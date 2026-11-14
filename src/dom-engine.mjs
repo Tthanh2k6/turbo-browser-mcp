@@ -4,16 +4,16 @@ import path from 'node:path';
 const DEFAULT_TIMEOUT_MS = 8000;
 
 const SUBMIT_LABEL_RE =
-  /^(submit|publish|post|send|apply(\s+now)?|confirm(\s+and)?\s*(pay|submit|order)|pay(\s+now)?|checkout|place\s+order|delete|remove|gửi|đăng(\s*bài)?|nộp(\s*đơn)?|xác\s*nhận(\s*(nộp|gửi|thanh\s*toán))?|thanh\s*toán|xoá|xóa)\b/i;
+  /^(submit|publish|post|send|apply(\s+now)?|confirm(\s+and)?\s*(pay|submit|order)|pay(\s+now)?|checkout|place\s+order|delete|remove|gửi|đăng(?!\s+nhập)(\s*bài)?|nộp(\s*đơn)?|xác\s*nhận(\s*(nộp|gửi|thanh\s*toán))?|thanh\s*toán|xoá|xóa)(?![\p{L}\p{N}_])/iu;
 
 const SAFE_SUBMIT_TYPE_RE =
-  /^(next|continue|search|filter|save\s*draft|tiếp(\s*tục)?|tìm(\s*kiếm)?|lọc|lưu\s*nháp)\b/i;
+  /^(next|continue|search|filter|save\s*draft|tiếp(\s*tục)?|tìm(\s*kiếm)?|lọc|lưu\s*nháp)(?![\p{L}\p{N}_])/iu;
 
 const QUESTION_BLOCK_SELECTOR =
   '[role="listitem"], fieldset, .form-group, .field, [class*="Field"], [class*="field"], [class*="question"]';
 
 const SUBMIT_SCAN_SELECTOR =
-  'button, input[type="submit"], input[type="button"], [role="button"], a[role="button"]';
+  'button, input[type="submit"], input[type="image"], input[type="button"], [role="button"], a[role="button"]';
 
 function compileFilterRegex(pattern) {
   try {
@@ -62,9 +62,61 @@ function inferMimeType(filePath) {
   return EXT_MIME_MAP[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
 }
 
+function canonicalizePath(targetPath) {
+  const resolved = path.resolve(targetPath);
+  let cur = resolved;
+  const tail = [];
+  while (true) {
+    if (fs.existsSync(cur)) {
+      try {
+        const real = fs.realpathSync(cur);
+        return tail.length > 0 ? path.join(real, ...tail.reverse()) : real;
+      } catch {
+        return tail.length > 0 ? path.join(cur, ...tail.reverse()) : cur;
+      }
+    }
+    const parent = path.dirname(cur);
+    if (parent === cur) return resolved;
+    tail.push(path.basename(cur));
+    cur = parent;
+  }
+}
+
+/**
+ * Resolve a file path for saving/loading state confined to process.cwd() or TURBO_BROWSER_SAVE_ROOT.
+ */
+export function resolveSafePath(inputPath, purpose = 'savePath') {
+  const raw = String(inputPath ?? '').trim();
+  if (!raw) {
+    throw new Error(`${purpose} requires a non-empty file path.`);
+  }
+  const envRoots = (process.env.TURBO_BROWSER_SAVE_ROOT || '')
+    .split(path.delimiter)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const allowedRoots = (envRoots.length > 0 ? envRoots : [process.cwd()]).map((r) =>
+    canonicalizePath(path.resolve(process.cwd(), r))
+  );
+  const candidate = canonicalizePath(path.resolve(process.cwd(), raw));
+  const normCand = process.platform === 'win32' ? candidate.toLowerCase() : candidate;
+
+  const isInside = allowedRoots.some((rootDir) => {
+    const normRoot = process.platform === 'win32' ? rootDir.toLowerCase() : rootDir;
+    const rel = path.relative(normRoot, normCand);
+    return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+  });
+
+  if (!isInside) {
+    throw new Error(
+      `Path "${raw}" (${purpose}) resolves outside allowed root(s) (${allowedRoots.join(', ')}). Set TURBO_BROWSER_SAVE_ROOT to allow additional directories.`
+    );
+  }
+  return candidate;
+}
+
 function writeSaveFile(savePath, content) {
   if (!savePath) return null;
-  const resolved = path.resolve(process.cwd(), String(savePath));
+  const resolved = resolveSafePath(savePath, 'savePath');
   fs.mkdirSync(path.dirname(resolved), { recursive: true });
   fs.writeFileSync(resolved, content, typeof content === 'string' ? 'utf8' : undefined);
   return resolved;
@@ -237,24 +289,38 @@ export async function resolveTarget(page, { ref, selector, text, frameIdx } = {}
 export async function isSubmitLikeElement(locator) {
   try {
     return await locator.evaluate((el, patterns) => {
-      const submitRe = new RegExp(patterns.submit, 'i');
-      const safeRe = new RegExp(patterns.safe, 'i');
-      const tag = (el.tagName || '').toLowerCase();
-      const type = (el.getAttribute('type') || '').toLowerCase();
-      const role = (el.getAttribute('role') || '').toLowerCase();
+      const submitRe = new RegExp(patterns.submit, 'iu');
+      const safeRe = new RegExp(patterns.safe, 'iu');
+      const lbl = el.closest?.('label');
+      const btn =
+        (lbl && lbl.control) ||
+        el.closest?.('button, input[type="submit"], input[type="image"], input[type="button"], [role="button"], a') ||
+        el;
+      const tag = (btn.tagName || '').toLowerCase();
+      const type = (
+        btn.getAttribute?.('type') ||
+        (tag === 'button' && btn.form ? btn.type : '') ||
+        ''
+      ).toLowerCase();
+      const role = (btn.getAttribute?.('role') || '').toLowerCase();
       const rawLabel = (
-        el.innerText ||
-        el.textContent ||
-        el.value ||
-        el.getAttribute('aria-label') ||
-        el.getAttribute('title') ||
+        btn.innerText ||
+        btn.textContent ||
+        btn.value ||
+        btn.getAttribute?.('alt') ||
+        btn.getAttribute?.('aria-label') ||
+        btn.getAttribute?.('title') ||
         ''
       )
         .replace(/\s+/g, ' ')
         .trim();
 
-      if (tag === 'input' && type === 'submit') {
-        return { isSubmit: !safeRe.test(rawLabel), label: rawLabel || 'submit', reason: 'input[type=submit]' };
+      if (tag === 'input' && (type === 'submit' || type === 'image')) {
+        return {
+          isSubmit: !(rawLabel && safeRe.test(rawLabel)),
+          label: rawLabel || 'submit',
+          reason: `input[type=${type}]`,
+        };
       }
       if (tag === 'button' && type === 'submit') {
         const isSafe = rawLabel && safeRe.test(rawLabel);
@@ -276,9 +342,33 @@ export async function isSubmitAtPoint(page, x, y) {
   let handle = null;
   try {
     handle = await page.evaluateHandle(([px, py]) => {
-      const hit = document.elementFromPoint(px, py);
+      let curDoc = document;
+      let cx = px;
+      let cy = py;
+      let hit = curDoc.elementFromPoint(cx, cy);
+      while (hit) {
+        if (hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
+          const inner = hit.shadowRoot.elementFromPoint(cx, cy);
+          if (inner && inner !== hit) {
+            hit = inner;
+            continue;
+          }
+        }
+        const tag = (hit.tagName || '').toUpperCase();
+        if ((tag === 'IFRAME' || tag === 'FRAME') && hit.contentDocument) {
+          const rect = hit.getBoundingClientRect();
+          cx = cx - rect.left - (hit.clientLeft || 0);
+          cy = cy - rect.top - (hit.clientTop || 0);
+          curDoc = hit.contentDocument;
+          hit = curDoc.elementFromPoint(cx, cy);
+          continue;
+        }
+        break;
+      }
       if (!hit) return null;
-      return hit.closest('button, input[type="submit"], input[type="button"], [role="button"], a') || hit;
+      const lbl = hit.closest?.('label');
+      if (lbl && lbl.control) return lbl.control;
+      return hit.closest?.('button, input[type="submit"], input[type="image"], input[type="button"], [role="button"], a') || hit;
     }, [x, y]);
     const empty = await handle.evaluate((el) => !el).catch(() => true);
     if (empty) return { isSubmit: false, label: '', reason: '' };
@@ -294,16 +384,21 @@ function checkEnterSubmitInBrowser(target, patterns) {
   if (!target || target === document.body || target === document.documentElement) {
     return { isSubmit: false, label: '', reason: '' };
   }
-  const submitRe = new RegExp(patterns.submit, 'i');
-  const safeRe = new RegExp(patterns.safe, 'i');
+  const submitRe = new RegExp(patterns.submit, 'iu');
+  const safeRe = new RegExp(patterns.safe, 'iu');
   const tag = (target.tagName || '').toLowerCase();
-  const type = (target.getAttribute?.('type') || '').toLowerCase();
+  const type = (
+    target.getAttribute?.('type') ||
+    (tag === 'button' && target.form ? target.type : '') ||
+    ''
+  ).toLowerCase();
   const role = (target.getAttribute?.('role') || '').toLowerCase();
   const labelOf = (node) =>
     (
       node.innerText ||
       node.textContent ||
       node.value ||
+      node.getAttribute?.('alt') ||
       node.getAttribute?.('aria-label') ||
       node.getAttribute?.('title') ||
       ''
@@ -312,11 +407,11 @@ function checkEnterSubmitInBrowser(target, patterns) {
       .trim();
 
   const rawLabel = labelOf(target);
-  if ((tag === 'input' || tag === 'button') && type === 'submit') {
+  if ((tag === 'input' && (type === 'submit' || type === 'image')) || (tag === 'button' && type === 'submit')) {
     return {
       isSubmit: !(rawLabel && safeRe.test(rawLabel)),
       label: rawLabel || 'submit',
-      reason: `${tag}[type=submit]`,
+      reason: `${tag}[type=${type}]`,
     };
   }
   if ((tag === 'button' || role === 'button' || type === 'button' || tag === 'a') && rawLabel && submitRe.test(rawLabel)) {
@@ -430,6 +525,9 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
           if (!root) return { items: [], nextRef: startRef, total: 0 };
 
           const isHidden = (el) => {
+            if (el.getAttribute('aria-hidden') === 'true' || Boolean(el.closest('[aria-hidden="true"]'))) {
+              return true;
+            }
             if (el.tagName === 'INPUT' && el.type === 'file') return false;
             const style = getComputedStyle(el);
             if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
@@ -704,7 +802,18 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
 
           const vis = (el) => {
             if (!el) return false;
-            if (el.disabled || el.readOnly) return false;
+            if (
+              el.disabled ||
+              el.readOnly ||
+              el.hasAttribute('readonly') ||
+              el.getAttribute('aria-readonly') === 'true' ||
+              el.getAttribute('aria-disabled') === 'true' ||
+              Boolean(el.closest('[aria-disabled="true"]')) ||
+              el.getAttribute('aria-hidden') === 'true' ||
+              Boolean(el.closest('[aria-hidden="true"]'))
+            ) {
+              return false;
+            }
             const st = getComputedStyle(el);
             if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) return false;
             const r = el.getBoundingClientRect();
@@ -735,7 +844,15 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             const wl = el.closest('label');
             if (wl) parts.push(wl.innerText);
             const blk = el.closest(qBlockSel) || el.getRootNode?.()?.host?.closest?.(qBlockSel);
-            if (blk) parts.push(blk.innerText.slice(0, 300));
+            if (blk) {
+              const blkTextInputs = queryAllDeep(
+                blk,
+                'input:not([type="radio"]):not([type="checkbox"]):not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="image"]):not([type="reset"]), textarea, select, [contenteditable="true"], [role="textbox"]'
+              );
+              if (blkTextInputs.length <= 1) {
+                parts.push(blk.innerText.slice(0, 300));
+              }
+            }
             const elRoleDesc = (el.getAttribute('role') || '').toLowerCase();
             if (elRoleDesc === 'switch' || elRoleDesc === 'checkbox' || elRoleDesc === 'radio') {
               if (el.innerText) parts.push(el.innerText);
@@ -797,6 +914,21 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             }
           };
 
+          const rankOptionMatch = (opt, pat) => {
+            const raw = String(pat ?? '').trim();
+            if (!raw) return 0;
+            const rawLower = raw.toLowerCase();
+            const txt = clean(opt.text);
+            const txtLower = txt.toLowerCase();
+            const valLower = String(opt.value ?? '').trim().toLowerCase();
+            if (txtLower === rawLower || valLower === rawLower) return 3;
+            const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const wordPrefixRe = new RegExp(`^${escaped}(?![\\p{L}\\p{N}_])`, 'iu');
+            if (wordPrefixRe.test(txt) || wordPrefixRe.test(String(opt.value ?? '').trim())) return 2;
+            if (safePatternMatch(txt, pat) || safePatternMatch(opt.value, pat)) return 1;
+            return 0;
+          };
+
           const chooseSelect = (sel, rawSpec) => {
             const specs = Array.isArray(rawSpec) ? rawSpec : [rawSpec];
             const patterns = specs.filter((p) => p !== undefined && p !== null && String(p) !== '');
@@ -808,11 +940,23 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
 
             let chosen;
             if (sel.multiple || Array.isArray(rawSpec)) {
-              const matched = [];
+              const selectedSet = new Set();
+              for (const pat of patterns) {
+                let bestTier = 0;
+                const scored = [...sel.options].map((opt) => {
+                  const tier = rankOptionMatch(opt, pat);
+                  if (tier > bestTier) bestTier = tier;
+                  return { opt, tier };
+                });
+                if (bestTier > 0) {
+                  for (const { opt, tier } of scored) {
+                    if (tier === bestTier) selectedSet.add(opt);
+                  }
+                }
+              }
+              const matched = [...sel.options].filter((opt) => selectedSet.has(opt));
               for (const opt of sel.options) {
-                const hit = patterns.some((pat) => safePatternMatch(opt.text, pat) || safePatternMatch(opt.value, pat));
-                opt.selected = sel.multiple ? hit : false;
-                if (hit) matched.push(opt);
+                opt.selected = sel.multiple ? selectedSet.has(opt) : false;
               }
               if (matched.length === 0) return null;
               if (!sel.multiple) {
@@ -823,10 +967,19 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
               }
             } else {
               const pat = patterns[0];
-              const opt = [...sel.options].find((o) => safePatternMatch(o.text, pat) || safePatternMatch(o.value, pat));
-              if (!opt) return null;
-              sel.value = opt.value;
-              chosen = clean(opt.text);
+              let bestOpt = null;
+              let bestTier = 0;
+              for (const o of sel.options) {
+                const tier = rankOptionMatch(o, pat);
+                if (tier > bestTier) {
+                  bestTier = tier;
+                  bestOpt = o;
+                  if (tier === 3) break;
+                }
+              }
+              if (!bestOpt) return null;
+              sel.value = bestOpt.value;
+              chosen = clean(bestOpt.text);
             }
             sel.dispatchEvent(new Event('input', { bubbles: true }));
             sel.dispatchEvent(new Event('change', { bubbles: true }));
@@ -898,38 +1051,70 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                 const controls = queryAllDeep(
                   container,
                   'input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"], [role="switch"]'
-                ).filter((c) => {
-                  const st = getComputedStyle(c);
-                  return st.display !== 'none' && st.visibility !== 'hidden';
+                ).filter(vis);
+
+                const decorated = controls.map((ctrl) => {
+                  const wrap = ctrl.closest('label');
+                  const lblListTxt = ctrl.labels?.length
+                    ? [...ctrl.labels].map((l) => l.innerText).join(' ')
+                    : '';
+                  const selfLabel = clean(
+                    (ctrl.hasAttribute('role') ? ctrl.innerText : '') ||
+                    ctrl.getAttribute('aria-label') ||
+                    ctrl.getAttribute('title') ||
+                    ''
+                  );
+                  const parentTxt =
+                    !wrap &&
+                    !lblListTxt &&
+                    !selfLabel &&
+                    ctrl.parentElement &&
+                    !/^(FORM|BODY|HTML|MAIN|SECTION)$/i.test(ctrl.parentElement.tagName)
+                      ? ctrl.parentElement.innerText
+                      : '';
+                  const optLabel = clean(
+                    (wrap ? wrap.innerText : '') || lblListTxt || selfLabel || parentTxt || ctrl.value || ''
+                  );
+                  return { ctrl, optLabel };
                 });
 
-                for (const pat of patterns) {
-                  for (const ctrl of controls) {
-                    const wrap = ctrl.closest('label');
-                    const lblListTxt = ctrl.labels?.length
-                      ? [...ctrl.labels].map((l) => l.innerText).join(' ')
-                      : '';
-                    const selfLabel = clean(
-                      (ctrl.hasAttribute('role') ? ctrl.innerText : '') ||
-                      ctrl.getAttribute('aria-label') ||
-                      ctrl.getAttribute('title') ||
-                      ''
-                    );
-                    const parentTxt =
-                      !wrap &&
-                      !lblListTxt &&
-                      !selfLabel &&
-                      ctrl.parentElement &&
-                      !/^(FORM|BODY|HTML|MAIN|SECTION)$/i.test(ctrl.parentElement.tagName)
-                        ? ctrl.parentElement.innerText
-                        : '';
-                    const optLabel = clean(
-                      (wrap ? wrap.innerText : '') || lblListTxt || selfLabel || parentTxt || ctrl.value || ''
-                    );
-                    if (!safePatternMatch(optLabel, pat)) continue;
-                    if (requireKeyMatch && !matchesSpec(optLabel.toLowerCase(), f)) continue;
+                const rankChoiceMatch = (optLabel, val, pat) => {
+                  const raw = String(pat ?? '').trim();
+                  if (!raw) return 0;
+                  const rawLower = raw.toLowerCase();
+                  const lblLower = optLabel.toLowerCase();
+                  const valLower = String(val ?? '').trim().toLowerCase();
+                  if (lblLower === rawLower || valLower === rawLower) return 3;
+                  const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                  const wordRe = new RegExp(`(?:^|[^\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, 'iu');
+                  if (wordRe.test(optLabel) || wordRe.test(String(val ?? ''))) return 2;
+                  if (safePatternMatch(optLabel, pat)) return 1;
+                  return 0;
+                };
 
+                for (const pat of patterns) {
+                  let bestTier = 0;
+                  const scored = [];
+                  for (const item of decorated) {
+                    if (requireKeyMatch && !matchesSpec(item.optLabel.toLowerCase(), f)) continue;
+                    const tier = rankChoiceMatch(item.optLabel, item.ctrl.value, pat);
+                    if (tier > 0) {
+                      if (tier > bestTier) bestTier = tier;
+                      scored.push({ ...item, tier });
+                    }
+                  }
+                  if (bestTier === 0) continue;
+
+                  const clickedRadioGroups = new Set();
+                  for (const { ctrl, optLabel, tier } of scored) {
+                    if (tier !== bestTier) continue;
                     const isAria = ctrl.hasAttribute('role');
+                    const isRadio = (isAria ? ctrl.getAttribute('role') : ctrl.type) === 'radio';
+                    if (isRadio) {
+                      const groupKey = ctrl.name || '__radio_group__';
+                      if (clickedRadioGroups.has(groupKey)) continue;
+                      clickedRadioGroups.add(groupKey);
+                    }
                     const isChecked = isAria
                       ? ctrl.getAttribute('aria-checked') === 'true'
                       : Boolean(ctrl.checked);
@@ -1141,10 +1326,14 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
           const submits = queryAllDeep(document, submitSel)
             .filter(vis)
             .map((el) => {
-              const txt = clean(el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '');
-              return { frameIdx: frameIdxArg, text: txt, type: el.getAttribute('type') || '' };
+              const txt = clean(
+                el.innerText || el.textContent || el.value || el.getAttribute('alt') || el.getAttribute('aria-label') || ''
+              );
+              const tag = (el.tagName || '').toLowerCase();
+              const rawType = (el.getAttribute('type') || (tag === 'button' && el.form ? el.type : '') || '').toLowerCase();
+              return { frameIdx: frameIdxArg, text: txt, type: rawType };
             })
-            .filter((b) => b.type === 'submit' || b.text);
+            .filter((b) => b.type === 'submit' || b.type === 'image' || b.text);
 
           return { frameFilled, frameSkipped, matchedIndexes, leftover, submits };
         },
@@ -1168,7 +1357,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
     for (const mIdx of res.matchedIndexes) matchedFieldIndexes.add(mIdx);
     for (const l of res.leftover) leftoverSet.add(l);
     for (const s of res.submits) {
-      if (SUBMIT_LABEL_RE.test(s.text) || (s.type === 'submit' && !SAFE_SUBMIT_TYPE_RE.test(s.text))) {
+      if (SUBMIT_LABEL_RE.test(s.text) || ((s.type === 'submit' || s.type === 'image') && !SAFE_SUBMIT_TYPE_RE.test(s.text))) {
         submitButtons.push(s);
       }
     }
@@ -1222,9 +1411,21 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
 
           const combos = queryAllDeep(document, '[role="combobox"]').filter((el) => {
             if (el.tagName === 'SELECT') return false;
+            if (
+              el.disabled ||
+              el.readOnly ||
+              el.hasAttribute('readonly') ||
+              el.getAttribute('aria-readonly') === 'true' ||
+              el.getAttribute('aria-disabled') === 'true' ||
+              Boolean(el.closest('[aria-disabled="true"]')) ||
+              el.getAttribute('aria-hidden') === 'true' ||
+              Boolean(el.closest('[aria-hidden="true"]'))
+            ) {
+              return false;
+            }
             const st = getComputedStyle(el);
             const r = el.getBoundingClientRect();
-            return st.display !== 'none' && st.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+            return st.display !== 'none' && st.visibility !== 'hidden' && Number(st.opacity) !== 0 && r.width > 0 && r.height > 0;
           });
           const keys = Array.isArray(fieldSpec.keys) ? fieldSpec.keys : fieldSpec.keys ? [fieldSpec.keys] : [];
           const nots = Array.isArray(fieldSpec.not) ? fieldSpec.not : fieldSpec.not ? [fieldSpec.not] : [];
@@ -1306,6 +1507,13 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
         await target.locator.setInputFiles(resolvedPaths);
         uploaded = true;
       } else {
+        if (spec.stopBeforeSubmit !== false) {
+          const meta = await isSubmitLikeElement(target.locator);
+          if (meta.isSubmit) {
+            skipped.push({ idx: ff._idx, reason: 'blocked-submit-target', label: meta.label });
+            continue;
+          }
+        }
         const [chooser] = await Promise.all([
           page.waitForEvent('filechooser', { timeout: 4000 }),
           target.locator.click(),
@@ -1463,11 +1671,16 @@ async function executeSingleAction(page, params = {}) {
 
   if (action === 'press') {
     if (!params.key) throw new Error('press action requires key.');
-    const isEnter = /^(enter|numpadenter)$/i.test(String(params.key).trim());
+    const rawKey = String(params.key);
+    const keyStr = rawKey.trim() || rawKey;
+    const isEnter = /(^|\+)(numpad)?enter$/i.test(keyStr);
+    const isSpace = /^(space|spacebar| )$/i.test(keyStr) || rawKey === ' ';
     if (params.ref || params.selector || params.text) {
       const target = await resolveTarget(page, params);
-      if (isEnter && !allowSubmit) {
-        const meta = await isEnterSubmitTarget(page, target.locator);
+      if ((isEnter || isSpace) && !allowSubmit) {
+        const meta = isEnter
+          ? await isEnterSubmitTarget(page, target.locator)
+          : await isSubmitLikeElement(target.locator);
         if (meta.isSubmit) {
           return {
             ok: false,
@@ -1481,9 +1694,9 @@ async function executeSingleAction(page, params = {}) {
       await target.locator.press(params.key, { timeout });
       return { ok: true, action, key: params.key };
     }
-    if (isEnter && !allowSubmit) {
+    if ((isEnter || isSpace) && !allowSubmit) {
       const meta = await isEnterSubmitTarget(page, null);
-      if (meta.isSubmit) {
+      if (meta.isSubmit && (isEnter || meta.reason !== 'implicit-form-enter')) {
         return {
           ok: false,
           blocked: true,
@@ -1623,16 +1836,34 @@ async function executeSingleAction(page, params = {}) {
   }
 
   if (action === 'type') {
-    if (params.submit && !allowSubmit) {
-      return {
-        ok: false,
-        blocked: true,
-        action,
-        frameIdx,
-        reason: 'Submit guard: blocked type with submit=true because allowSubmit=false.',
-      };
-    }
     const val = String(params.value ?? '');
+    if (!allowSubmit && (params.submit || /[\r\n]/.test(val))) {
+      if (params.submit) {
+        return {
+          ok: false,
+          blocked: true,
+          action,
+          frameIdx,
+          reason: 'Submit guard: blocked type with submit=true because allowSubmit=false.',
+        };
+      }
+      const isMultiline = await locator
+        .evaluate((el) => el.tagName === 'TEXTAREA' || Boolean(el.isContentEditable))
+        .catch(() => false);
+      if (!isMultiline) {
+        const meta = await isEnterSubmitTarget(page, locator);
+        if (meta.isSubmit) {
+          return {
+            ok: false,
+            blocked: true,
+            action,
+            frameIdx,
+            label: meta.label,
+            reason: `Submit guard: blocked type containing newline on "${meta.label}" (${meta.reason}) because allowSubmit=false.`,
+          };
+        }
+      }
+    }
     if (params.slowly === false && !params.delayMs) {
       await locator.fill(val, { timeout });
     } else {
@@ -1689,6 +1920,19 @@ async function executeSingleAction(page, params = {}) {
     if (isFileInput) {
       await locator.setInputFiles(paths);
     } else {
+      if (!allowSubmit) {
+        const meta = await isSubmitLikeElement(locator);
+        if (meta.isSubmit) {
+          return {
+            ok: false,
+            blocked: true,
+            action,
+            frameIdx,
+            label: meta.label,
+            reason: `Submit guard: blocked upload click on "${meta.label}" (${meta.reason}) because allowSubmit=false.`,
+          };
+        }
+      }
       const [chooser] = await Promise.all([
         page.waitForEvent('filechooser', { timeout }),
         locator.click({ timeout }),
@@ -1732,13 +1976,16 @@ export async function batchActions(page, steps = [], options = {}, previousLines
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     try {
+      if (!step || typeof step !== 'object') {
+        throw new Error('Invalid batch step: expected an action object.');
+      }
       let stepResult;
       if (step.action === 'smart_fill_form' || step.action === 'fill_form') {
         stepResult = await smartFillForm(page, step, previousLinesSet);
       } else {
         stepResult = await executeSingleAction(page, {
           ...step,
-          allowSubmit: step.allowSubmit ?? defaultAllowSubmit,
+          allowSubmit: options.allowSubmit === false ? false : (step.allowSubmit ?? defaultAllowSubmit),
         });
       }
       results.push({ step: i, ...stepResult });
@@ -1752,7 +1999,7 @@ export async function batchActions(page, steps = [], options = {}, previousLines
         };
       }
     } catch (err) {
-      results.push({ step: i, ok: false, action: step.action, error: err.message });
+      results.push({ step: i, ok: false, action: step?.action, error: err.message });
       if (!continueOnError) {
         return {
           completed: i,
@@ -1888,6 +2135,7 @@ export async function extractCleanText(page, options = {}) {
             if (node.nodeType === 3) return node.textContent || '';
             if (node.nodeType !== 1) return '';
             if (isHiddenEl(node)) return '';
+            if (node.tagName === 'BR') return ' ';
             if (skipSubLists && (node.tagName === 'UL' || node.tagName === 'OL')) return '';
             if (node.tagName === 'A' && node.getAttribute('href')) {
               let inner = '';
@@ -2007,36 +2255,38 @@ export async function evaluateJs(page, { expression, frameIdx = 0, arg, ref, sel
     resolvedFrameIdx = target.frameIdx;
     result = await target.locator.evaluate(
       async (el, { code, payload }) => {
-        let val;
+        let fn;
         try {
-          val = new Function('el', 'arg', `return (${code});`)(el, payload);
+          fn = new Function('el', 'arg', `return (${code});`);
         } catch {
-          val = new Function('el', 'arg', code)(el, payload);
+          fn = new Function('el', 'arg', code);
         }
+        const val = await fn(el, payload);
         if (typeof val === 'function') {
           return await val(el, payload);
         }
-        return await val;
+        return val;
       },
       { code: expression, payload: arg }
     );
   } else {
     const frames = getAllFrames(page);
-    const target = frames.find((f) => f.frameIdx === frameIdx) || frames[0];
+    const target = frames.find((f) => f.frameIdx === frameIdx);
     if (!target) throw new Error(`Frame ${frameIdx} not found.`);
     resolvedFrameIdx = target.frameIdx;
     result = await target.frame.evaluate(
       async ({ code, payload }) => {
-        let val;
+        let fn;
         try {
-          val = new Function('arg', `return (${code});`)(payload);
+          fn = new Function('arg', `return (${code});`);
         } catch {
-          val = new Function('arg', code)(payload);
+          fn = new Function('arg', code);
         }
+        const val = await fn(payload);
         if (typeof val === 'function') {
           return await val(payload);
         }
-        return await val;
+        return val;
       },
       { code: expression, payload: arg }
     );
@@ -2054,7 +2304,7 @@ export async function capturePage(page, params = {}) {
   const mode = params.mode === 'pdf' ? 'pdf' : 'screenshot';
   const timeout = Number(params.timeoutMs) || DEFAULT_TIMEOUT_MS;
   const resolvedPath = params.savePath
-    ? path.resolve(process.cwd(), String(params.savePath))
+    ? resolveSafePath(params.savePath, 'savePath')
     : null;
 
   if (resolvedPath) {

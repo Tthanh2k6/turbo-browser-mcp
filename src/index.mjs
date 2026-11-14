@@ -20,6 +20,7 @@ const SERVER_INFO = {
 };
 
 const SUPPORTED_PROTOCOL = '2025-03-26';
+const SUPPORTED_PROTOCOLS = new Set(['2025-03-26', '2024-11-05', '2024-10-07']);
 
 export const TOOL_DEFINITIONS = [
   {
@@ -145,7 +146,7 @@ export const TOOL_DEFINITIONS = [
         },
         savePath: {
           type: 'string',
-          description: 'Optional file path relative to cwd to save snapshot text.',
+          description: 'Optional file path confined to cwd (or TURBO_BROWSER_SAVE_ROOT) to save snapshot text.',
         },
       },
     },
@@ -362,7 +363,10 @@ export const TOOL_DEFINITIONS = [
         includeFrames: { type: 'boolean', default: true },
         format: { type: 'string', enum: ['text', 'markdown'], default: 'text' },
         maxChars: { type: 'integer', default: 6000 },
-        savePath: { type: 'string', description: 'Optional file path relative to cwd to save text output.' },
+        savePath: {
+          type: 'string',
+          description: 'Optional file path confined to cwd (or TURBO_BROWSER_SAVE_ROOT) to save text output.',
+        },
       },
     },
   },
@@ -388,7 +392,10 @@ export const TOOL_DEFINITIONS = [
         selector: { type: 'string', description: 'Optional target selector (passes (el, arg) to expression).' },
         text: { type: 'string', description: 'Optional visible text target (passes (el, arg) to expression).' },
         arg: {},
-        savePath: { type: 'string', description: 'Optional file path relative to cwd to save result.' },
+        savePath: {
+          type: 'string',
+          description: 'Optional file path confined to cwd (or TURBO_BROWSER_SAVE_ROOT) to save result.',
+        },
       },
     },
   },
@@ -434,7 +441,7 @@ export const TOOL_DEFINITIONS = [
         },
         savePath: {
           type: 'string',
-          description: 'Optional JSON file path relative to cwd to save diagnostics output.',
+          description: 'Optional JSON file path confined to cwd (or TURBO_BROWSER_SAVE_ROOT) to save diagnostics output.',
         },
         clear: { type: 'boolean', default: false },
       },
@@ -443,7 +450,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'capture_page',
     description:
-      'Capture a full-page or element screenshot (png/jpeg, css/device scale) or export PDF safely resolved relative to cwd, with optional inline image return.',
+      'Capture a full-page or element screenshot (png/jpeg, css/device scale) or export PDF confined to cwd (or TURBO_BROWSER_SAVE_ROOT), with optional inline image return.',
     annotations: {
       title: 'Capture Screenshot or PDF',
       readOnlyHint: true,
@@ -495,8 +502,14 @@ export const TOOL_DEFINITIONS = [
         storageAction: { type: 'string', enum: ['get', 'set', 'clear'] },
         storageType: { type: 'string', enum: ['local', 'session', 'both'], default: 'local' },
         items: { type: 'object' },
-        saveStorageStatePath: { type: 'string' },
-        loadStorageStatePath: { type: 'string' },
+        saveStorageStatePath: {
+          type: 'string',
+          description: 'Save storageState JSON to a path confined to cwd (or TURBO_BROWSER_SAVE_ROOT).',
+        },
+        loadStorageStatePath: {
+          type: 'string',
+          description: 'Load storageState JSON from a path confined to cwd (or TURBO_BROWSER_SAVE_ROOT).',
+        },
         blockResources: { type: 'array', items: { type: 'string' } },
         blockUrls: { type: 'array', items: { type: 'string' } },
         unblockAll: { type: 'boolean', default: false },
@@ -529,10 +542,13 @@ export async function dispatchToolCall(manager, name, args = {}) {
       return { text: JSON.stringify({ tabId, ...res }) };
     }
     case 'batch_actions': {
+      if (!Array.isArray(args.steps) || args.steps.length === 0) {
+        throw new Error('batch_actions requires a non-empty steps array.');
+      }
       const { tabId, page } = await manager.getPage(args.tabId);
       const res = await batchActions(
         page,
-        args.steps || [],
+        args.steps,
         {
           continueOnError: args.continueOnError,
           allowSubmit: args.allowSubmit,
@@ -596,7 +612,25 @@ export async function dispatchToolCall(manager, name, args = {}) {
 
 export function createJsonRpcHandler(manager) {
   return async function handleMessage(msg) {
-    if (!msg || typeof msg !== 'object') return null;
+    if (Array.isArray(msg)) {
+      if (msg.length === 0) {
+        return {
+          jsonrpc: '2.0',
+          id: null,
+          error: { code: -32600, message: 'Invalid Request: empty batch' },
+        };
+      }
+      const replies = (await Promise.all(msg.map((item) => handleMessage(item)))).filter(Boolean);
+      return replies.length > 0 ? replies : null;
+    }
+
+    if (!msg || typeof msg !== 'object') {
+      return {
+        jsonrpc: '2.0',
+        id: null,
+        error: { code: -32600, message: 'Invalid Request' },
+      };
+    }
 
     // Notifications carry no id and expect no reply.
     const hasId = Object.prototype.hasOwnProperty.call(msg, 'id') && msg.id !== undefined;
@@ -605,13 +639,25 @@ export function createJsonRpcHandler(manager) {
     }
 
     const { id, method, params = {} } = msg;
+    if (!method || typeof method !== 'string') {
+      return {
+        jsonrpc: '2.0',
+        id,
+        error: { code: -32600, message: 'Invalid Request: method must be a non-empty string' },
+      };
+    }
+
     try {
       if (method === 'initialize') {
+        const negotiatedProtocol =
+          params.protocolVersion && SUPPORTED_PROTOCOLS.has(params.protocolVersion)
+            ? params.protocolVersion
+            : SUPPORTED_PROTOCOL;
         return {
           jsonrpc: '2.0',
           id,
           result: {
-            protocolVersion: params.protocolVersion || SUPPORTED_PROTOCOL,
+            protocolVersion: negotiatedProtocol,
             capabilities: { tools: {} },
             serverInfo: SERVER_INFO,
           },
@@ -705,6 +751,11 @@ export function startStdioServer(manager = new BrowserManager()) {
         msg = JSON.parse(rawJson);
       } catch (err) {
         process.stderr.write(`[turbo-browser-mcp] JSON parse error: ${err.message}\n`);
+        writeReply({
+          jsonrpc: '2.0',
+          id: null,
+          error: { code: -32700, message: `Parse error: ${err.message}` },
+        });
         return;
       }
       const reply = await handle(msg);
@@ -720,7 +771,10 @@ export function startStdioServer(manager = new BrowserManager()) {
       if (buffer.length === 0) break;
 
       const head = buffer.subarray(0, Math.min(buffer.length, 64)).toString('utf8');
-      if (head.startsWith('Content-Length:')) {
+      if (buffer.length < 15 && 'content-length:'.startsWith(head.toLowerCase())) {
+        break;
+      }
+      if (/^content-length:/i.test(head)) {
         useContentLength = true;
         const headerEnd = buffer.indexOf('\r\n\r\n');
         if (headerEnd === -1) break;

@@ -632,8 +632,11 @@ describe('turbo-browser-mcp integration', () => {
   let baseUrl;
   let tmpPdf;
   let manager;
+  let prevSaveRoot;
 
   before(async () => {
+    prevSaveRoot = process.env.TURBO_BROWSER_SAVE_ROOT;
+    process.env.TURBO_BROWSER_SAVE_ROOT = [process.cwd(), os.tmpdir()].join(path.delimiter);
     ({ server, baseUrl } = await startFixtureServer());
     tmpPdf = path.join(os.tmpdir(), `tbm-cv-${Date.now()}.pdf`);
     fs.writeFileSync(tmpPdf, '%PDF-1.4\n%turbo-browser-mcp-test\n%%EOF\n', 'utf8');
@@ -645,6 +648,11 @@ describe('turbo-browser-mcp integration', () => {
     await new Promise((resolve) => server?.close(resolve));
     if (tmpPdf && fs.existsSync(tmpPdf)) {
       fs.unlinkSync(tmpPdf);
+    }
+    if (prevSaveRoot === undefined) {
+      delete process.env.TURBO_BROWSER_SAVE_ROOT;
+    } else {
+      process.env.TURBO_BROWSER_SAVE_ROOT = prevSaveRoot;
     }
   });
 

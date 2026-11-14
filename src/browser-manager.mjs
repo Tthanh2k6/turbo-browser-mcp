@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { resolveSafePath } from './dom-engine.mjs';
 import { loadPlaywright, resolveChromiumExecutable } from './playwright-loader.mjs';
 
 const CONSOLE_RING_LIMIT = 80;
@@ -38,10 +39,15 @@ function pushRing(arr, item, limit, onEvict) {
 }
 
 function compileUrlPattern(pattern) {
+  const raw = String(pattern);
+  if (raw.startsWith('*')) {
+    const globSource = raw.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+    return new RegExp(globSource, 'i');
+  }
   try {
-    return new RegExp(pattern, 'i');
+    return new RegExp(raw, 'i');
   } catch {
-    return { test: (val) => val.toLowerCase().includes(String(pattern).toLowerCase()) };
+    return { test: (val) => val.toLowerCase().includes(raw.toLowerCase()) };
   }
 }
 
@@ -72,6 +78,7 @@ export class BrowserManager {
     this.pageToId = new WeakMap();
     this.attachedPages = new WeakSet();
     this.diagnostics = new WeakMap();
+    this.tempDownloadFiles = new Set();
   }
 
   async ensureReady() {
@@ -299,6 +306,7 @@ export class BrowserManager {
       page.on('download', (download) => {
         const safeName = path.basename(download.suggestedFilename() || 'download.bin');
         const savePath = path.join(os.tmpdir(), `tbm-dl-${Date.now()}-${safeName}`);
+        this.tempDownloadFiles.add(savePath);
         const job = download.saveAs(savePath).then(() => {
           pushRing(
             diag.downloads,
@@ -487,21 +495,37 @@ export class BrowserManager {
             slice.map(async (targetUrl) => {
               const page = await ctx.newPage();
               const tabId = this._registerPage(page, false, ctxName);
-              await page.goto(targetUrl, navOpts);
-              return {
-                tabId,
-                isolatedContext: ctxName,
-                url: page.url(),
-                title: await page.title().catch(() => ''),
-              };
+              try {
+                await page.goto(targetUrl, navOpts);
+                return {
+                  tabId,
+                  isolatedContext: ctxName,
+                  url: page.url(),
+                  title: await page.title().catch(() => ''),
+                  ok: true,
+                };
+              } catch (err) {
+                await page.close().catch(() => {});
+                this.tabs.delete(tabId);
+                this.tabContextName.delete(tabId);
+                return {
+                  tabId: null,
+                  isolatedContext: ctxName,
+                  url: targetUrl,
+                  title: '',
+                  ok: false,
+                  error: String(err?.message || err),
+                };
+              }
             })
           );
           opened.push(...chunkResults);
         }
         if (op.activate === false) {
           this.activeTabId = prevActiveTabId;
-        } else if (opened.length > 0) {
-          this.activeTabId = opened[opened.length - 1].tabId;
+        } else {
+          const lastOk = [...opened].reverse().find((item) => item.ok !== false && item.tabId !== null);
+          this.activeTabId = lastOk ? lastOk.tabId : prevActiveTabId;
         }
         results.push({
           action: 'open_many',
@@ -512,14 +536,21 @@ export class BrowserManager {
       }
 
       if (action === 'open') {
+        const prevActiveTabId = this.activeTabId;
         const { name: ctxName, ctx } = await this._getOrCreateContext(op.isolatedContext);
         const page = await ctx.newPage();
         const tabId = this._registerPage(page, op.activate !== false, ctxName);
+        if (op.activate === false) {
+          this.activeTabId = prevActiveTabId;
+        }
         if (op.url) {
           await page.goto(op.url, {
             waitUntil: op.waitUntil || 'domcontentloaded',
             timeout: op.timeoutMs || this.defaultTimeoutMs,
           });
+        }
+        if (op.activate === false) {
+          this.activeTabId = prevActiveTabId;
         }
         results.push({
           action: 'open',
@@ -640,7 +671,10 @@ export class BrowserManager {
     const diag = this._ensureDiagState(page);
 
     if (diag.pendingDownloads.length > 0) {
-      await Promise.allSettled([...diag.pendingDownloads]);
+      await Promise.race([
+        Promise.allSettled([...diag.pendingDownloads]),
+        new Promise((r) => setTimeout(r, 1200)),
+      ]);
     }
 
     if (opts.dialogPolicy) {
@@ -699,7 +733,7 @@ export class BrowserManager {
         : { tabId: id, request: fullDetail };
 
       if (opts.savePath) {
-        const resolved = path.resolve(process.cwd(), String(opts.savePath));
+        const resolved = resolveSafePath(opts.savePath, 'savePath');
         fs.mkdirSync(path.dirname(resolved), { recursive: true });
         fs.writeFileSync(resolved, JSON.stringify(detailPayload, null, 2), 'utf8');
         detailPayload.savePath = resolved;
@@ -755,7 +789,7 @@ export class BrowserManager {
     };
 
     if (opts.savePath) {
-      const resolved = path.resolve(process.cwd(), String(opts.savePath));
+      const resolved = resolveSafePath(opts.savePath, 'savePath');
       fs.mkdirSync(path.dirname(resolved), { recursive: true });
       fs.writeFileSync(resolved, JSON.stringify(snapshot, null, 2), 'utf8');
       snapshot.savePath = resolved;
@@ -836,6 +870,36 @@ export class BrowserManager {
 
     const pageCtx = page.context();
 
+    if (params.loadStorageStatePath) {
+      const srcPath = resolveSafePath(params.loadStorageStatePath, 'loadStorageStatePath');
+      const raw = JSON.parse(fs.readFileSync(srcPath, 'utf8'));
+      if (Array.isArray(raw.cookies) && raw.cookies.length > 0) {
+        await pageCtx.addCookies(raw.cookies);
+      }
+      if (Array.isArray(raw.origins) && raw.origins.length > 0) {
+        await pageCtx.addInitScript((origins) => {
+          const m = origins.find((o) => o.origin === window.location.origin);
+          if (m && Array.isArray(m.localStorage)) {
+            for (const item of m.localStorage) {
+              window.localStorage.setItem(item.name, item.value);
+            }
+          }
+        }, raw.origins);
+        if (page.url().startsWith('http')) {
+          const curOrigin = new URL(page.url()).origin;
+          const match = raw.origins.find((o) => o.origin === curOrigin);
+          if (match && Array.isArray(match.localStorage)) {
+            await page.evaluate((entries) => {
+              for (const item of entries) {
+                window.localStorage.setItem(item.name, item.value);
+              }
+            }, match.localStorage);
+          }
+        }
+      }
+      result.loadedStorageStatePath = srcPath;
+    }
+
     if (params.cookieAction === 'get') {
       const cookies = await pageCtx.cookies(params.urls);
       result.cookies = cookies.map((c) => ({
@@ -902,30 +966,10 @@ export class BrowserManager {
     }
 
     if (params.saveStorageStatePath) {
-      const targetPath = path.resolve(process.cwd(), String(params.saveStorageStatePath));
+      const targetPath = resolveSafePath(params.saveStorageStatePath, 'saveStorageStatePath');
       fs.mkdirSync(path.dirname(targetPath), { recursive: true });
       await pageCtx.storageState({ path: targetPath });
       result.savedStorageStatePath = targetPath;
-    }
-
-    if (params.loadStorageStatePath) {
-      const srcPath = path.resolve(process.cwd(), String(params.loadStorageStatePath));
-      const raw = JSON.parse(fs.readFileSync(srcPath, 'utf8'));
-      if (Array.isArray(raw.cookies) && raw.cookies.length > 0) {
-        await pageCtx.addCookies(raw.cookies);
-      }
-      if (Array.isArray(raw.origins) && raw.origins.length > 0 && page.url().startsWith('http')) {
-        const curOrigin = new URL(page.url()).origin;
-        const match = raw.origins.find((o) => o.origin === curOrigin);
-        if (match && Array.isArray(match.localStorage)) {
-          await page.evaluate((entries) => {
-            for (const item of entries) {
-              window.localStorage.setItem(item.name, item.value);
-            }
-          }, match.localStorage);
-        }
-      }
-      result.loadedStorageStatePath = srcPath;
     }
 
     return result;
@@ -946,6 +990,14 @@ export class BrowserManager {
       // Closing a connectOverCDP Browser disconnects without terminating the user's Chrome.
       await this.browser.close().catch(() => {});
     }
+    for (const f of this.tempDownloadFiles) {
+      try {
+        if (fs.existsSync(f)) fs.unlinkSync(f);
+      } catch {
+        // Ignore cleanup errors on already-removed or locked temp files.
+      }
+    }
+    this.tempDownloadFiles.clear();
     this.tabs.clear();
     this.context = null;
     this.browser = null;
