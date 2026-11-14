@@ -24,6 +24,15 @@ function compileFilterRegex(pattern) {
   }
 }
 
+function matchesPattern(text, pattern) {
+  if (pattern === undefined || pattern === null) return false;
+  const raw = String(pattern);
+  if (!raw) return false;
+  const hay = String(text || '');
+  if (hay.toLowerCase().includes(raw.toLowerCase())) return true;
+  return compileFilterRegex(raw).test(hay);
+}
+
 /**
  * Determine whether Submit/Publish actions are permitted (explicit parameter overrides env default).
  */
@@ -281,6 +290,86 @@ export async function isSubmitAtPoint(page, x, y) {
   }
 }
 
+function checkEnterSubmitInBrowser(target, patterns) {
+  if (!target || target === document.body || target === document.documentElement) {
+    return { isSubmit: false, label: '', reason: '' };
+  }
+  const submitRe = new RegExp(patterns.submit, 'i');
+  const safeRe = new RegExp(patterns.safe, 'i');
+  const tag = (target.tagName || '').toLowerCase();
+  const type = (target.getAttribute?.('type') || '').toLowerCase();
+  const role = (target.getAttribute?.('role') || '').toLowerCase();
+  const labelOf = (node) =>
+    (
+      node.innerText ||
+      node.textContent ||
+      node.value ||
+      node.getAttribute?.('aria-label') ||
+      node.getAttribute?.('title') ||
+      ''
+    )
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  const rawLabel = labelOf(target);
+  if ((tag === 'input' || tag === 'button') && type === 'submit') {
+    return {
+      isSubmit: !(rawLabel && safeRe.test(rawLabel)),
+      label: rawLabel || 'submit',
+      reason: `${tag}[type=submit]`,
+    };
+  }
+  if ((tag === 'button' || role === 'button' || type === 'button' || tag === 'a') && rawLabel && submitRe.test(rawLabel)) {
+    return { isSubmit: true, label: rawLabel, reason: 'submit-label-match' };
+  }
+
+  const form = target.form || target.closest?.('form');
+  if (form && tag === 'input' && !['button', 'reset', 'checkbox', 'radio', 'file'].includes(type)) {
+    const submitBtns = [
+      ...form.querySelectorAll('button[type="submit"], button:not([type]), input[type="submit"], input[type="image"]'),
+    ];
+    if (submitBtns.length === 0) {
+      return { isSubmit: true, label: rawLabel || target.name || 'form', reason: 'implicit-form-enter' };
+    }
+    for (const btn of submitBtns) {
+      const btnLabel = labelOf(btn);
+      if (submitRe.test(btnLabel) || !safeRe.test(btnLabel)) {
+        return { isSubmit: true, label: btnLabel || 'submit', reason: 'implicit-form-enter' };
+      }
+    }
+  }
+
+  return { isSubmit: false, label: rawLabel, reason: '' };
+}
+
+async function isEnterSubmitTarget(page, locator) {
+  const patterns = { submit: SUBMIT_LABEL_RE.source, safe: SAFE_SUBMIT_TYPE_RE.source };
+  if (locator) {
+    try {
+      return await locator.evaluate(checkEnterSubmitInBrowser, patterns);
+    } catch {
+      return { isSubmit: false, label: '', reason: '' };
+    }
+  }
+  let handle = null;
+  try {
+    handle = await page.evaluateHandle(() => {
+      let cur = document.activeElement;
+      while (cur && cur.shadowRoot && cur.shadowRoot.activeElement) {
+        cur = cur.shadowRoot.activeElement;
+      }
+      return cur || null;
+    });
+    const hasActive = await handle.evaluate((el) => Boolean(el)).catch(() => false);
+    if (!hasActive) return { isSubmit: false, label: '', reason: '' };
+    return await handle.evaluate(checkEnterSubmitInBrowser, patterns);
+  } catch {
+    return { isSubmit: false, label: '', reason: '' };
+  } finally {
+    await handle?.dispose().catch(() => {});
+  }
+}
+
 /**
  * Build a token-efficient snapshot across frames & open Shadow DOM (capped at maxChars),
  * assigning deterministic data-tbm-ref IDs and supporting query, onlyChanged delta, boxes, and savePath.
@@ -330,6 +419,10 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
             }
             return out;
           };
+
+          for (const oldRefEl of queryAllDeep(document, '[data-tbm-ref]')) {
+            oldRefEl.removeAttribute('data-tbm-ref');
+          }
 
           const root = rootSel
             ? (queryAllDeep(document, rootSel)[0] || document.body)
@@ -682,12 +775,24 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             el.style.outlineOffset = '1px';
           };
 
+          const safePatternMatch = (text, pat) => {
+            if (pat === undefined || pat === null) return false;
+            const raw = String(pat);
+            if (!raw) return false;
+            const hay = String(text || '');
+            if (hay.toLowerCase().includes(raw.toLowerCase())) return true;
+            try {
+              return new RegExp(raw, 'i').test(hay);
+            } catch {
+              const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              return new RegExp(escaped, 'i').test(hay);
+            }
+          };
+
           const chooseSelect = (sel, rawSpec) => {
             const specs = Array.isArray(rawSpec) ? rawSpec : [rawSpec];
-            const regexes = specs
-              .filter((p) => p !== undefined && p !== null)
-              .map((p) => new RegExp(String(p), 'i'));
-            if (regexes.length === 0) return null;
+            const patterns = specs.filter((p) => p !== undefined && p !== null && String(p) !== '');
+            if (patterns.length === 0) return null;
 
             if (sel._valueTracker && typeof sel._valueTracker.setValue === 'function') {
               sel._valueTracker.setValue('');
@@ -697,7 +802,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             if (sel.multiple || Array.isArray(rawSpec)) {
               const matched = [];
               for (const opt of sel.options) {
-                const hit = regexes.some((re) => re.test(opt.text) || re.test(opt.value));
+                const hit = patterns.some((pat) => safePatternMatch(opt.text, pat) || safePatternMatch(opt.value, pat));
                 opt.selected = sel.multiple ? hit : false;
                 if (hit) matched.push(opt);
               }
@@ -709,7 +814,8 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                 chosen = matched.map((o) => clean(o.text));
               }
             } else {
-              const opt = [...sel.options].find((o) => regexes[0].test(o.text) || regexes[0].test(o.value));
+              const pat = patterns[0];
+              const opt = [...sel.options].find((o) => safePatternMatch(o.text, pat) || safePatternMatch(o.value, pat));
               if (!opt) return null;
               sel.value = opt.value;
               chosen = clean(opt.text);
@@ -724,8 +830,8 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             const keys = Array.isArray(f.keys) ? f.keys : f.keys ? [f.keys] : [];
             const nots = Array.isArray(f.not) ? f.not : f.not ? [f.not] : [];
             if (keys.length === 0) return false;
-            if (nots.some((n) => new RegExp(n, 'i').test(text))) return false;
-            return keys.some((k) => new RegExp(k, 'i').test(text));
+            if (nots.some((n) => safePatternMatch(text, n))) return false;
+            return keys.some((k) => safePatternMatch(text, k));
           };
 
           const frameFilled = [];
@@ -788,13 +894,12 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                 });
 
                 for (const pat of patterns) {
-                  const re = new RegExp(pat, 'i');
                   for (const ctrl of controls) {
                     const wrap = ctrl.closest('label') || ctrl.parentElement || ctrl;
                     const optLabel = clean(
                       wrap.innerText || ctrl.getAttribute('aria-label') || ctrl.value || ''
                     );
-                    if (!re.test(optLabel)) continue;
+                    if (!safePatternMatch(optLabel, pat)) continue;
                     if (requireKeyMatch && !matchesSpec(optLabel.toLowerCase(), f)) continue;
 
                     const isAria = ctrl.hasAttribute('role');
@@ -1024,6 +1129,24 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             return out;
           };
 
+          const safePatternMatch = (text, pat) => {
+            if (pat === undefined || pat === null) return false;
+            const raw = String(pat);
+            if (!raw) return false;
+            const hay = String(text || '');
+            if (hay.toLowerCase().includes(raw.toLowerCase())) return true;
+            try {
+              return new RegExp(raw, 'i').test(hay);
+            } catch {
+              const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              return new RegExp(escaped, 'i').test(hay);
+            }
+          };
+
+          for (const old of queryAllDeep(document, '[data-tbm-combo]')) {
+            old.removeAttribute('data-tbm-combo');
+          }
+
           const combos = queryAllDeep(document, '[role="combobox"]').filter((el) => {
             if (el.tagName === 'SELECT') return false;
             const st = getComputedStyle(el);
@@ -1049,8 +1172,8 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                 el.closest('[class*="field"], [class*="Field"], .form-group, [role="listitem"]')?.innerText,
               ].join(' ')
             );
-            if (nots.some((n) => new RegExp(n, 'i').test(txt))) return false;
-            return keys.some((k) => new RegExp(k, 'i').test(txt));
+            if (nots.some((n) => safePatternMatch(txt, n))) return false;
+            return keys.some((k) => safePatternMatch(txt, k));
           });
           if (!hit) return null;
           const marker = `c${fieldSpec._idx}`;
@@ -1065,7 +1188,10 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
       try {
         const comboLoc = frameInfo.frame.locator(`[data-tbm-combo="${comboTag}"]`).first();
         await comboLoc.click({ timeout: 2500 });
-        const optLoc = frameInfo.frame.getByRole('option', { name: new RegExp(f.value, 'i') }).first();
+        let optLoc = frameInfo.frame.getByRole('option', { name: f.value, exact: false }).first();
+        if ((await optLoc.count()) === 0) {
+          optLoc = frameInfo.frame.getByRole('option', { name: compileFilterRegex(f.value) }).first();
+        }
         if ((await optLoc.count()) > 0) {
           await optLoc.click({ timeout: 2500 });
           filled.push({
@@ -1115,15 +1241,13 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
         uploaded = true;
       }
     } else {
-      const keyRes = (Array.isArray(ff.keys) ? ff.keys : ff.keys ? [ff.keys] : []).map(
-        (k) => new RegExp(k, 'i')
-      );
+      const fileKeys = Array.isArray(ff.keys) ? ff.keys : ff.keys ? [ff.keys] : [];
       for (const frameInfo of frames) {
         const fileInputs = frameInfo.frame.locator('input[type="file"]');
         const count = await fileInputs.count();
         for (let i = 0; i < count; i++) {
           const loc = fileInputs.nth(i);
-          if (keyRes.length > 0) {
+          if (fileKeys.length > 0) {
             const label = await loc.evaluate((el) => {
               const blk = el.closest('label, .form-group, .field, [role="listitem"], fieldset') || el.parentElement;
               return (
@@ -1136,7 +1260,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                 (blk?.innerText || '')
               );
             });
-            if (!keyRes.some((re) => re.test(label))) continue;
+            if (!fileKeys.some((k) => matchesPattern(label, k))) continue;
           }
           await loc.setInputFiles(resolvedPaths);
           uploaded = true;
@@ -1223,10 +1347,41 @@ async function executeSingleAction(page, params = {}) {
       }
       return { ok: true, action, textGone: params.textGone };
     }
-    if (params.selector || params.ref || params.text) {
+    if (params.ref) {
       const target = await resolveTarget(page, params);
       await target.locator.waitFor({ state: params.state || 'visible', timeout });
-      return { ok: true, action, waitedFor: params.ref || params.selector || params.text };
+      return { ok: true, action, waitedFor: params.ref };
+    }
+    if (params.selector || params.text) {
+      const desiredState = params.state || 'visible';
+      const frames = getAllFrames(page);
+      const scopedFrames = params.frameIdx !== undefined && params.frameIdx !== null
+        ? frames.filter((f) => f.frameIdx === params.frameIdx)
+        : frames;
+      if (scopedFrames.length === 0) {
+        throw new Error(`No matching frames found for wait target (${params.selector || params.text}).`);
+      }
+      const makeLoc = (f) =>
+        params.selector
+          ? f.frame.locator(params.selector).first()
+          : f.frame.getByText(params.text, { exact: false }).first();
+
+      if (desiredState === 'hidden' || desiredState === 'detached') {
+        for (const f of scopedFrames) {
+          const loc = makeLoc(f);
+          if ((await loc.count().catch(() => 0)) > 0) {
+            await loc.waitFor({ state: desiredState, timeout });
+          }
+        }
+        return { ok: true, action, waitedFor: params.selector || params.text };
+      }
+
+      try {
+        await Promise.any(scopedFrames.map((f) => makeLoc(f).waitFor({ state: desiredState, timeout })));
+      } catch {
+        throw new Error(`Timed out after ${timeout}ms waiting for "${params.selector || params.text}" to become ${desiredState}.`);
+      }
+      return { ok: true, action, waitedFor: params.selector || params.text };
     }
     const ms = Math.min(Number(params.ms) || 500, 15000);
     await page.waitForTimeout(ms);
@@ -1235,22 +1390,35 @@ async function executeSingleAction(page, params = {}) {
 
   if (action === 'press') {
     if (!params.key) throw new Error('press action requires key.');
+    const isEnter = /^(enter|numpadenter)$/i.test(String(params.key).trim());
     if (params.ref || params.selector || params.text) {
       const target = await resolveTarget(page, params);
-      if (params.key === 'Enter' && !allowSubmit) {
-        const meta = await isSubmitLikeElement(target.locator);
+      if (isEnter && !allowSubmit) {
+        const meta = await isEnterSubmitTarget(page, target.locator);
         if (meta.isSubmit) {
           return {
             ok: false,
             blocked: true,
             action,
             label: meta.label,
-            reason: 'Submit guard: allowSubmit=false blocks pressing Enter on submit-like control.',
+            reason: `Submit guard: allowSubmit=false blocks pressing ${params.key} (${meta.reason}).`,
           };
         }
       }
       await target.locator.press(params.key, { timeout });
       return { ok: true, action, key: params.key };
+    }
+    if (isEnter && !allowSubmit) {
+      const meta = await isEnterSubmitTarget(page, null);
+      if (meta.isSubmit) {
+        return {
+          ok: false,
+          blocked: true,
+          action,
+          label: meta.label,
+          reason: `Submit guard: allowSubmit=false blocks pressing ${params.key} (${meta.reason}).`,
+        };
+      }
     }
     await page.keyboard.press(params.key);
     return { ok: true, action, key: params.key };

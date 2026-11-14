@@ -1023,6 +1023,89 @@ describe('turbo-browser-mcp integration', () => {
     assert.equal(typeof snapTimed.elapsedMs, 'number');
   });
 
+  it('prevents stale data-tbm-ref collisions, handles regex metacharacters in labels/options, and guards implicit Enter submit', async () => {
+    const opened = await manager.tabsBatch([
+      { action: 'open', url: 'about:blank', isolatedContext: 'regression', activate: true },
+    ]);
+    const tabId = opened.results[0].tabId;
+    const { page } = await manager.getPage(tabId);
+    await page.setContent(`<!doctype html><html><body>
+      <a id="top-link" href="#top" onclick="window.__topClicked = true; return false;">Skip Navigation</a>
+      <form id="edge-f" onsubmit="event.preventDefault(); window.__edgeSubmitted = (window.__edgeSubmitted || 0) + 1;">
+        <input id="first" name="q" type="text" aria-label="Search (optional)" />
+        <label for="phone">Phone (optional)</label>
+        <input id="phone" type="text" />
+        <label for="lang">Skill (C++)</label>
+        <select id="lang"><option value="">Pick</option><option value="c++">C++</option><option value="ts">TypeScript</option></select>
+        <label><input id="exp" type="checkbox" /> 5+ years (Senior)</label>
+        <button id="edge-sub" type="submit">Submit</button>
+      </form>
+      <form id="safe-search-f" onsubmit="event.preventDefault(); window.__safeSearched = (window.__safeSearched || 0) + 1;">
+        <input id="q-safe" type="search" />
+        <button type="submit">Search</button>
+      </form>
+    </body></html>`);
+
+    // 1. Switching inspect_compact modes must clear stale [data-tbm-ref] attributes.
+    await inspectCompact(page, { mode: 'interactive' });
+    const formsSnap = await inspectCompact(page, { mode: 'forms' });
+    assert.ok(formsSnap.text.includes('[f0:e1] <input:text> "Search (optional)"'));
+    await actFast(page, { action: 'click', ref: 'f0:e1' });
+    await actFast(page, { action: 'fill', ref: 'f0:e1', value: 'hello' });
+    const afterRefState = await evaluateJs(page, {
+      expression: '({ val: document.getElementById("first").value, topClicked: Boolean(window.__topClicked) })',
+    });
+    assert.deepEqual(afterRefState.result, { val: 'hello', topClicked: false });
+
+    // 2. Regex metacharacters in keys, select value, and check labels must match cleanly without SyntaxError.
+    const metaFill = await smartFillForm(page, {
+      fields: [
+        { keys: ['Phone (optional)'], value: '0999888777' },
+        { keys: ['C++'], value: 'C++' },
+        { check: '5+ years (Senior)' },
+      ],
+    });
+    assert.equal(metaFill.filledCount, 3);
+    const metaState = await evaluateJs(page, {
+      expression: '({ phone: document.getElementById("phone").value, lang: document.getElementById("lang").value, exp: document.getElementById("exp").checked })',
+    });
+    assert.deepEqual(metaState.result, { phone: '0999888777', lang: 'c++', exp: true });
+
+    // 3. Pressing Enter inside a <form> input must be blocked when allowSubmit=false, allowed on safe Search forms or allowSubmit=true.
+    const blockedEnter = await actFast(page, { action: 'press', selector: '#first', key: 'Enter', allowSubmit: false });
+    assert.equal(blockedEnter.blocked, true);
+
+    await actFast(page, { action: 'focus', selector: '#phone' });
+    const blockedActiveEnter = await actFast(page, { action: 'press', key: 'Enter', allowSubmit: false });
+    assert.equal(blockedActiveEnter.blocked, true);
+
+    const safeEnter = await actFast(page, { action: 'press', selector: '#q-safe', key: 'Enter', allowSubmit: false });
+    assert.equal(safeEnter.ok, true);
+
+    const allowedEnter = await actFast(page, { action: 'press', selector: '#first', key: 'Enter', allowSubmit: true });
+    assert.equal(allowedEnter.ok, true);
+
+    const submitCounts = await evaluateJs(page, {
+      expression: '({ edge: window.__edgeSubmitted || 0, safe: window.__safeSearched || 0 })',
+    });
+    assert.deepEqual(submitCounts.result, { edge: 1, safe: 1 });
+
+    // 4. Async wait for text/selector appearing after action delay (must not throw immediately on count=0).
+    await page.setContent(`<!doctype html><html><body>
+      <button id="enable-btn" type="button" onclick="setTimeout(() => { const inp = document.getElementById('async-inp'); inp.disabled = false; const p = document.createElement('p'); p.id='async-msg'; p.textContent='Async ready!'; document.body.appendChild(p); }, 250);">Enable</button>
+      <input id="async-inp" type="text" disabled />
+    </body></html>`);
+    const asyncBatch = await batchActions(page, [
+      { action: 'click', selector: '#enable-btn' },
+      { action: 'wait', text: 'Async ready!', timeoutMs: 4000 },
+      { action: 'wait', selector: '#async-msg', timeoutMs: 2000 },
+      { action: 'fill', selector: '#async-inp', value: 'loaded-ok' },
+    ]);
+    assert.equal(asyncBatch.completed, 4);
+    const asyncVal = await evaluateJs(page, { expression: 'document.getElementById("async-inp").value' });
+    assert.equal(asyncVal.result, 'loaded-ok');
+  });
+
   it('supports CLI flags --version, --help, and --doctor', async () => {
     const runCliFlag = (args) =>
       new Promise((resolve, reject) => {
