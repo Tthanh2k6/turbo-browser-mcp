@@ -296,12 +296,188 @@ const V3_HTML = `<!doctype html>
 </body>
 </html>`;
 
+const FORMS_ALL_HTML = `<!doctype html>
+<html>
+<head><title>All Form Controls Fixture</title></head>
+<body>
+  <form id="all-form" onsubmit="event.preventDefault(); window.__allFormSubmitted = true;">
+    <input id="f-date" type="date" aria-label="Start Date" />
+    <input id="f-time" type="time" aria-label="Start Time" />
+    <input id="f-dt" type="datetime-local" aria-label="Meeting Slot" />
+    <input id="f-month" type="month" aria-label="Billing Month" />
+    <input id="f-num" type="number" aria-label="Years Experience" />
+    <input id="f-tel" type="tel" aria-label="Mobile Tel" />
+    <input id="f-url" type="url" aria-label="Portfolio URL" />
+    <input id="f-pass" type="password" aria-label="Access Passcode" />
+    <input id="f-color" type="color" aria-label="Brand Color" />
+    <input id="f-range" type="range" min="0" max="100" value="10" aria-label="Confidence Score" />
+    <input id="email-personal" type="email" aria-label="Personal Email" />
+    <input id="email-work" type="email" aria-label="Work Email" />
+    <input id="ref-target" type="text" aria-label="Ref Target Input" />
+    <input id="sel-target" type="text" aria-label="Selector Target Input" />
+    <textarea id="small-note" aria-label="Short Note" style="width:140px;height:36px;"></textarea>
+    <div id="main-essay" contenteditable="true" role="textbox" aria-label="Detailed Essay" style="width:360px;height:140px;border:1px solid #999;"></div>
+    <button id="dark-switch" type="button" role="switch" aria-checked="false" aria-label="Dark Mode">Dark Mode</button>
+    <div id="tos-check" role="checkbox" aria-checked="false" tabindex="0">I agree to terms</div>
+    <input id="multi-files" type="file" multiple aria-label="Supporting Docs" />
+    <span id="multi-names"></span>
+    <button id="custom-upload-btn" type="button">Upload Avatar</button>
+    <input id="avatar-input" type="file" style="display:none" />
+    <span id="avatar-name"></span>
+  </form>
+  <script>
+    const sw = document.getElementById('dark-switch');
+    sw.addEventListener('click', () => {
+      sw.setAttribute('aria-checked', sw.getAttribute('aria-checked') === 'true' ? 'false' : 'true');
+    });
+    const tos = document.getElementById('tos-check');
+    tos.addEventListener('click', () => {
+      tos.setAttribute('aria-checked', tos.getAttribute('aria-checked') === 'true' ? 'false' : 'true');
+    });
+    document.getElementById('multi-files').addEventListener('change', (e) => {
+      document.getElementById('multi-names').textContent = [...e.target.files].map((f) => f.name).join(',');
+    });
+    const avatarInput = document.getElementById('avatar-input');
+    document.getElementById('custom-upload-btn').addEventListener('click', () => avatarInput.click());
+    avatarInput.addEventListener('change', (e) => {
+      const f = e.target.files?.[0];
+      document.getElementById('avatar-name').textContent = f ? f.name : '';
+    });
+  </script>
+</body>
+</html>`;
+
+const SCRAPE_HTML = `<!doctype html>
+<html>
+<head><title>Scraping & Markdown Fixture</title></head>
+<body>
+  <aside id="noise">Ignore sidebar promotional banner</aside>
+  <main>
+    <article>
+      <h1>Catalog Page 1</h1>
+      <table id="pricing-table">
+        <thead><tr><th>Plan</th><th>Price</th></tr></thead>
+        <tbody>
+          <tr><td><p>Starter</p></td><td>$0</td></tr>
+          <tr><td><p>Pro</p></td><td>$29</td></tr>
+        </tbody>
+      </table>
+      <ul>
+        <li>Backend
+          <ul>
+            <li>Postgres</li>
+            <li>Redis</li>
+          </ul>
+        </li>
+        <li>Frontend</li>
+      </ul>
+      <pre><code>const fast = true;
+return fast;</code></pre>
+      <blockquote>Important quote for benchmark</blockquote>
+      <p>Read the <a href="https://example.com/docs">API guide</a> carefully.</p>
+      <shadow-article></shadow-article>
+      <div id="items">
+        <div class="card" data-price="10">Alpha</div>
+        <div class="card" data-price="25">Beta</div>
+      </div>
+      <div id="page-status">Page 1 ready</div>
+      <button id="load-more" type="button">Load More</button>
+    </article>
+  </main>
+  <iframe id="scrape-frame" src="/iframe-form" style="width:300px;height:90px;"></iframe>
+  <script>
+    class ShadowArticle extends HTMLElement {
+      constructor() {
+        super();
+        const root = this.attachShadow({ mode: 'open' });
+        root.innerHTML = '<h3>Shadow Section</h3><p>Hidden inside shadow root</p>';
+      }
+    }
+    customElements.define('shadow-article', ShadowArticle);
+    document.getElementById('load-more').addEventListener('click', () => {
+      setTimeout(() => {
+        const d = document.createElement('div');
+        d.className = 'card';
+        d.setAttribute('data-price', '50');
+        d.textContent = 'Gamma';
+        document.getElementById('items').appendChild(d);
+        document.getElementById('page-status').textContent = 'Page 2 loaded';
+      }, 120);
+    });
+  </script>
+</body>
+</html>`;
+
+const INTERACTIONS_HTML = `<!doctype html>
+<html>
+<head><title>Interactions Matrix Fixture</title></head>
+<body>
+  <button id="dbl-btn" type="button">Double Target</button>
+  <input id="edit-inp" type="text" value="initial text" aria-label="Editable Input" />
+  <div id="edit-ce" contenteditable="true" role="textbox" aria-label="Editable Div" style="width:200px;height:40px;border:1px solid #999;">seed</div>
+  <label><input id="agree-cb" type="checkbox" /> Native Agree</label>
+  <button id="role-sw" type="button" role="switch" aria-checked="false">Notify Switch</button>
+  <select id="single-sel" aria-label="Single Select">
+    <option value="alpha">Alpha Label</option>
+    <option value="beta">Beta Label</option>
+    <option value="gamma">Gamma Label</option>
+  </select>
+  <select id="multi-sel" multiple aria-label="Multi Select">
+    <option value="alpha">Alpha Label</option>
+    <option value="beta">Beta Label</option>
+    <option value="gamma">Gamma Label</option>
+  </select>
+  <div id="hide-me">Visible Soon Hidden</div>
+  <div id="detach-me">Attached Soon Detached</div>
+  <button id="trigger-waits" type="button">Trigger Waits</button>
+  <button id="batch-ok-btn" type="button" onclick="window.__batchOk = true;">Batch OK</button>
+  <a id="next-route" href="/interactions-done">Go Done</a>
+  <div style="height:1600px;">Spacer</div>
+  <button id="bottom-btn" type="button" onclick="window.__bottomHit = true;">Bottom Target</button>
+  <script>
+    window.__dblCount = 0;
+    window.__keyLog = [];
+    window.__batchOk = false;
+    window.__bottomHit = false;
+    document.getElementById('dbl-btn').addEventListener('dblclick', () => { window.__dblCount++; });
+    const inp = document.getElementById('edit-inp');
+    inp.addEventListener('focus', () => { window.__inpFocused = true; });
+    inp.addEventListener('keydown', (e) => window.__keyLog.push(e.key));
+    const sw = document.getElementById('role-sw');
+    sw.addEventListener('click', () => {
+      sw.setAttribute('aria-checked', sw.getAttribute('aria-checked') === 'true' ? 'false' : 'true');
+    });
+    document.getElementById('trigger-waits').addEventListener('click', () => {
+      setTimeout(() => { document.getElementById('hide-me').style.display = 'none'; }, 100);
+      setTimeout(() => { document.getElementById('detach-me')?.remove(); }, 130);
+    });
+  </script>
+</body>
+</html>`;
+
+const SESSION_DIAG_HTML = `<!doctype html>
+<html>
+<head><title>Session & Deep Diagnostics</title></head>
+<body>
+  <h1>Session Fixture</h1>
+  <img id="sess-img" src="/pixel.png" width="16" height="16" alt="px" />
+  <button id="confirm-btn" type="button" onclick="window.__confirmAns = confirm('Proceed safely?');">Confirm Box</button>
+  <button id="post-big" type="button" onclick="fetch('/api/large-echo', { method: 'POST', headers: { 'X-Custom-Hdr': 'turbo-hdr', 'Content-Type': 'application/json' }, body: JSON.stringify({ payload: 'long-data' }) }).then(r => r.text()).then(t => { window.__bigLen = t.length; });">Fetch Big Payload</button>
+  <script>
+    setTimeout(() => {
+      throw new Error('Unhandled boom 789');
+    }, 30);
+  </script>
+</body>
+</html>`;
+
 const TINY_PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7+fX0AAAAASUVORK5CYII=',
   'base64'
 );
 
 function startFixtureServer() {
+  let nav2Hits = 0;
   const server = http.createServer((req, res) => {
     const urlPath = (req.url || '/').split('?')[0];
     if (urlPath === '/') {
@@ -364,6 +540,79 @@ function startFixtureServer() {
     if (urlPath === '/google-analytics.com/collect') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ tracked: true }));
+      return;
+    }
+    if (urlPath === '/forms-all') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(FORMS_ALL_HTML);
+      return;
+    }
+    if (urlPath === '/scrape') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(SCRAPE_HTML);
+      return;
+    }
+    if (urlPath === '/interactions') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(INTERACTIONS_HTML);
+      return;
+    }
+    if (urlPath === '/interactions-done') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end('<!doctype html><html><head><title>Done Route</title></head><body><h1>Interactions Done</h1></body></html>');
+      return;
+    }
+    if (urlPath === '/nav-1') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<!doctype html><html><head><title>Nav One</title><style>
+        #print-only { display: none; }
+        @media print { #print-only { display: block; } }
+      </style></head><body>
+        <h1 id="nav-title">Page One</h1>
+        <div id="print-only">Print Layout</div>
+        <a id="to-nav2" href="/nav-2">Next</a>
+        <button id="open-popup" type="button" onclick="window.open('/popup', '_blank')">Open Popup</button>
+      </body></html>`);
+      return;
+    }
+    if (urlPath === '/nav-2') {
+      nav2Hits++;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<!doctype html><html><head><title>Nav Two #${nav2Hits}</title></head><body><h1 id="nav-title">Page Two</h1><span id="hit-count">${nav2Hits}</span></body></html>`);
+      return;
+    }
+    if (urlPath === '/popup') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<!doctype html><html><head><title>Popup Window</title></head><body><h1>Popup Ready</h1><button id="popup-ping" type="button" onclick="window.__popPing = true;">Ping</button></body></html>`);
+      return;
+    }
+    if (urlPath === '/session') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(SESSION_DIAG_HTML);
+      return;
+    }
+    if (urlPath === '/api/large-echo' && req.method === 'POST') {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'X-Reply-Tag': 'turbo-large' });
+        res.end(JSON.stringify({ ok: true, echo: JSON.parse(body || '{}'), pad: 'X'.repeat(450) }));
+      });
+      return;
+    }
+    if (urlPath === '/dummy.mp4') {
+      res.writeHead(200, { 'Content-Type': 'video/mp4' });
+      res.end(Buffer.from('00000018667479706d703432', 'hex'));
+      return;
+    }
+    if (urlPath === '/capture') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<!doctype html><html><head><title>Capture Fixture</title></head><body style="margin:0;">
+        <div id="card-box" style="width:240px;height:120px;background:#0ea5e9;color:#fff;padding:16px;">Element Capture Box</div>
+        <button id="cap-btn" type="button" style="width:160px;height:40px;">Ref Capture Target</button>
+        <div style="height:2200px;">Spacer</div>
+        <div id="footer-box">Bottom Box</div>
+      </body></html>`);
       return;
     }
     res.writeHead(404, { 'Content-Type': 'text/plain' });
@@ -1324,6 +1573,468 @@ describe('turbo-browser-mcp integration', () => {
     } finally {
       child.stdin.end();
       await new Promise((resolve) => child.once('exit', resolve));
+    }
+  });
+
+  it('fills all HTML5 input types, color/range, ARIA switches, not/ref/selector/main, overwrite, multi-file & filechooser', async () => {
+    const tmpA = path.join(os.tmpdir(), `tbm-a-${Date.now()}.txt`);
+    const tmpB = path.join(os.tmpdir(), `tbm-b-${Date.now()}.txt`);
+    const tmpAv = path.join(os.tmpdir(), `tbm-av-${Date.now()}.png`);
+    fs.writeFileSync(tmpA, 'doc a', 'utf8');
+    fs.writeFileSync(tmpB, 'doc b', 'utf8');
+    fs.writeFileSync(tmpAv, TINY_PNG);
+
+    try {
+      const opened = await manager.tabsBatch([
+        { action: 'open', url: `${baseUrl}/forms-all`, isolatedContext: 'forms-all', waitUntil: 'networkidle' },
+      ]);
+      const { page } = await manager.getPage(opened.activeTabId);
+
+      const formsSnap = await inspectCompact(page, { mode: 'forms' });
+      const refMatch = /\[(f0:e\d+)\]\s+<input:text>\s+"Ref Target Input"/.exec(formsSnap.text);
+      assert.ok(refMatch, 'should find Ref Target Input ref');
+      assert.ok(formsSnap.text.includes('<button:switch> "Dark Mode"'), 'should inspect ARIA switch role');
+
+      const fill1 = await smartFillForm(page, {
+        fields: [
+          { keys: ['start date'], value: '2026-11-14' },
+          { keys: ['start time'], value: '14:30' },
+          { keys: ['meeting slot'], value: '2026-11-14T14:30' },
+          { keys: ['billing month'], value: '2026-11' },
+          { keys: ['years experience'], value: '7' },
+          { keys: ['mobile tel'], value: '+84901234567' },
+          { keys: ['portfolio url'], value: 'https://example.org/app' },
+          { keys: ['access passcode'], value: 'S3cret!99' },
+          { keys: ['brand color'], value: '#ff5500' },
+          { keys: ['confidence score'], value: 85 },
+          { keys: ['email'], not: ['work'], value: 'personal@example.com' },
+          { keys: ['work email'], value: 'work@example.com' },
+          { ref: refMatch[1], value: 'filled-via-ref' },
+          { selector: '#sel-target', value: 'filled-via-selector' },
+          { keys: ['short note'], value: 'Brief note' },
+          { selector: '#dark-switch', value: true },
+          { check: 'I agree to terms' },
+          { keys: ['supporting docs'], files: [tmpA, tmpB] },
+          { selector: '#custom-upload-btn', file: tmpAv },
+        ],
+        main: 'Main detailed essay automatically placed in largest box.',
+      });
+      assert.equal(fill1.filledCount, 20);
+
+      const postSnap = await inspectCompact(page, { mode: 'forms' });
+      assert.ok(postSnap.text.includes('<button:switch> "Dark Mode" [checked]'), 'switch [checked] flag must render');
+      assert.ok(postSnap.text.includes('<div:checkbox> "I agree to terms" [checked]'), 'role=checkbox [checked] must render');
+
+      const skipCheck = await smartFillForm(page, {
+        overwrite: false,
+        fields: [
+          { keys: ['brand color'], value: '#00ff00' },
+          { keys: ['confidence score'], value: 25 },
+          { keys: ['work email'], value: 'ignored@example.com' },
+        ],
+      });
+      assert.equal(skipCheck.filledCount, 0);
+      assert.equal(skipCheck.skipped.length, 3);
+
+      const overCheck = await smartFillForm(page, {
+        overwrite: true,
+        fields: [
+          { keys: ['brand color'], value: '#00aa55' },
+          { keys: ['confidence score'], value: 33 },
+          { keys: ['work email'], value: 'updated@example.com' },
+          { keys: ['dark mode'], value: false },
+        ],
+      });
+      assert.equal(overCheck.filledCount, 4);
+
+      const vals = await evaluateJs(page, {
+        expression: `() => ({
+          date: document.getElementById('f-date').value,
+          time: document.getElementById('f-time').value,
+          dt: document.getElementById('f-dt').value,
+          month: document.getElementById('f-month').value,
+          num: document.getElementById('f-num').value,
+          tel: document.getElementById('f-tel').value,
+          url: document.getElementById('f-url').value,
+          pass: document.getElementById('f-pass').value,
+          color: document.getElementById('f-color').value,
+          range: document.getElementById('f-range').value,
+          personal: document.getElementById('email-personal').value,
+          work: document.getElementById('email-work').value,
+          refVal: document.getElementById('ref-target').value,
+          selVal: document.getElementById('sel-target').value,
+          small: document.getElementById('small-note').value,
+          essay: document.getElementById('main-essay').innerText.trim(),
+          darkSw: document.getElementById('dark-switch').getAttribute('aria-checked'),
+          tos: document.getElementById('tos-check').getAttribute('aria-checked'),
+          multi: document.getElementById('multi-names').textContent,
+          avatar: document.getElementById('avatar-name').textContent
+        })`,
+      });
+      assert.deepEqual(vals.result, {
+        date: '2026-11-14',
+        time: '14:30',
+        dt: '2026-11-14T14:30',
+        month: '2026-11',
+        num: '7',
+        tel: '+84901234567',
+        url: 'https://example.org/app',
+        pass: 'S3cret!99',
+        color: '#00aa55',
+        range: '33',
+        personal: 'personal@example.com',
+        work: 'updated@example.com',
+        refVal: 'filled-via-ref',
+        selVal: 'filled-via-selector',
+        small: 'Brief note',
+        essay: 'Main detailed essay automatically placed in largest box.',
+        darkSw: 'false',
+        tos: 'true',
+        multi: `${path.basename(tmpA)},${path.basename(tmpB)}`,
+        avatar: path.basename(tmpAv),
+      });
+    } finally {
+      for (const f of [tmpA, tmpB, tmpAv]) {
+        if (fs.existsSync(f)) fs.unlinkSync(f);
+      }
+    }
+  });
+
+  it('scrapes paginated items, Shadow DOM, tables/nested lists/code/quotes markdown, inspect modes, and JSON savePath', async () => {
+    const tmpScrapeJson = path.join(os.tmpdir(), `tbm-scrape-${Date.now()}.json`);
+    try {
+      const opened = await manager.tabsBatch([
+        { action: 'open', url: `${baseUrl}/scrape`, isolatedContext: 'scrape', waitUntil: 'networkidle' },
+      ]);
+      const { page } = await manager.getPage(opened.activeTabId);
+
+      const artSnap = await inspectCompact(page, { mode: 'article', includeFrames: false });
+      assert.ok(artSnap.text.includes('<h1> Catalog Page 1'));
+      assert.equal(artSnap.framesScanned, 1);
+      assert.equal(artSnap.text.includes('iframe f1'), false);
+
+      const allSnap = await inspectCompact(page, { mode: 'all', includeFrames: true });
+      assert.ok(allSnap.framesScanned >= 2);
+      assert.ok(allSnap.text.includes('Emergency Contact'));
+
+      const scopedSnap = await inspectCompact(page, { mode: 'all', selector: '#items', includeFrames: false });
+      assert.equal(scopedSnap.text.includes('Emergency Contact'), false);
+
+      const pageBatch = await batchActions(page, [
+        { action: 'click', selector: '#load-more' },
+        { action: 'wait', text: 'Page 2 loaded', timeoutMs: 3000 },
+      ]);
+      assert.equal(pageBatch.completed, 2);
+
+      const md = await extractCleanText(page, { format: 'markdown', includeFrames: false, maxChars: 6000 });
+      assert.ok(md.text.includes('# Catalog Page 1'));
+      assert.ok(md.text.includes('| Plan | Price |\n| --- | --- |'));
+      assert.ok(md.text.includes('| Starter | $0 |'));
+      assert.equal(md.text.includes('\nStarter\n'), false, 'should not duplicate <p> inside <td>');
+      assert.ok(md.text.includes('- Backend\n  - Postgres\n  - Redis\n- Frontend'), 'nested lists should indent cleanly without duplicating');
+      assert.ok(md.text.includes('```\nconst fast = true;\nreturn fast;\n```'));
+      assert.ok(md.text.includes('> Important quote for benchmark'));
+      assert.ok(md.text.includes('[API guide](https://example.com/docs)'));
+      assert.ok(md.text.includes('### Shadow Section'));
+      assert.ok(md.text.includes('Hidden inside shadow root'));
+      assert.equal(md.text.includes('Ignore sidebar promotional banner'), false);
+
+      const extracted = await evaluateJs(page, {
+        arg: { minPrice: 20 },
+        savePath: tmpScrapeJson,
+        expression: `(arg) => [...document.querySelectorAll('.card')]
+          .map(el => ({ name: el.textContent.trim(), price: Number(el.dataset.price) }))
+          .filter(item => item.price >= arg.minPrice)`,
+      });
+      assert.deepEqual(extracted.result, [
+        { name: 'Beta', price: 25 },
+        { name: 'Gamma', price: 50 },
+      ]);
+      assert.deepEqual(JSON.parse(fs.readFileSync(tmpScrapeJson, 'utf8')), extracted.result);
+    } finally {
+      if (fs.existsSync(tmpScrapeJson)) fs.unlinkSync(tmpScrapeJson);
+    }
+  });
+
+  it('covers dblclick, focus/clear/type slowly/press combos, check/uncheck switch, label selects, scroll, hidden/detached/url waits & batch continueOnError', async () => {
+    const opened = await manager.tabsBatch([
+      { action: 'open', url: `${baseUrl}/interactions`, isolatedContext: 'interactions', waitUntil: 'networkidle' },
+    ]);
+    const { page } = await manager.getPage(opened.activeTabId);
+
+    await actFast(page, { action: 'dblclick', selector: '#dbl-btn' });
+    await actFast(page, { action: 'focus', selector: '#edit-inp' });
+    await actFast(page, { action: 'clear', selector: '#edit-inp' });
+    await actFast(page, { action: 'type', selector: '#edit-inp', value: 'typed', slowly: true, delayMs: 5 });
+    const typedCheck = await evaluateJs(page, { expression: 'document.getElementById("edit-inp").value' });
+    assert.equal(typedCheck.result, 'typed');
+
+    await actFast(page, { action: 'press', selector: '#edit-inp', key: 'Control+a' });
+    await actFast(page, { action: 'press', selector: '#edit-inp', key: 'Backspace' });
+    await actFast(page, { action: 'press', key: 'Tab' });
+    await actFast(page, { action: 'press', key: 'Escape' });
+
+    await actFast(page, { action: 'clear', selector: '#edit-ce' });
+    await actFast(page, { action: 'fill', selector: '#edit-ce', value: 'ce-updated' });
+
+    await actFast(page, { action: 'check', selector: '#agree-cb' });
+    await actFast(page, { action: 'uncheck', selector: '#agree-cb' });
+    await actFast(page, { action: 'check', selector: '#role-sw' });
+    await actFast(page, { action: 'uncheck', selector: '#role-sw' });
+    await actFast(page, { action: 'check', selector: '#role-sw' });
+
+    const s1 = await actFast(page, { action: 'select', selector: '#single-sel', label: 'Beta Label' });
+    assert.deepEqual(s1.chosen, ['beta']);
+    const s2 = await actFast(page, { action: 'select', selector: '#single-sel', value: 'gamma' });
+    assert.deepEqual(s2.chosen, ['gamma']);
+    const m1 = await actFast(page, { action: 'select', selector: '#multi-sel', label: ['Alpha Label', 'Gamma Label'] });
+    assert.deepEqual(m1.chosen, ['alpha', 'gamma']);
+
+    await actFast(page, { action: 'scroll', dx: 0, dy: 200 });
+    const scrollMid = await evaluateJs(page, { expression: 'window.scrollY' });
+    assert.ok(scrollMid.result >= 150);
+
+    await actFast(page, { action: 'scroll', selector: '#bottom-btn' });
+    await actFast(page, { action: 'click', selector: '#bottom-btn' });
+
+    await actFast(page, { action: 'click', selector: '#trigger-waits' });
+    const waitHidden = await actFast(page, { action: 'wait', selector: '#hide-me', state: 'hidden', timeoutMs: 3000 });
+    const waitDetached = await actFast(page, { action: 'wait', selector: '#detach-me', state: 'detached', timeoutMs: 3000 });
+    assert.equal(waitHidden.ok, true);
+    assert.equal(waitDetached.ok, true);
+
+    const errBatch = await batchActions(page, [
+      { action: 'smart_fill_form', fields: [{ selector: '#edit-inp', value: 'batch-done' }] },
+      { action: 'click', selector: '#nonexistent-step', timeoutMs: 300 },
+      { action: 'click', selector: '#batch-ok-btn' },
+    ], { continueOnError: true, returnSnapshot: true });
+    assert.equal(errBatch.completed, 3);
+    assert.equal(errBatch.results[1].ok, false);
+    assert.equal(errBatch.results[2].ok, true);
+    assert.ok(errBatch.snapshot.includes('Mode: interactive'));
+
+    const stateCheck = await evaluateJs(page, {
+      expression: `() => ({
+        dbl: window.__dblCount,
+        focused: Boolean(window.__inpFocused),
+        inpVal: document.getElementById('edit-inp').value,
+        ceVal: document.getElementById('edit-ce').innerText.trim(),
+        cbChecked: document.getElementById('agree-cb').checked,
+        swChecked: document.getElementById('role-sw').getAttribute('aria-checked'),
+        bottomHit: window.__bottomHit,
+        batchOk: window.__batchOk,
+        keys: window.__keyLog
+      })`,
+    });
+    assert.equal(stateCheck.result.dbl, 1);
+    assert.equal(stateCheck.result.focused, true);
+    assert.equal(stateCheck.result.inpVal, 'batch-done');
+    assert.equal(stateCheck.result.ceVal, 'ce-updated');
+    assert.equal(stateCheck.result.cbChecked, false);
+    assert.equal(stateCheck.result.swChecked, 'true');
+    assert.equal(stateCheck.result.bottomHit, true);
+    assert.equal(stateCheck.result.batchOk, true);
+    assert.ok(stateCheck.result.keys.includes('Backspace'));
+
+    await actFast(page, { action: 'click', selector: '#next-route' });
+    const waitUrl = await actFast(page, { action: 'wait', url: '/interactions-done', timeoutMs: 3000 });
+    const waitLoad = await actFast(page, { action: 'wait', loadState: 'networkidle', timeoutMs: 3000 });
+    assert.equal(waitUrl.ok, true);
+    assert.equal(waitLoad.ok, true);
+  });
+
+  it('manages tab back/forward/reload, popup auto-registration, activate/close focus handoff, and media/motion/UA emulation', async () => {
+    const opened = await manager.tabsBatch([{ action: 'open', url: `${baseUrl}/nav-1`, waitUntil: 'networkidle' }]);
+    const mainTabId = opened.activeTabId;
+
+    await manager.tabsBatch([{ action: 'navigate', tabId: mainTabId, url: `${baseUrl}/nav-2`, waitUntil: 'networkidle' }]);
+    const { page: mainPage } = await manager.getPage(mainTabId);
+    const hit1 = Number((await evaluateJs(mainPage, { expression: 'document.getElementById("hit-count").textContent' })).result);
+
+    const reloadRes = await manager.tabsBatch([{ action: 'reload', tabId: mainTabId, waitUntil: 'networkidle' }]);
+    assert.equal(reloadRes.results[0].action, 'reload');
+    const hit2 = Number((await evaluateJs(mainPage, { expression: 'document.getElementById("hit-count").textContent' })).result);
+    assert.ok(hit2 > hit1, 'reload should increment server visit count');
+
+    const backRes = await manager.tabsBatch([{ action: 'back', tabId: mainTabId, waitUntil: 'domcontentloaded' }]);
+    assert.ok(backRes.results[0].url.endsWith('/nav-1'));
+
+    const fwdRes = await manager.tabsBatch([{ action: 'forward', tabId: mainTabId, waitUntil: 'domcontentloaded' }]);
+    assert.ok(fwdRes.results[0].url.endsWith('/nav-2'));
+
+    await manager.tabsBatch([{ action: 'back', tabId: mainTabId, waitUntil: 'domcontentloaded' }]);
+    await manager.tabsBatch([
+      {
+        action: 'emulate',
+        tabId: mainTabId,
+        media: 'print',
+        reducedMotion: 'reduce',
+        viewport: { width: 820, height: 640 },
+        userAgent: 'TurboAgent/1.0',
+      },
+    ]);
+    const emuState = await evaluateJs(mainPage, {
+      expression: `() => ({
+        printMedia: matchMedia('print').matches,
+        reduced: matchMedia('(prefers-reduced-motion: reduce)').matches,
+        width: window.innerWidth,
+        ua: navigator.userAgent
+      })`,
+    });
+    assert.deepEqual(emuState.result, {
+      printMedia: true,
+      reduced: true,
+      width: 820,
+      ua: 'TurboAgent/1.0',
+    });
+
+    await actFast(mainPage, { action: 'click', selector: '#open-popup' });
+    let listRes;
+    for (let i = 0; i < 20; i++) {
+      listRes = await manager.tabsBatch([{ action: 'list' }]);
+      if (listRes.tabs.some((t) => t.url.includes('/popup'))) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const popupTab = listRes.tabs.find((t) => t.url.includes('/popup'));
+    assert.ok(popupTab, 'window.open popup tab must be registered automatically');
+
+    const { page: popupPage } = await manager.getPage(popupTab.tabId);
+    await popupPage.waitForLoadState('domcontentloaded');
+    await actFast(popupPage, { action: 'click', selector: '#popup-ping' });
+    const pingState = await evaluateJs(popupPage, { expression: 'window.__popPing' });
+    assert.equal(pingState.result, true);
+
+    await manager.tabsBatch([{ action: 'activate', tabId: mainTabId }]);
+    const afterAct = await manager.tabsBatch([{ action: 'list' }]);
+    assert.equal(afterAct.activeTabId, mainTabId);
+
+    const closePopup = await manager.tabsBatch([{ action: 'close', tabId: popupTab.tabId }]);
+    assert.equal(closePopup.tabs.some((t) => t.tabId === popupTab.tabId), false);
+    assert.equal(closePopup.activeTabId, mainTabId);
+  });
+
+  it('persists/restores storageState into isolatedContext, manages sessionStorage, blocks no-images/no-media, and inspects deep diagnostics', async () => {
+    const tmpState = path.join(os.tmpdir(), `tbm-iso-state-${Date.now()}.json`);
+    try {
+      const opened = await manager.tabsBatch([{ action: 'open', url: `${baseUrl}/session`, waitUntil: 'networkidle' }]);
+      const tabId = opened.activeTabId;
+      const { page } = await manager.getPage(tabId);
+
+      await manager.getDiagnostics(tabId, { dialogPolicy: { action: 'accept' } });
+      await new Promise((r) => setTimeout(r, 80));
+      await actFast(page, { action: 'click', selector: '#confirm-btn' });
+      await actFast(page, { action: 'click', selector: '#post-big' });
+      await actFast(page, { action: 'wait', ms: 120 });
+
+      const diag = await manager.getDiagnostics(tabId, { statusFilter: 'all' });
+      assert.ok(diag.console.some((c) => c.level === 'pageerror' && c.text.includes('Unhandled boom 789')));
+      assert.ok(diag.dialogs.some((d) => d.type === 'confirm' && d.actionTaken === 'accepted'));
+
+      const bigReq = diag.requests.find((r) => r.url.includes('/api/large-echo'));
+      assert.ok(bigReq);
+
+      const reqHdrs = await manager.getDiagnostics(tabId, { reqId: bigReq.reqId, part: 'request-headers' });
+      assert.equal(reqHdrs.data['x-custom-hdr'], 'turbo-hdr');
+      const reqBody = await manager.getDiagnostics(tabId, { reqId: bigReq.reqId, part: 'request-body' });
+      assert.ok(reqBody.data.includes('long-data'));
+      const respHdrs = await manager.getDiagnostics(tabId, { reqId: bigReq.reqId, part: 'response-headers' });
+      assert.equal(respHdrs.data['x-reply-tag'], 'turbo-large');
+      const truncBody = await manager.getDiagnostics(tabId, { reqId: bigReq.reqId, maxBodyChars: 120 });
+      assert.equal(truncBody.request.bodyTruncated, true);
+      assert.ok(truncBody.request.responseBody.length <= 120);
+
+      await manager.manageNetworkSession(tabId, {
+        cookieAction: 'set',
+        cookies: [{ name: 'persist_sid', value: 'v4-secret' }],
+        storageAction: 'set',
+        storageType: 'both',
+        items: { authUser: 'tthanh2k6' },
+        saveStorageStatePath: tmpState,
+      });
+
+      const bothRead = await manager.manageNetworkSession(tabId, { storageAction: 'get', storageType: 'both' });
+      assert.equal(bothRead.storage.local.authUser, 'tthanh2k6');
+      assert.equal(bothRead.storage.session.authUser, 'tthanh2k6');
+
+      await manager.manageNetworkSession(tabId, { storageAction: 'clear', storageType: 'session' });
+      const afterClearSession = await manager.manageNetworkSession(tabId, { storageAction: 'get', storageType: 'both' });
+      assert.equal(afterClearSession.storage.local.authUser, 'tthanh2k6');
+      assert.equal(afterClearSession.storage.session.authUser, undefined);
+
+      // Restore storageState into a fresh isolatedContext tab
+      const isoOpened = await manager.tabsBatch([
+        { action: 'open', url: `${baseUrl}/session`, isolatedContext: 'restored-iso', waitUntil: 'networkidle' },
+      ]);
+      const isoTabId = isoOpened.activeTabId;
+      await manager.manageNetworkSession(isoTabId, { loadStorageStatePath: tmpState });
+      const isoCookies = await manager.manageNetworkSession(isoTabId, {
+        cookieAction: 'get',
+        storageAction: 'get',
+        storageType: 'local',
+      });
+      assert.ok(isoCookies.cookies.some((c) => c.name === 'persist_sid' && c.value === 'v4-secret'));
+      assert.equal(isoCookies.storage.local.authUser, 'tthanh2k6');
+
+      // Test no-images and no-media presets
+      const noImgRes = await manager.manageNetworkSession(isoTabId, { preset: 'no-images' });
+      assert.equal(noImgRes.presetApplied, 'no-images');
+      const { page: isoPage } = await manager.getPage(isoTabId);
+      const imgBlocked = await evaluateJs(isoPage, {
+        expression: `async () => new Promise((resolve) => {
+          const img = new Image();
+          img.onload = () => resolve('loaded');
+          img.onerror = () => resolve('blocked');
+          img.src = '/pixel.png?ni=' + Date.now();
+        })`,
+      });
+      assert.equal(imgBlocked.result, 'blocked');
+
+      const noMediaRes = await manager.manageNetworkSession(isoTabId, { preset: 'no-media' });
+      assert.equal(noMediaRes.presetApplied, 'no-media');
+      assert.ok(noMediaRes.blockedResources.includes('media'));
+    } finally {
+      if (fs.existsSync(tmpState)) fs.unlinkSync(tmpState);
+    }
+  });
+
+  it('captures element screenshots by selector/ref, jpeg quality, fullPage, and returnImage=false', async () => {
+    const tmpEl = path.join(os.tmpdir(), `tbm-el-${Date.now()}.png`);
+    const tmpJpg = path.join(os.tmpdir(), `tbm-jpg-${Date.now()}.jpg`);
+    const tmpFull = path.join(os.tmpdir(), `tbm-full-${Date.now()}.png`);
+    try {
+      const opened = await manager.tabsBatch([
+        { action: 'open', url: `${baseUrl}/capture`, isolatedContext: 'capture', waitUntil: 'networkidle' },
+      ]);
+      const { page } = await manager.getPage(opened.activeTabId);
+
+      const elShot = await capturePage(page, { selector: '#card-box', savePath: tmpEl, returnImage: false });
+      assert.equal(elShot.ok, true);
+      assert.equal(elShot.base64, undefined);
+      assert.ok(fs.existsSync(tmpEl));
+
+      const snap = await inspectCompact(page, { mode: 'interactive' });
+      const refMatch = /\[(f0:e\d+)\]\s+<button>\s+"Ref Capture Target"/.exec(snap.text);
+      assert.ok(refMatch, 'should locate button ref for capturePage');
+
+      const boxSnap = await capturePage(page, {
+        ref: refMatch[1],
+        type: 'jpeg',
+        quality: 60,
+        returnImage: false,
+        savePath: tmpJpg,
+      });
+      assert.equal(boxSnap.mimeType, 'image/jpeg');
+      assert.equal(boxSnap.base64, undefined);
+      const jpgHeader = fs.readFileSync(tmpJpg).subarray(0, 2);
+      assert.deepEqual([...jpgHeader], [0xff, 0xd8], 'should write valid JPEG magic bytes');
+
+      const fullShot = await capturePage(page, { fullPage: true, savePath: tmpFull, returnImage: false });
+      assert.ok(fullShot.bytes > elShot.bytes);
+      assert.ok(fs.existsSync(tmpFull));
+    } finally {
+      for (const f of [tmpEl, tmpJpg, tmpFull]) {
+        if (fs.existsSync(f)) fs.unlinkSync(f);
+      }
     }
   });
 });

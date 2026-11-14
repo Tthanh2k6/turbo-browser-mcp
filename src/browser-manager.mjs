@@ -176,6 +176,7 @@ export class BrowserManager {
         blockedResources: new Set(),
         blockedUrlPatterns: [],
         routeHandlerAttached: false,
+        cdpSession: null,
       };
       this.diagnostics.set(page, diag);
     }
@@ -329,6 +330,10 @@ export class BrowserManager {
       });
 
       page.on('close', () => {
+        if (diag.cdpSession) {
+          diag.cdpSession.detach().catch(() => {});
+          diag.cdpSession = null;
+        }
         const id = this.pageToId.get(page);
         if (id !== undefined) {
           this.tabs.delete(id);
@@ -576,9 +581,14 @@ export class BrowserManager {
           });
         }
         if (op.userAgent) {
-          const client = await page.context().newCDPSession(page);
-          await client.send('Emulation.setUserAgentOverride', { userAgent: String(op.userAgent) });
-          await client.detach().catch(() => {});
+          const diag = this._ensureDiagState(page);
+          if (!diag.cdpSession) {
+            diag.cdpSession = await page.context().newCDPSession(page);
+          }
+          await diag.cdpSession.send('Emulation.setUserAgentOverride', { userAgent: String(op.userAgent) });
+          if (Object.keys(mediaOpts).length > 0) {
+            await page.emulateMedia(mediaOpts);
+          }
         }
         results.push({
           action: 'emulate',

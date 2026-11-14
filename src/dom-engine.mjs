@@ -484,11 +484,11 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
 
           const selectorByMode = {
             interactive:
-              'a[href], button, input, textarea, select, [contenteditable="true"], [contenteditable=""], [role="button"], [role="link"], [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], [role="tab"], [role="menuitem"], summary',
+              'a[href], button, input, textarea, select, [contenteditable="true"], [contenteditable=""], [role="button"], [role="link"], [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], [role="switch"], [role="tab"], [role="menuitem"], summary',
             forms:
-              'input, textarea, select, [contenteditable="true"], [contenteditable=""], [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], button, [role="button"]',
+              'input, textarea, select, [contenteditable="true"], [contenteditable=""], [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], [role="switch"], button, [role="button"]',
             article: 'h1, h2, h3, h4, p, li, a[href], button',
-            all: 'h1, h2, h3, a[href], button, input, textarea, select, [contenteditable="true"], [role="button"], [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], p',
+            all: 'h1, h2, h3, a[href], button, input, textarea, select, [contenteditable="true"], [role="button"], [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], [role="switch"], p',
           };
 
           const sel = selectorByMode[modeArg] || selectorByMode.interactive;
@@ -534,6 +534,8 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
               } else if (el.value) {
                 extra += ` val="${clean(el.value).slice(0, 40)}"`;
               }
+            } else if (role === 'checkbox' || role === 'radio' || role === 'switch') {
+              if (el.getAttribute('aria-checked') === 'true') extra += ' [checked]';
             } else if (el.isContentEditable) {
               const txt = clean(el.innerText);
               if (txt) extra += ` val="${txt.slice(0, 40)}"`;
@@ -734,13 +736,19 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             if (wl) parts.push(wl.innerText);
             const blk = el.closest(qBlockSel) || el.getRootNode?.()?.host?.closest?.(qBlockSel);
             if (blk) parts.push(blk.innerText.slice(0, 300));
+            const elRoleDesc = (el.getAttribute('role') || '').toLowerCase();
+            if (elRoleDesc === 'switch' || elRoleDesc === 'checkbox' || elRoleDesc === 'radio') {
+              if (el.innerText) parts.push(el.innerText);
+            }
             const host = el.getRootNode?.()?.host;
             if (host) {
               const hostAttr = host.getAttribute('aria-label') || host.getAttribute('data-label');
               if (hostAttr) parts.push(hostAttr);
             }
             const prev = el.previousElementSibling;
-            if (prev) parts.push(prev.innerText);
+            if (prev && !prev.matches('button, input, select, textarea, a, [role="button"], [role="switch"], [role="checkbox"], [role="radio"], [role="textbox"]')) {
+              parts.push(prev.innerText);
+            }
             return clean(parts.join(' | ')).toLowerCase();
           };
 
@@ -866,12 +874,14 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             );
           }
 
-          // 2. Text / Select / Radio / Checkbox fields across light + open Shadow DOM
+          // 2. Text / Select / Radio / Checkbox / ARIA Switch fields across light + open Shadow DOM
           const inputs = queryAllDeep(
             document,
-            'input, textarea, select, [contenteditable="true"], [role="textbox"]'
+            'input, textarea, select, [contenteditable="true"], [role="textbox"], [role="checkbox"], [role="radio"], [role="switch"]'
           ).filter((el) => {
             if (!vis(el)) return false;
+            const r = (el.getAttribute('role') || '').toLowerCase();
+            if (r === 'switch' || r === 'checkbox' || r === 'radio') return true;
             const t = (el.getAttribute('type') || '').toLowerCase();
             return !['hidden', 'submit', 'button', 'image', 'reset', 'file'].includes(t);
           });
@@ -887,7 +897,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
               const toggleChoiceControls = (container, requireKeyMatch) => {
                 const controls = queryAllDeep(
                   container,
-                  'input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]'
+                  'input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"], [role="switch"]'
                 ).filter((c) => {
                   const st = getComputedStyle(c);
                   return st.display !== 'none' && st.visibility !== 'hidden';
@@ -895,9 +905,26 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
 
                 for (const pat of patterns) {
                   for (const ctrl of controls) {
-                    const wrap = ctrl.closest('label') || ctrl.parentElement || ctrl;
+                    const wrap = ctrl.closest('label');
+                    const lblListTxt = ctrl.labels?.length
+                      ? [...ctrl.labels].map((l) => l.innerText).join(' ')
+                      : '';
+                    const selfLabel = clean(
+                      (ctrl.hasAttribute('role') ? ctrl.innerText : '') ||
+                      ctrl.getAttribute('aria-label') ||
+                      ctrl.getAttribute('title') ||
+                      ''
+                    );
+                    const parentTxt =
+                      !wrap &&
+                      !lblListTxt &&
+                      !selfLabel &&
+                      ctrl.parentElement &&
+                      !/^(FORM|BODY|HTML|MAIN|SECTION)$/i.test(ctrl.parentElement.tagName)
+                        ? ctrl.parentElement.innerText
+                        : '';
                     const optLabel = clean(
-                      wrap.innerText || ctrl.getAttribute('aria-label') || ctrl.value || ''
+                      (wrap ? wrap.innerText : '') || lblListTxt || selfLabel || parentTxt || ctrl.value || ''
                     );
                     if (!safePatternMatch(optLabel, pat)) continue;
                     if (requireKeyMatch && !matchesSpec(optLabel.toLowerCase(), f)) continue;
@@ -969,15 +996,59 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                 continue;
               }
 
-              if (el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio') && typeof f.value === 'boolean') {
-                if (Boolean(el.checked) !== f.value) el.click();
-                el.style.outline = '2px solid #E0461D';
+              const elRole = (el.getAttribute('role') || '').toLowerCase();
+              if (elRole === 'switch' || elRole === 'checkbox' || elRole === 'radio') {
+                if (typeof f.value === 'boolean') {
+                  const curChecked = el.getAttribute('aria-checked') === 'true';
+                  if (curChecked !== f.value) el.click();
+                  el.style.outline = '2px solid #E0461D';
+                  frameFilled.push({
+                    idx: f._idx,
+                    frameIdx: frameIdxArg,
+                    tag: `role:${elRole}`,
+                    label: describe(el).slice(0, 50),
+                    checked: el.getAttribute('aria-checked') === 'true',
+                  });
+                  matchedIndexes.push(f._idx);
+                }
+                continue;
+              }
+
+              if (el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio')) {
+                if (typeof f.value === 'boolean') {
+                  if (Boolean(el.checked) !== f.value) el.click();
+                  el.style.outline = '2px solid #E0461D';
+                  frameFilled.push({
+                    idx: f._idx,
+                    frameIdx: frameIdxArg,
+                    tag: `input:${el.type}`,
+                    label: describe(el).slice(0, 50),
+                    checked: Boolean(el.checked),
+                  });
+                  matchedIndexes.push(f._idx);
+                }
+                continue;
+              }
+
+              if (el.tagName === 'INPUT' && el.type === 'color') {
+                if (el.dataset.tbmColorFilled === '1' && !overwriteFlag) {
+                  frameSkipped.push({
+                    idx: f._idx,
+                    frameIdx: frameIdxArg,
+                    reason: 'already-filled',
+                    label: describe(el).slice(0, 50),
+                  });
+                  matchedIndexes.push(f._idx);
+                  continue;
+                }
+                setNativeValue(el, String(f.value ?? ''));
+                el.dataset.tbmColorFilled = '1';
                 frameFilled.push({
                   idx: f._idx,
                   frameIdx: frameIdxArg,
-                  tag: `input:${el.type}`,
+                  tag: 'input:color',
                   label: describe(el).slice(0, 50),
-                  checked: Boolean(el.checked),
+                  value: el.value,
                 });
                 matchedIndexes.push(f._idx);
                 continue;
@@ -1060,6 +1131,8 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
           const leftover = inputs
             .filter((el) => {
               if (el.tagName === 'INPUT' && (el.type === 'radio' || el.type === 'checkbox')) return false;
+              const r = (el.getAttribute('role') || '').toLowerCase();
+              if (r === 'radio' || r === 'checkbox' || r === 'switch') return false;
               return !currentValue(el);
             })
             .slice(0, 10)
@@ -1587,8 +1660,21 @@ async function executeSingleAction(page, params = {}) {
   }
 
   if (action === 'check' || action === 'uncheck') {
-    if (action === 'check') await locator.check({ timeout });
-    else await locator.uncheck({ timeout });
+    const wantChecked = action === 'check';
+    const roleInfo = await locator.evaluate((el) => ({
+      role: (el.getAttribute('role') || '').toLowerCase(),
+      ariaChecked: el.getAttribute('aria-checked'),
+    })).catch(() => ({ role: '', ariaChecked: null }));
+
+    if (roleInfo.role === 'switch' || roleInfo.role === 'checkbox' || roleInfo.role === 'radio') {
+      if ((roleInfo.ariaChecked === 'true') !== wantChecked) {
+        await locator.click({ timeout });
+      }
+    } else if (wantChecked) {
+      await locator.check({ timeout });
+    } else {
+      await locator.uncheck({ timeout });
+    }
     return { ok: true, action, frameIdx };
   }
 
@@ -1716,52 +1802,163 @@ export async function extractCleanText(page, options = {}) {
     let part = '';
     try {
       part = await frameInfo.frame.evaluate(({ sel, fmt }) => {
-        const root = sel
-          ? document.querySelector(sel)
-          : document.querySelector('main, article, [role="main"]') || document.body;
-        if (!root) return '';
-        const clone = root.cloneNode(true);
-        for (const bad of clone.querySelectorAll('script, style, noscript, svg, template')) {
-          bad.remove();
-        }
+        const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'SVG', 'TEMPLATE']);
         const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
 
+        const findDeepFirst = (rootNode, query) => {
+          const stack = [rootNode];
+          while (stack.length > 0) {
+            const cur = stack.shift();
+            if (!cur || !cur.querySelector) continue;
+            const match = cur.querySelector(query);
+            if (match) return match;
+            for (const el of cur.querySelectorAll('*')) {
+              if (el.shadowRoot) stack.push(el.shadowRoot);
+            }
+          }
+          return null;
+        };
+
+        const root = sel
+          ? findDeepFirst(document, sel)
+          : document.querySelector('main, article, [role="main"]') || document.body;
+        if (!root) return '';
+
+        const isHiddenEl = (el) => {
+          if (!el || el.nodeType !== 1) return false;
+          if (SKIP_TAGS.has(el.tagName) || el.hasAttribute('hidden')) return true;
+          try {
+            return getComputedStyle(el).display === 'none';
+          } catch {
+            return false;
+          }
+        };
+
+        const extractDeepPlain = (node) => {
+          if (!node) return '';
+          if (node.nodeType === 3) return node.textContent || '';
+          if (node.nodeType !== 1 && node.nodeType !== 11) return '';
+          if (node.nodeType === 1 && isHiddenEl(node)) return '';
+          if (node.nodeType === 1 && node.tagName === 'BR') return '\n';
+
+          let pieces = [];
+          if (node.nodeType === 1 && node.shadowRoot) {
+            pieces.push(extractDeepPlain(node.shadowRoot));
+          } else if (node.nodeType === 1 && node.tagName === 'SLOT' && typeof node.assignedNodes === 'function') {
+            const assigned = node.assignedNodes({ flatten: true });
+            const list = assigned.length > 0 ? assigned : [...node.childNodes];
+            for (const c of list) pieces.push(extractDeepPlain(c));
+          } else {
+            for (const c of node.childNodes) pieces.push(extractDeepPlain(c));
+          }
+          const inner = pieces.join('');
+          const BLOCK = new Set(['H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'P', 'LI', 'TR', 'DIV', 'SECTION', 'ARTICLE', 'HEADER', 'FOOTER', 'BLOCKQUOTE', 'PRE']);
+          if (node.nodeType === 1 && BLOCK.has(node.tagName)) {
+            return `\n${inner}\n`;
+          }
+          return inner;
+        };
+
         if (fmt === 'markdown') {
+          const queryBlocksDeep = (rootNode) => {
+            const out = [];
+            const visit = (node) => {
+              if (!node || (node.nodeType === 1 && isHiddenEl(node))) return;
+              if (node.nodeType === 1 && node.matches?.('h1, h2, h3, h4, p, li, tr, pre, blockquote')) {
+                out.push(node);
+              }
+              if (node.nodeType === 1 && node.shadowRoot) {
+                for (const c of node.shadowRoot.childNodes) visit(c);
+                return;
+              }
+              if (node.nodeType === 1 && node.tagName === 'SLOT' && typeof node.assignedNodes === 'function') {
+                const assigned = node.assignedNodes({ flatten: true });
+                const list = assigned.length > 0 ? assigned : [...node.childNodes];
+                for (const c of list) visit(c);
+                return;
+              }
+              for (const c of node.childNodes) visit(c);
+            };
+            visit(rootNode);
+            return out;
+          };
+
+          const renderInline = (node, skipSubLists = false) => {
+            if (!node) return '';
+            if (node.nodeType === 3) return node.textContent || '';
+            if (node.nodeType !== 1) return '';
+            if (isHiddenEl(node)) return '';
+            if (skipSubLists && (node.tagName === 'UL' || node.tagName === 'OL')) return '';
+            if (node.tagName === 'A' && node.getAttribute('href')) {
+              let inner = '';
+              for (const c of node.childNodes) inner += renderInline(c, skipSubLists);
+              const label = clean(inner);
+              return label ? `[${label}](${node.getAttribute('href')})` : '';
+            }
+            if (node.shadowRoot) {
+              let sOut = '';
+              for (const c of node.shadowRoot.childNodes) sOut += renderInline(c, skipSubLists);
+              return sOut;
+            }
+            let outStr = '';
+            for (const c of node.childNodes) {
+              outStr += renderInline(c, skipSubLists);
+            }
+            return outStr;
+          };
+
+          const listDepthOf = (liNode) => {
+            let depth = 0;
+            let cur = liNode.parentElement;
+            while (cur) {
+              if (cur.tagName === 'UL' || cur.tagName === 'OL') depth++;
+              cur = cur.parentElement;
+            }
+            return Math.max(0, depth - 1);
+          };
+
           const out = [];
-          const blocks = clone.querySelectorAll('h1, h2, h3, h4, p, li, tr');
+          const blocks = queryBlocksDeep(root);
           if (blocks.length > 0) {
             for (const node of blocks) {
               const tag = node.tagName.toLowerCase();
-              if (tag === 'p' && node.closest('li')) continue;
-              if (tag === 'h1' || tag === 'h2' || tag === 'h3' || tag === 'h4') {
+              if (tag === 'p' && node.closest('li, td, th, blockquote, pre')) continue;
+              if ((tag === 'h1' || tag === 'h2' || tag === 'h3' || tag === 'h4') && node.closest('pre')) continue;
+
+              if (tag === 'pre') {
+                const codeTxt = (node.innerText || node.textContent || '').replace(/^\n+|\n+$/g, '');
+                if (codeTxt) out.push(`\`\`\`\n${codeTxt}\n\`\`\``);
+              } else if (tag === 'blockquote') {
+                const txt = clean(renderInline(node));
+                if (txt) out.push(`> ${txt}`);
+              } else if (tag === 'h1' || tag === 'h2' || tag === 'h3' || tag === 'h4') {
                 const level = '#'.repeat(Number(tag[1]));
-                const txt = clean(node.innerText || node.textContent);
+                const txt = clean(renderInline(node));
                 if (txt) out.push(`${level} ${txt}`);
               } else if (tag === 'li') {
-                const txt = clean(node.innerText || node.textContent);
-                if (txt) out.push(`- ${txt}`);
+                const txt = clean(renderInline(node, true));
+                const indent = '  '.repeat(listDepthOf(node));
+                if (txt) out.push(`${indent}- ${txt}`);
               } else if (tag === 'tr') {
-                const cells = [...node.querySelectorAll('th, td')].map((c) => clean(c.innerText || c.textContent));
-                if (cells.length > 0) out.push(`| ${cells.join(' | ')} |`);
+                const directCells = [...node.children].filter((c) => c.tagName === 'TH' || c.tagName === 'TD');
+                const cells = (directCells.length > 0 ? directCells : [...node.querySelectorAll('th, td')]);
+                const cellTexts = cells.map((c) => clean(renderInline(c)));
+                if (cellTexts.length > 0) {
+                  out.push(`| ${cellTexts.join(' | ')} |`);
+                  if (cells.every((c) => c.tagName === 'TH')) {
+                    out.push(`| ${cells.map(() => '---').join(' | ')} |`);
+                  }
+                }
               } else {
-                const rendered = [...node.childNodes]
-                  .map((child) => {
-                    if (child.nodeType === 1 && child.tagName === 'A' && child.getAttribute('href')) {
-                      const label = clean(child.innerText || child.textContent);
-                      return label ? `[${label}](${child.getAttribute('href')})` : '';
-                    }
-                    return child.textContent || '';
-                  })
-                  .join(' ');
-                const txt = clean(rendered);
+                const txt = clean(renderInline(node));
                 if (txt) out.push(txt);
               }
             }
-            return out.join('\n');
+            if (out.length > 0) return out.join('\n');
           }
         }
 
-        return (clone.innerText || clone.textContent || '')
+        return extractDeepPlain(root)
           .split('\n')
           .map((line) => line.replace(/\s+/g, ' ').trim())
           .filter(Boolean)
