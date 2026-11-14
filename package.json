@@ -1,0 +1,40 @@
+{
+  "name": "turbo-browser-mcp",
+  "version": "0.4.0",
+  "description": "Fast, token-efficient MCP server for Playwright browser automation with batched DOM actions, React/Shadow DOM/contenteditable form prefill, isolated contexts, download/network diagnostics, and direct disk file uploads.",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "bin": {
+    "turbo-browser-mcp": "./src/index.mjs"
+  },
+  "files": [
+    "src/",
+    "benchmarks/",
+    "README.md",
+    "LICENSE",
+    "server.json"
+  ],
+  "scripts": {
+    "start": "node ./src/index.mjs",
+    "test": "node --test test/*.test.mjs",
+    "doctor": "node ./src/index.mjs --doctor",
+    "benchmark": "node ./benchmarks/benchmark.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "playwright",
+    "browser-automation",
+    "cdp",
+    "shadow-dom",
+    "llm-agent"
+  ],
+  "author": "Trung Thanh Tran",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "playwright-core": ">=1.49.0"
+  }
+}

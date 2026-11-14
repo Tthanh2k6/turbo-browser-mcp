@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20, 22]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Playwright Chromium
+        run: npx playwright-core install --with-deps chromium
+
+      - name: Check CLI version & environment doctor
+        run: |
+          node ./src/index.mjs --version
+          npm run doctor
+
+      - name: Run integration test suite
+        run: npm test
+
+      - name: Run benchmark sanity check
+        run: npm run benchmark
