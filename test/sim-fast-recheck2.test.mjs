@@ -142,12 +142,16 @@ describe('sim-fast-recheck2 — resolveSafePath #179 diff-scoped audit', () => {
       const res2 = resolveSafePath('new-folder/sub/output.png');
       assert.equal(res2.toLowerCase(), path.join(canonWorkspace, 'new-folder', 'sub', 'output.png').toLowerCase());
 
-      // Explicit path via symlinked cwd prefix (un-canonicalized lexical prefix matching rawRoot)
+      // On Windows, chdir() preserves junction spelling in process.cwd() (rawRoot === symlinkedCwd)
+      if (process.platform === 'win32') {
+        const resWinCwd = resolveSafePath(path.join(symlinkedCwd, 'deep', 'win-cwd.json'));
+        assert.equal(resWinCwd.toLowerCase(), path.join(canonWorkspace, 'deep', 'win-cwd.json').toLowerCase());
+      }
+
+      // Custom TURBO_BROWSER_SAVE_ROOT with symlinked root + secondary root (rawRoot === symlinkedCwd on all OSes)
+      process.env.TURBO_BROWSER_SAVE_ROOT = `${symlinkedCwd}${path.delimiter}${secondaryRoot}`;
       const res3 = resolveSafePath(path.join(symlinkedCwd, 'deep', 'state.json'));
       assert.equal(res3.toLowerCase(), path.join(canonWorkspace, 'deep', 'state.json').toLowerCase());
-
-      // Custom TURBO_BROWSER_SAVE_ROOT with multiple roots
-      process.env.TURBO_BROWSER_SAVE_ROOT = `${symlinkedCwd}${path.delimiter}${secondaryRoot}`;
       const canonSecondary = fs.realpathSync(secondaryRoot);
       const res4 = resolveSafePath(path.join(secondaryRoot, 'nested', 'artifact.txt'));
       assert.equal(res4.toLowerCase(), path.join(canonSecondary, 'nested', 'artifact.txt').toLowerCase());
