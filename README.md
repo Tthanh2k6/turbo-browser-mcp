@@ -1,7 +1,7 @@
 # turbo-browser-mcp
 
 [![CI](https://github.com/Tthanh2k6/turbo-browser-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Tthanh2k6/turbo-browser-mcp/actions/workflows/ci.yml)
-![Version](https://img.shields.io/badge/version-0.4.0-blue)
+![Version](https://img.shields.io/badge/version-0.5.0-blue)
 ![Tests](https://img.shields.io/badge/tests-407%20passing%20(86%20suites)-brightgreen)
 ![Node](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
@@ -25,7 +25,7 @@ All figures below come from [`benchmarks/benchmark.mjs`](benchmarks/benchmark.mj
 | **Heavy Media Load** (`preset: "turbo"`, `304 KiB` assets) | `252 ms`, `9` media requests (`304 KiB`) | **`165 ms`**, `0` media requests (`0 KiB`) | **`1.53x` faster** | **`100%` media bandwidth cut** |
 | **Article Markdown Scraping** (`extract_clean_text`) | `3,595` tok raw HTML (`10,844` chars) | **`156` tok** clean Markdown (`641` chars) | Clean reader output | **`95.7%` saved** |
 | **Diagnostics Triage** (`page_diagnostics` errors-only) | `3,460` tok unfiltered (`32` req / `26` console) | **`601` tok** default errors (`2` req / `6` console) | Zero noise scrolling | **`82.6%` saved** |
-| **Static MCP Tool Schema** (every turn overhead) | `3,917` tok Playwright / `6,737` tok DevTools | **`3,010` tok** stripped (`3,314` full w/ annotations) | `10` tools vs `25` / `33` | **`23.2%` vs Playwright / `55.3%` vs DevTools** |
+| **Static MCP Tool Schema** (every turn overhead) | `3,917` tok Playwright / `6,737` tok DevTools | **`3,170` tok** stripped (`3,541` full w/ annotations) | `11` tools vs `25` / `33` | **`19.1%` vs Playwright / `52.9%` vs DevTools** |
 
 > **Note on latency vs LLM inference turns:** Eliminating `10` round-trips on a 10-field form saves both `7x` in browser execution (`574 ms -> 82 ms`) and `10` separate LLM inference round-trips (`2-5s` per turn in agent loops) plus `~71,800` replayed history tokens.
 
@@ -134,9 +134,11 @@ Measured against installed MCP JSON schemas on disk (compact parameter schemas w
 
 | MCP Server | Tool Count | Compact Schema Chars | Exact `o200k_base` Tokens | Savings with `turbo-browser-mcp` |
 | :--- | :--- | :--- | :--- | :--- |
-| `turbo-browser-mcp` | **`10`** (`14,186` full / `12,796` compact) | **`12,796`** | **`3,010`** (`3,314` full w/ annotations) | Baseline (`10` tools) |
-| `@playwright/mcp` | `25` | `18,457` | `3,917` | **`23.2%` fewer static tokens** |
-| `chrome-devtools-mcp` | `33` | `30,252` | `6,737` | **`55.3%` fewer static tokens** |
+| `turbo-browser-mcp` | **`11`** (`15,144` full / `13,631` compact) | **`13,631`** | **`3,170`** (`3,541` full w/ annotations) | Baseline (`11` tools) |
+| `@playwright/mcp` | `25` | `18,457` | `3,917` | **`19.1%` fewer static tokens** |
+| `chrome-devtools-mcp` | `33` | `30,252` | `6,737` | **`52.9%` fewer static tokens** |
+
+v0.5.0 added `wait_for_human` and the commit-safety parameters for about 160 tokens per turn (v0.4.0: `3,010` compact). To keep that small, `expect` / `submissionKey` / `allowDuplicate` are declared only on `batch_actions` (a one-step batch works for a single click), and the network guard is switched on by environment variable, so it costs no schema tokens. The label lists for other languages run inside the page and are never sent to the model.
 
 ---
 
@@ -183,9 +185,45 @@ Measured against installed MCP JSON schemas on disk (compact parameter schemas w
    - File outputs (`savePath`, `saveStorageStatePath`) and state inputs (`loadStorageStatePath`) are strictly confined to the current working directory or `TURBO_BROWSER_SAVE_ROOT`.
    - Lexical checks, `lstatSync`/`readlinkSync` symlink verification, and `realpathSync` validation block `..` traversal, UNC network paths, dangling symlinks, cyclic symlinks, and Windows junctions before reading or writing.
 
+### Commit safety added in v0.5.0 (from Show HN and dev.to feedback)
+
+Readers who run agents on real portals pointed out three gaps in a label-based guard. v0.5.0 adds an opt-in answer to each. `expect`, `submissionKey` and `allowDuplicate` appear in the `batch_actions` schema; `act_fast` accepts the same arguments without advertising them. The network guard is turned on with `TURBO_BROWSER_NETWORK_GUARD=true` and covers `act_fast`, `batch_actions` and `smart_fill_form`.
+
+1. **A landed click is not a confirmed submission → `expect`.** After an allowed submit, pass `expect: { urlMatches?, textMatches?, selector?, timeoutMs? }`. The result carries `submitVerified` and `evidence` (the new URL, a text snippet such as a receipt number, or the matched selector). If nothing shows up in time you get `submitVerified: false` and a reason, so the agent does not report "done" on an empty submission list.
+2. **A re-run is a second entry, not a retry → `submissionKey`.** With `submissionKey: "portal:2026-11-15:entry-42"`, every allowed submit is appended to a JSONL ledger (`~/.turbo-browser-mcp/submissions.jsonl`, or `TURBO_BROWSER_LEDGER`, or `ledgerPath` inside the save root). A later call with the same key is refused with `blockedBy: "ledger"` unless `allowDuplicate: true`.
+3. **Labels lie → modal rule + `networkGuard`.** On many Korean portals the last step reads 다음 and the real commit is a 확인 inside a modal that opens afterwards.
+   - Affirmative buttons (`확인`, `OK`, `Yes`, `Confirm`, `確認`, `确定`, `Đồng ý`, …) inside `dialog` / `[role=dialog]` / `[role=alertdialog]` / `[aria-modal=true]` now count as commits (`blockedBy: "modal"`). Cookie banners (dialog text mentions cookies) and date/time pickers (dialog contains a calendar grid or date input) are excluded; a confirmation that only mentions "privacy" or "consent" is still blocked.
+   - When an action makes the page call `form.submit()` / `requestSubmit()` or fire a `submit` event and the guard stops it, the result now says so (`submitSuppressed`, `note`) instead of a bare `ok: true`. The action itself (a select, a check) still counts as done, so batches continue.
+   - Common Korean, Japanese, Chinese and Vietnamese submit labels were added (`제출`, `신청`, `등록`, `결제`, `送信`, `確定`, `提交`, `Hoàn tất`, …), and `다음`, `次へ`, `下一步` are treated like `Next`.
+   - `TURBO_BROWSER_NETWORK_GUARD=true` is the safety net that does not depend on labels: while submitting is not allowed, non-GET navigations and same-site `fetch`/XHR `POST`/`PUT`/`PATCH`/`DELETE` are stopped and reported (`blockedBy: "network"`, `networkBlocked[]`). Blocked navigations get a `204` so the page and the half-filled form stay put. Let harmless endpoints through with `TURBO_BROWSER_NETWORK_GUARD_ALLOW="/autosave$,/analytics"`. Per call, the undeclared arguments `networkGuard`, `networkGuardAllow` and `networkGuardSettleMs` override the env values. It is off by default because multi-step wizards often `POST` on every "Next".
+   - Every blocked result now says which mechanism stopped it: `blockedBy` is `label`, `modal`, `network` or `ledger`.
+
+Limits:
+- The network guard watches the action plus `networkGuardSettleMs` (250 ms) afterwards, so a commit fired later by a timer is not caught. WebSocket messages, requests made by a service worker, and cross-site `fetch` POSTs are not inspected (cross-site *navigations* are). Patterns in `TURBO_BROWSER_NETWORK_GUARD_ALLOW` are split on commas, so a pattern cannot contain one.
+- The ledger is written only when the call returns. If the call throws after the page already sent the submission (for example a navigation timeout), nothing is recorded; check the site before re-running.
+- `expect.selector` that is not a valid selector never matches, so the call reports `submitVerified: false` after the timeout.
+
+### Human-first sessions (`wait_for_human`, `--open-profile`)
+
+Some sites fail their bot check whenever the browser is remote-controlled, so a person has to open the same profile in a normal browser first. turbo-browser-mcp does **not** try to hide automation: no stealth plugins, no fingerprint or `navigator.webdriver` patching, no CAPTCHA solving. It supports two hand-off flows instead.
+
+1. **Before the session:** `turbo-browser-mcp --open-profile --url https://site.example/login` opens plain Chrome (no debugging port, no automation flags) on the dedicated profile `~/.turbo-browser-mcp/chrome-profile` (or `--user-data-dir`). The human logs in or passes the check and closes the window. Then start the server with `--user-data-dir <same path>` or `--launch-chrome`, and the agent reuses those cookies. This works for sites that check at login; a site that re-checks on every request will still see an automated browser.
+2. **During the session:** the agent calls `wait_for_human` with a message and a condition (`urlMatches`, `selector`, `textMatches` or `textGone`). The tool brings the tab to the front and polls until the condition holds, then the agent continues in the same tab with the same cookies. Keep `timeoutMs` below your MCP client's request timeout and call it again to keep waiting.
+
+```json
+{
+  "name": "wait_for_human",
+  "arguments": {
+    "message": "Please sign in and finish the security check, then leave the tab open.",
+    "selector": "#account-menu",
+    "timeoutMs": 120000
+  }
+}
+```
+
 ---
 
-## All 10 Tools Reference
+## All 11 Tools Reference
 
 | Tool | Purpose | Key Parameters |
 | :--- | :--- | :--- |
@@ -193,12 +231,30 @@ Measured against installed MCP JSON schemas on disk (compact parameter schemas w
 | `inspect_compact` | Token-capped element/form/article snapshot | `mode` (`interactive`, `forms`, `article`, `all`), `onlyChanged`, `query`, `boxes`, `maxChars`, `includeFrames`, `savePath` |
 | `smart_fill_form` | Batch form, editor & disk file prefill | `fields[]` (`ref`, `selector`, `value`, `option`, `values`, `check`, `not`, `keys`, `file`, `files`, `frameIdx`, `all`), `gmail`, `overwrite`, `stopBeforeSubmit`, `returnSnapshot` |
 | `act_fast` | Single targeted page action | `action` (`16` actions), `ref`/`selector`/`text`/`label`/`(x, y)`, `modifiers`, `dropData`, `allowSubmit`, `returnSnapshot` |
-| `batch_actions` | Ordered chain of actions + form steps | `steps[]`, `continueOnError`, `allowSubmit`, `returnSnapshot`, `snapshotMaxChars` |
+| `batch_actions` | Ordered chain of actions + form steps | `steps[]`, `continueOnError`, `allowSubmit`, `expect`, `submissionKey`, `allowDuplicate`, `returnSnapshot`, `snapshotMaxChars` |
 | `extract_clean_text` | Clean text or compact Markdown reader | `format` (`text`, `markdown`), `selector`, `includeFrames`, `maxChars`, `savePath` |
 | `evaluate_js` | Scoped JS expression or `(el, arg)` call | `expression`, `arg`, `frameIdx`, `ref`/`selector`/`text`, `savePath` |
 | `page_diagnostics` | Console, network, downloads & dialogs | `level` (`errors`, `all`), `statusFilter` (`errors`, `all`), `includeStatic`, `urlFilter`, `reqId`, `part`, `dialogPolicy`, `clear`, `savePath` |
 | `capture_page` | PNG/JPEG screenshots & PDF export | `mode` (`screenshot`, `pdf`), `type`, `quality`, `fullPage`, `scale` (`css`, `device`), `ref`/`selector`/`text`, `returnImage`, `savePath` |
 | `network_session` | Resource blockers, cookies & storage | `preset` (`turbo`, `no-images`, `no-media`, `clean`), `blockResources`, `blockUrls`, `cookieAction`, `storageAction`, `loadStorageStatePath`, `saveStorageStatePath` |
+| `wait_for_human` | Hand a step to a person, resume in the same session | `message`, `urlMatches`, `selector`, `textMatches`, `textGone`, `timeoutMs`, `pollMs` |
+
+#### Submit with proof and an idempotency key
+```json
+{
+  "name": "batch_actions",
+  "arguments": {
+    "steps": [
+      { "action": "smart_fill_form", "fields": [{ "selector": "#name", "value": "홍길동" }] },
+      { "action": "click", "text": "다음" },
+      { "action": "click", "text": "확인" }
+    ],
+    "allowSubmit": true,
+    "expect": { "textMatches": "접수번호\\s*R-\\d+", "timeoutMs": 8000 },
+    "submissionKey": "photo-contest:2026-11-15:entry-1"
+  }
+}
+```
 
 ### Copy-Paste JSON Examples
 
@@ -308,7 +364,11 @@ Using `npx` / binary entrypoint:
 | `--doctor` | - | - | Print Node, Playwright, Chromium, and CDP diagnostics as JSON |
 | `--bridge` | `TURBO_BROWSER_BRIDGE_PORT` | `9224` | Start/verify the persistent CDP Keep-Alive Bridge daemon for Chrome 144+ `DevToolsActivePort` (approve once, reconnect unlimited times AFK) |
 | `--launch-chrome` | - | `~/.turbo-browser-mcp/chrome-profile` | Launch Chrome with a dedicated profile & `--remote-debugging-port=9222` (`0` approval prompts ever) |
-| `--version` / `-v` | - | - | Print server version (`0.4.0`) |
+| `--open-profile [--url <u>]` | `TURBO_BROWSER_OPEN_URL` | `~/.turbo-browser-mcp/chrome-profile` | Open the profile in a normal, non-automated Chrome so a human can log in or pass a check first |
+| - | `TURBO_BROWSER_NETWORK_GUARD` | `false` | Turn on the network commit guard by default |
+| - | `TURBO_BROWSER_NETWORK_GUARD_ALLOW` | `""` | Comma-separated URL regexes the network guard lets through |
+| - | `TURBO_BROWSER_LEDGER` | `~/.turbo-browser-mcp/submissions.jsonl` | Submission ledger used by `submissionKey` |
+| `--version` / `-v` | - | - | Print server version (`0.5.0`) |
 | `--help` / `-h` | - | - | Print CLI usage summary |
 | - | `TURBO_BROWSER_SAVE_ROOT` | `process.cwd()` | Root directory confining `savePath` and `storageState` files |
 | - | `PLAYWRIGHT_CORE_PATH` | auto-resolved | Explicit path to `playwright-core/index.mjs` |
@@ -328,10 +388,11 @@ In Chrome 136+/144+, enabling `chrome://inspect/#remote-debugging` on the defaul
 ## Verification
 
 ```bash
-npm test            # 407 passing tests across 86 suites (26 test files under test/*.test.mjs)
+npm test            # 424 passing tests across 87 suites (27 test files under test/*.test.mjs)
 npm run doctor      # Environment check for Node, Playwright, Chromium, and CDP
 npm run bridge      # Start/verify persistent CDP Keep-Alive Bridge daemon
 npm run benchmark   # Local Chromium speed & exact o200k_base token benchmark
+npm run benchmark:e2e  # End-to-end wizard task + commit-safety cases (see benchmarks/E2E_COMPARISON.md)
 ```
 
 Tested automatically on GitHub Actions (`ubuntu-latest`) across **Node 20** and **Node 22**.

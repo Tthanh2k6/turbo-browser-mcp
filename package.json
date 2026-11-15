@@ -1,6 +1,6 @@
 {
   "name": "turbo-browser-mcp",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Fast, token-efficient MCP server for Playwright browser automation with batched DOM actions, React/Shadow DOM/contenteditable form prefill, isolated contexts, download/network diagnostics, and direct disk file uploads.",
   "type": "module",
   "main": "./src/index.mjs",
@@ -20,7 +20,8 @@
     "doctor": "node ./src/index.mjs --doctor",
     "bridge": "node ./src/index.mjs --bridge",
     "launch-chrome": "node ./src/index.mjs --launch-chrome",
-    "benchmark": "node ./benchmarks/benchmark.mjs"
+    "benchmark": "node ./benchmarks/benchmark.mjs",
+    "benchmark:e2e": "node ./benchmarks/e2e-tasks.mjs"
   },
   "keywords": [
     "mcp",

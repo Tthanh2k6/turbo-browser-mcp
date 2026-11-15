@@ -1,16 +1,33 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import {
+  appendLedger,
+  defaultLedgerPath,
+  describeNetworkBlock,
+  findLedgerEntry,
+  hasAnyCondition,
+  installNetworkGuard,
+  resolveNetworkGuard,
+  waitForSubmitEvidence,
+} from './guards.mjs';
 
 const DEFAULT_TIMEOUT_MS = 8000;
 
 const SUBMIT_LABEL_RE =
-  /^(submit|publish|post|send|apply(\s+now)?|confirm(\s+and)?\s*(pay|submit|order|booking)|pay(\s+now)?|buy(\s+now)?|order(\s+now)?|complete\s+(order|purchase)|checkout|place\s+order|delete|remove|gửi|đăng(?!\s+nhập)(\s*bài)?|nộp(\s*đơn)?|xác\s*nhận(\s*(nộp|gửi|thanh\s*toán|đặt))?|thanh\s*toán|đặt\s+hàng|mua\s+ngay|xoá|xóa)(?![\p{L}\p{N}_])/iu;
+  /^(submit|publish|post|send|apply(\s+now)?|confirm(\s+and)?\s*(pay|submit|order|booking)|pay(\s+now)?|buy(\s+now)?|order(\s+now)?|complete\s+(order|purchase)|checkout|place\s+order|delete|remove|gửi|đăng(?!\s+nhập)(\s*bài)?|nộp(\s*đơn)?|xác\s*nhận(\s*(nộp|gửi|thanh\s*toán|đặt))?|thanh\s*toán|đặt\s+hàng|mua\s+ngay|xoá|xóa|hoàn\s*tất|(제출|신청|등록|접수|결제|구매|삭제)(하기)?|送信(する)?|確定|申し込む|購入(する)?|削除|提交|确认提交|支付|购买|删除)(?![\p{L}\p{N}_])/iu;
 
 const SAFE_SUBMIT_TYPE_RE =
-  /^(next|continue|search|filter|save\s*draft|log\s*in|sign\s*in|tiếp(\s*tục)?|tìm(\s*kiếm)?|lọc|lưu\s*nháp|đăng\s+nhập)(?![\p{L}\p{N}_])/iu;
+  /^(next|continue|search|filter|save\s*draft|log\s*in|sign\s*in|tiếp(\s*tục)?|tìm(\s*kiếm)?|lọc|lưu\s*nháp|đăng\s+nhập|다음|이전|검색|로그인|次へ|検索|ログイン|下一步|搜索|登录)(?![\p{L}\p{N}_])/iu;
 
 const COMPOUND_DANGER_RE =
-  /(?:^|[^\p{L}\p{N}_])(submit|publish|post|send|apply(\s+now)?|pay|payment|purchase|buy|place\s+order|complete\s+(order|purchase)|checkout|delete|remove|confirm|thanh\s*toán|đặt\s+hàng|mua\s+ngay|đăng(?!\s+nhập)(\s*bài)?|xoá|xóa|gửi|nộp)(?![\p{L}\p{N}_])/iu;
+  /(?:^|[^\p{L}\p{N}_])(submit|publish|post|send|apply(\s+now)?|pay|payment|purchase|buy|place\s+order|complete\s+(order|purchase)|checkout|delete|remove|confirm|thanh\s*toán|đặt\s+hàng|mua\s+ngay|đăng(?!\s+nhập)(\s*bài)?|xoá|xóa|gửi|nộp|제출|결제|送信|提交|支付)(?![\p{L}\p{N}_])/iu;
+
+// Affirmative buttons that commit when they sit inside a modal opened by an earlier "next" step
+// (e.g. Korean portals: 다음 -> modal 확인 is the real submit).
+const MODAL_CONFIRM_RE =
+  /^(ok(ay)?|yes|confirm|확인|예|네|はい|確認|OK|确定|確定|确认|đồng\s*ý|có|xác\s*nhận)(?![\p{L}\p{N}_])/iu;
+
+const MODAL_SELECTOR = 'dialog, [role="dialog"], [role="alertdialog"], [aria-modal="true"]';
 
 const QUESTION_BLOCK_SELECTOR =
   '[role="listitem"], [role="radiogroup"], [role="group"], fieldset, .form-group, .field, [class*="Field"], [class*="field"], [class*="question"]';
@@ -404,6 +421,7 @@ export async function isSubmitLikeElement(locator) {
       const submitRe = new RegExp(patterns.submit, 'iu');
       const safeRe = new RegExp(patterns.safe, 'iu');
       const dangerRe = new RegExp(patterns.danger, 'iu');
+      const modalRe = new RegExp(patterns.modal, 'iu');
       const isShadowRoot = (r) => Boolean(r && r.nodeType === 11 && 'host' in r);
       const getSR = (node) => node?.shadowRoot || window.__tbmGetShadowRoot?.(node) || null;
       const closestComposed = (node, sel) => {
@@ -701,6 +719,26 @@ export async function isSubmitLikeElement(locator) {
         if ((submitRe.test(cleanLbl) || (safeRe.test(cleanLbl) && dangerRe.test(cleanLbl))) && !isSafeLbl) {
           return { isSubmit: true, isSafeSubmit: false, label: rawLabel, reason: 'submit-label-match' };
         }
+        if (modalRe.test(cleanLbl) && !isSafeLbl) {
+          const dlg = closestComposed(btn, patterns.modalSelector);
+          if (dlg) {
+            const dlgText = normLbl(`${dlg.getAttribute?.('aria-label') || ''} ${(dlg.textContent || '').slice(0, 600)}`);
+            // Only real cookie banners are exempt: "privacy"/"consent" also appear in submit confirmations.
+            const isCookieBanner = /cookie|쿠키|クッキー/i.test(dlgText);
+            // Date/time pickers confirm a value inside the form, not the form itself.
+            let isPicker = false;
+            try {
+              isPicker = Boolean(
+                dlg.querySelector?.(
+                  '[role="grid"], input[type="date"], input[type="time"], [class*="calendar" i], [class*="datepicker" i], [class*="date-picker" i], [class*="timepicker" i]'
+                )
+              );
+            } catch {}
+            if (!isCookieBanner && !isPicker) {
+              return { isSubmit: true, isSafeSubmit: false, label: rawLabel, reason: 'modal-confirm' };
+            }
+          }
+        }
       }
       const isSafeButtonWidget =
         tag === 'button' ||
@@ -714,7 +752,13 @@ export async function isSubmitLikeElement(locator) {
         label: rawLabel,
         reason: '',
       };
-    }, { submit: SUBMIT_LABEL_RE.source, safe: SAFE_SUBMIT_TYPE_RE.source, danger: COMPOUND_DANGER_RE.source });
+    }, {
+      submit: SUBMIT_LABEL_RE.source,
+      safe: SAFE_SUBMIT_TYPE_RE.source,
+      danger: COMPOUND_DANGER_RE.source,
+      modal: MODAL_CONFIRM_RE.source,
+      modalSelector: MODAL_SELECTOR,
+    });
   } catch {
     return { isSubmit: false, label: '', reason: '' };
   }
@@ -4183,7 +4227,23 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
   return output;
 }
 
+/**
+ * Run one action and, if the submit guard suppressed a form submission the action triggered
+ * (submit event, form.submit(), requestSubmit()), say so in the result. The action itself still
+ * succeeded (e.g. a select changed its value), so ok stays true and batches keep going.
+ */
 async function executeSingleAction(page, params = {}) {
+  const silentState = { count: 0 };
+  const res = await executeSingleActionInner(page, params, silentState);
+  if (silentState.count > 0 && res && typeof res === 'object' && !res.blocked) {
+    res.submitSuppressed = silentState.count;
+    res.note =
+      'The page tried to submit a form during this action (submit event, form.submit() or requestSubmit()); it was stopped because allowSubmit=false. Nothing was sent.';
+  }
+  return res;
+}
+
+async function executeSingleActionInner(page, params = {}, silentState = { count: 0 }) {
   const action = params.action;
   if (!action) throw new Error('act_fast requires action.');
   const timeout = Number(params.timeoutMs) || DEFAULT_TIMEOUT_MS;
@@ -4412,6 +4472,17 @@ async function executeSingleAction(page, params = {}) {
           ({ isAllowSafe, useActiveEl, submitSrc, safeSrc, dangerSrc }) => {
             const win = window;
             if (win.__tbmCleanupActGuard) win.__tbmCleanupActGuard();
+            delete win.__tbmSilentSubmitBlocks;
+            const noteBlocked = () => {
+              try {
+                Object.defineProperty(win, '__tbmSilentSubmitBlocks', {
+                  value: (Number(win.__tbmSilentSubmitBlocks) || 0) + 1,
+                  writable: true,
+                  enumerable: false,
+                  configurable: true,
+                });
+              } catch {}
+            };
             Object.defineProperty(win, '__tbmSubmitGuardActive', {
               value: (win.__tbmSubmitGuardActive || 0) + 1,
               writable: true,
@@ -4563,6 +4634,7 @@ async function executeSingleAction(page, params = {}) {
               ) {
                 return;
               }
+              noteBlocked();
               e.preventDefault();
               e.stopImmediatePropagation();
             };
@@ -4640,16 +4712,21 @@ async function executeSingleAction(page, params = {}) {
                   if (win.__tbmAllowSafeForm && this && this.__tbmAllowedSubmit === true && origSub) {
                     return origSub.apply(this, arguments);
                   }
+                  noteBlocked();
                 };
               }
               if (typeof origReqSub === 'function' && !hasProxyReqSub) {
                 win.HTMLFormElement.prototype.requestSubmit = function () {
                   if (win.__tbmAllowSafeForm && this && this.__tbmAllowedSubmit === true) {
                     if (arguments.length > 0 && arguments[0] !== undefined && arguments[0] !== null) {
-                      if (!isSafeSubmitter(arguments[0])) return;
+                      if (!isSafeSubmitter(arguments[0])) {
+                        noteBlocked();
+                        return;
+                      }
                     }
                     return origReqSub.apply(this, arguments);
                   }
+                  noteBlocked();
                 };
               }
             }
@@ -4725,15 +4802,21 @@ async function executeSingleAction(page, params = {}) {
     try {
       return await fn();
     } finally {
+      let silentBlocks = 0;
       for (const tf of targetFrames) {
-        await tf
+        const n = await tf
           .evaluate(async () => {
             await Promise.resolve();
             await new Promise((r) => setTimeout(r, 0));
+            const count = Number(window.__tbmSilentSubmitBlocks) || 0;
+            delete window.__tbmSilentSubmitBlocks;
             if (window.__tbmCleanupActGuard) window.__tbmCleanupActGuard();
+            return count;
           })
-          .catch(() => {});
+          .catch(() => 0);
+        silentBlocks += Number(n) || 0;
       }
+      silentState.count += silentBlocks;
     }
   };
 
@@ -5439,9 +5522,129 @@ async function executeSingleAction(page, params = {}) {
 /**
  * Execute one interactive action with human-in-the-loop submit protection and optional 1-turn snapshot.
  */
+function resolveLedgerPath(params) {
+  if (params.ledgerPath) return resolveSafePath(params.ledgerPath, 'ledgerPath');
+  return defaultLedgerPath();
+}
+
+function tagBlockedBy(res) {
+  if (res && res.blocked && !res.blockedBy) {
+    res.blockedBy = /modal-confirm/.test(String(res.reason || '')) ? 'modal' : 'label';
+  }
+  return res;
+}
+
+function applyNetworkBlock(res, blockedRequests) {
+  if (!res || blockedRequests.length === 0) return res;
+  if (!res.blocked) {
+    res.ok = false;
+    res.blocked = true;
+    res.blockedBy = 'network';
+    res.reason = describeNetworkBlock(blockedRequests);
+  }
+  res.networkBlocked = [...(res.networkBlocked || []), ...blockedRequests];
+  return res;
+}
+
+/**
+ * Validate expect + check the submission ledger before anything is clicked.
+ * Returns { key, ledgerPath, refusal } where refusal is a blocked result when the key was already used.
+ */
+function prepareCommitControls(params, maySubmit) {
+  if (params.expect !== undefined && params.expect !== null && !hasAnyCondition(params.expect)) {
+    throw new Error('expect requires at least one of urlMatches, textMatches, selector.');
+  }
+  const key =
+    params.submissionKey !== undefined && params.submissionKey !== null && String(params.submissionKey) !== ''
+      ? String(params.submissionKey)
+      : '';
+  if (!key) return { key: '', ledgerPath: null, refusal: null };
+  const ledgerPath = resolveLedgerPath(params);
+  if (!maySubmit) return { key, ledgerPath, refusal: null };
+  const prev = findLedgerEntry(ledgerPath, key);
+  if (prev && !params.allowDuplicate) {
+    return {
+      key,
+      ledgerPath,
+      refusal: {
+        ok: false,
+        blocked: true,
+        blockedBy: 'ledger',
+        reason: `Duplicate guard: submissionKey "${key}" was already submitted at ${prev.time} (${prev.finalUrl}, submitVerified=${prev.submitVerified}). A re-run would create a second entry; pass allowDuplicate=true only if that is intended.`,
+        previousSubmission: prev,
+      },
+    };
+  }
+  return { key, ledgerPath, refusal: null };
+}
+
+async function finishCommit(page, params, key, ledgerPath, res) {
+  if (params.expect) {
+    Object.assign(res, await waitForSubmitEvidence(page, params.expect));
+  }
+  if (key) {
+    let origin = '';
+    try {
+      origin = new URL(page.url()).origin;
+    } catch {}
+    appendLedger(ledgerPath, {
+      key,
+      time: new Date().toISOString(),
+      origin,
+      finalUrl: page.url(),
+      submitVerified: params.expect ? Boolean(res.submitVerified) : null,
+      evidence: res.evidence ?? null,
+    });
+    res.submissionKey = key;
+    res.ledgerPath = ledgerPath;
+  }
+}
+
+function networkGuardOptions(params) {
+  return { allow: params.networkGuardAllow, settleMs: params.networkGuardSettleMs };
+}
+
+/**
+ * smart_fill_form with the optional network commit guard (active while stopBeforeSubmit is true).
+ */
+export async function smartFillFormGuarded(page, spec = {}, previousLinesSet = null) {
+  const stop = spec.stopBeforeSubmit !== undefined ? Boolean(spec.stopBeforeSubmit) : true;
+  const guard =
+    stop && resolveNetworkGuard(spec.networkGuard) ? await installNetworkGuard(page, networkGuardOptions(spec)) : null;
+  let res;
+  try {
+    res = await smartFillForm(page, spec, previousLinesSet);
+    if (guard) await guard.settle();
+  } finally {
+    if (guard) await guard.remove();
+  }
+  if (guard) applyNetworkBlock(res, guard.blocked);
+  return res;
+}
+
 export async function actFast(page, params = {}, previousLinesSet = null) {
   const t0 = Date.now();
-  const res = await executeSingleAction(page, params);
+  const allowSubmit = resolveAllowSubmit(params.allowSubmit);
+  const { key, ledgerPath, refusal } = prepareCommitControls(params, allowSubmit);
+  if (refusal) {
+    return { action: params.action, ...refusal, elapsedMs: Date.now() - t0 };
+  }
+  const guard =
+    !allowSubmit && resolveNetworkGuard(params.networkGuard)
+      ? await installNetworkGuard(page, networkGuardOptions(params))
+      : null;
+  let res;
+  try {
+    res = await executeSingleAction(page, params);
+    if (guard) await guard.settle();
+  } finally {
+    if (guard) await guard.remove();
+  }
+  tagBlockedBy(res);
+  if (guard) applyNetworkBlock(res, guard.blocked);
+  if (allowSubmit && !res.blocked && (params.expect || key)) {
+    await finishCommit(page, params, key, ledgerPath, res);
+  }
   if (params.returnSnapshot && !res.blocked) {
     const snap = await inspectCompact(
       page,
@@ -5461,6 +5664,48 @@ export async function actFast(page, params = {}, previousLinesSet = null) {
 export async function batchActions(page, steps = [], options = {}, previousLinesSet = null) {
   const t0 = Date.now();
   const stepList = Array.isArray(steps) ? steps : [];
+  const defaultAllowSubmit = resolveAllowSubmit(options.allowSubmit);
+  const maySubmit =
+    options.allowSubmit === false
+      ? false
+      : defaultAllowSubmit ||
+        stepList.some(
+          (s) =>
+            s &&
+            typeof s === 'object' &&
+            (s.allowSubmit === true ||
+              ((s.action === 'smart_fill_form' || s.action === 'fill_form') && s.stopBeforeSubmit === false))
+        );
+  const { key, ledgerPath, refusal } = prepareCommitControls(options, maySubmit);
+  if (refusal) {
+    return { completed: 0, total: stepList.length, ...refusal, results: [], elapsedMs: Date.now() - t0 };
+  }
+  const guard =
+    !maySubmit && resolveNetworkGuard(options.networkGuard)
+      ? await installNetworkGuard(page, networkGuardOptions(options))
+      : null;
+  const guardState = { guard, seen: 0 };
+  let out;
+  try {
+    out = await batchActionsCore(page, stepList, options, previousLinesSet, guardState);
+    if (guard && !out.blocked) {
+      await guard.settle();
+      if (guard.blocked.length > guardState.seen) {
+        applyNetworkBlock(out, guard.blocked.slice(guardState.seen));
+      }
+    }
+  } finally {
+    if (guard) await guard.remove();
+  }
+  if (maySubmit && !out.blocked && !out.error && (options.expect || key)) {
+    await finishCommit(page, options, key, ledgerPath, out);
+  }
+  out.elapsedMs = Date.now() - t0;
+  return out;
+}
+
+async function batchActionsCore(page, stepList, options, previousLinesSet, guardState) {
+  const t0 = Date.now();
   const continueOnError = Boolean(options.continueOnError);
   const defaultAllowSubmit = resolveAllowSubmit(options.allowSubmit);
   const results = [];
@@ -5489,6 +5734,13 @@ export async function batchActions(page, steps = [], options = {}, previousLines
           ...step,
           allowSubmit: options.allowSubmit === false ? false : (step.allowSubmit ?? defaultAllowSubmit),
         });
+      }
+      tagBlockedBy(stepResult);
+      const g = guardState?.guard;
+      if (g) await g.settleStep();
+      if (g && g.blocked.length > guardState.seen) {
+        applyNetworkBlock(stepResult, g.blocked.slice(guardState.seen));
+        guardState.seen = g.blocked.length;
       }
       results.push({ step: i, ...stepResult });
       if (stepResult.blocked && !continueOnError) {

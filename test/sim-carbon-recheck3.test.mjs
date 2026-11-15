@@ -968,7 +968,7 @@ describe('sim-carbon-recheck3: Round-5 deep adversarial & regression suite', { c
 
       const rpc = createJsonRpcHandler(manager);
       const list = await rpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
-      assert.equal(list.result.tools.length, 10);
+      assert.equal(list.result.tools.length, 11);
     });
   });
 });

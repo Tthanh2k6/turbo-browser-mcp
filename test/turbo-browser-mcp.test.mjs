@@ -1380,7 +1380,7 @@ describe('turbo-browser-mcp integration', () => {
 
     const verRes = await runCliFlag(['--version']);
     assert.equal(verRes.code, 0);
-    assert.equal(verRes.stdout.trim(), '0.4.0');
+    assert.equal(verRes.stdout.trim(), '0.5.0');
 
     const helpRes = await runCliFlag(['--help']);
     assert.equal(helpRes.code, 0);
@@ -1390,7 +1390,7 @@ describe('turbo-browser-mcp integration', () => {
     const docRes = await runCliFlag(['--doctor']);
     assert.equal(docRes.code, 0);
     const parsed = JSON.parse(docRes.stdout);
-    assert.equal(parsed.version, '0.4.0');
+    assert.equal(parsed.version, '0.5.0');
     assert.equal(parsed.playwrightLoaded, true);
     assert.equal(parsed.platform, process.platform);
   });
@@ -1437,13 +1437,13 @@ describe('turbo-browser-mcp integration', () => {
         clientInfo: { name: 'test-client', version: '1.0.0' },
       });
       assert.equal(initRes.result.serverInfo.name, 'turbo-browser-mcp');
-      assert.equal(initRes.result.serverInfo.version, '0.4.0');
+      assert.equal(initRes.result.serverInfo.version, '0.5.0');
 
       child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
 
       const listRes = await callRpc(2, 'tools/list');
       const tools = listRes.result.tools;
-      assert.equal(tools.length, 10);
+      assert.equal(tools.length, 11);
       for (const tool of tools) {
         assert.ok(tool.annotations, `${tool.name} missing MCP annotations`);
         assert.equal(typeof tool.annotations.readOnlyHint, 'boolean');

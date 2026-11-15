@@ -260,6 +260,17 @@ export class BrowserManager {
                 return undefined;
               }
             };
+            // Count suppressed submits so the tool can report them instead of returning a silent ok.
+            const noteBlocked = () => {
+              try {
+                Object.defineProperty(w, '__tbmSilentSubmitBlocks', {
+                  value: (Number(w.__tbmSilentSubmitBlocks) || 0) + 1,
+                  writable: true,
+                  enumerable: false,
+                  configurable: true,
+                });
+              } catch {}
+            };
             const resolveGuardState = (formEl) => {
               let fWin = w;
               try {
@@ -293,6 +304,7 @@ export class BrowserManager {
                   const { guardOn, allowSafe } = resolveGuardState(thisArg);
                   if (guardOn) {
                     if (!(allowSafe && thisArg && thisArg.__tbmAllowedSubmit === true)) {
+                      noteBlocked();
                       return undefined;
                     }
                   }
@@ -309,10 +321,12 @@ export class BrowserManager {
                   const { guardOn, allowSafe, checkSub } = resolveGuardState(thisArg);
                   if (guardOn) {
                     if (!(allowSafe && thisArg && thisArg.__tbmAllowedSubmit === true)) {
+                      noteBlocked();
                       return undefined;
                     }
                     if (args.length > 0 && args[0] !== undefined && args[0] !== null) {
                       if (typeof checkSub !== 'function' || !checkSub(args[0])) {
+                        noteBlocked();
                         return undefined;
                       }
                     }
@@ -370,6 +384,14 @@ export class BrowserManager {
         if (window.__tbmSubmitGuardActive > 0) {
           const f = e.target;
           if (window.__tbmAllowSafeForm && f && f.__tbmAllowedSubmit === true) return;
+          try {
+            Object.defineProperty(window, '__tbmSilentSubmitBlocks', {
+              value: (Number(window.__tbmSilentSubmitBlocks) || 0) + 1,
+              writable: true,
+              enumerable: false,
+              configurable: true,
+            });
+          } catch {}
           e.preventDefault();
           e.stopImmediatePropagation();
         }

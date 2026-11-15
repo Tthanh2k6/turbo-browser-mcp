@@ -1,5 +1,7 @@
 #!/usr/bin/env node
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BrowserManager } from './browser-manager.mjs';
@@ -21,12 +23,32 @@ import {
   evaluateJs,
   extractCleanText,
   inspectCompact,
-  smartFillForm,
+  smartFillFormGuarded,
 } from './dom-engine.mjs';
+import { waitForHuman } from './guards.mjs';
 
 const SERVER_INFO = {
   name: 'turbo-browser-mcp',
-  version: '0.4.0',
+  version: '0.5.0',
+};
+
+// Kept short on purpose: every byte here is sent to the model on every turn.
+// Declared only on batch_actions. act_fast and batch_actions also accept them (plus ledgerPath),
+// and the network guard is configured by env (TURBO_BROWSER_NETWORK_GUARD, ..._ALLOW) or the
+// undeclared networkGuard / networkGuardAllow / networkGuardSettleMs arguments. See README.
+const COMMIT_PROPS = {
+  expect: {
+    type: 'object',
+    description: 'Submit evidence to wait for; returns submitVerified.',
+    properties: {
+      urlMatches: { type: 'string' },
+      textMatches: { type: 'string' },
+      selector: { type: 'string' },
+      timeoutMs: { type: 'integer' },
+    },
+  },
+  submissionKey: { type: 'string', description: 'Idempotency key; repeat submits are refused.' },
+  allowDuplicate: { type: 'boolean' },
 };
 
 const SUPPORTED_PROTOCOL = '2025-03-26';
@@ -357,6 +379,7 @@ export const TOOL_DEFINITIONS = [
         returnSnapshot: { type: 'boolean', default: false },
         snapshotMode: { type: 'string', enum: ['interactive', 'forms', 'article', 'all'] },
         snapshotMaxChars: { type: 'integer', default: 2500 },
+        ...COMMIT_PROPS,
       },
     },
   },
@@ -532,6 +555,30 @@ export const TOOL_DEFINITIONS = [
       },
     },
   },
+  {
+    name: 'wait_for_human',
+    description:
+      'Let a human do a step (login, bot check, 2FA) in the visible browser; wait until a condition holds, then continue in the same session. Only waits.',
+    annotations: {
+      title: 'Wait For Human Step',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'integer' },
+        message: { type: 'string' },
+        urlMatches: { type: 'string' },
+        selector: { type: 'string' },
+        textMatches: { type: 'string' },
+        textGone: { type: 'string' },
+        timeoutMs: { type: 'integer', default: 120000 },
+      },
+    },
+  },
 ];
 
 export async function dispatchToolCall(manager, name, rawArgs = {}) {
@@ -550,7 +597,7 @@ export async function dispatchToolCall(manager, name, rawArgs = {}) {
     }
     case 'smart_fill_form': {
       const { tabId, page } = await manager.getPage(args.tabId);
-      const res = await smartFillForm(page, args, manager.getSnapshotState(page));
+      const res = await smartFillFormGuarded(page, args, manager.getSnapshotState(page));
       return { text: JSON.stringify({ tabId, ...res }) };
     }
     case 'act_fast': {
@@ -572,9 +619,21 @@ export async function dispatchToolCall(manager, name, rawArgs = {}) {
           returnSnapshot: args.returnSnapshot,
           snapshotMode: args.snapshotMode,
           snapshotMaxChars: args.snapshotMaxChars,
+          expect: args.expect,
+          submissionKey: args.submissionKey,
+          allowDuplicate: args.allowDuplicate,
+          ledgerPath: args.ledgerPath,
+          networkGuard: args.networkGuard,
+          networkGuardAllow: args.networkGuardAllow,
+          networkGuardSettleMs: args.networkGuardSettleMs,
         },
         manager.getSnapshotState(page)
       );
+      return { text: JSON.stringify({ tabId, ...res }) };
+    }
+    case 'wait_for_human': {
+      const { tabId, page } = await manager.getPage(args.tabId);
+      const res = await waitForHuman(page, args);
       return { text: JSON.stringify({ tabId, ...res }) };
     }
     case 'extract_clean_text': {
@@ -937,6 +996,7 @@ const VALUE_FLAG_ENV = {
   '--user-data-dir': 'TURBO_BROWSER_USER_DATA_DIR',
   '--executable': 'TURBO_BROWSER_EXECUTABLE',
   '--timeout': 'TURBO_BROWSER_TIMEOUT_MS',
+  '--url': 'TURBO_BROWSER_OPEN_URL',
 };
 
 const HELP_TEXT = `turbo-browser-mcp v${SERVER_INFO.version} — Fast, token-efficient Playwright MCP server
@@ -950,6 +1010,8 @@ Options:
   --doctor                   Check Node, Playwright, Chromium, and CDP availability (JSON)
   --bridge                   Start/verify the persistent CDP Keep-Alive Bridge daemon (1 approval total)
   --launch-chrome            Launch Chrome with a dedicated profile & --remote-debugging-port=9222 (0 prompts)
+  --open-profile [--url <u>] Open the same profile in a normal, non-automated Chrome so a human can log in or
+                             pass a bot check first; the agent later reuses the cookies (waits until Chrome exits)
   --mode <auto|cdp|persistent|launch>  Browser connection mode (default: auto)
   --cdp <url>                CDP endpoint URL (default: http://127.0.0.1:9222)
   --user-data-dir <path>     Persistent browser profile directory
@@ -977,6 +1039,7 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
     doctor: false,
     bridge: false,
     launchChrome: false,
+    openProfile: false,
     envOverrides: {},
     unknown: null,
   };
@@ -996,6 +1059,8 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
       out.bridge = true;
     } else if (flag === '--launch-chrome') {
       out.launchChrome = true;
+    } else if (flag === '--open-profile') {
+      out.openProfile = true;
     } else if (flag === '--headless') {
       out.envOverrides.TURBO_BROWSER_HEADLESS = 'true';
     } else if (flag === '--headed') {
@@ -1054,6 +1119,41 @@ async function runCli() {
       `${JSON.stringify({ ok: true, mode: 'unattended-cdp', endpoint, executablePath }, null, 2)}\n`
     );
     process.exit(0);
+  }
+  if (parsed.openProfile) {
+    const pw = await loadPlaywright();
+    const { executablePath } = resolveChromiumExecutable(pw.chromium, false);
+    if (!executablePath) {
+      process.stderr.write('No Chrome/Chromium executable found.\n');
+      process.exit(1);
+    }
+    const userDataDir =
+      process.env.TURBO_BROWSER_USER_DATA_DIR || path.join(os.homedir(), '.turbo-browser-mcp', 'chrome-profile');
+    fs.mkdirSync(userDataDir, { recursive: true });
+    // Plain user launch: no --remote-debugging-port, no automation flags.
+    const chromeArgs = [`--user-data-dir=${userDataDir}`, '--no-first-run', '--no-default-browser-check'];
+    if (process.env.TURBO_BROWSER_OPEN_URL) chromeArgs.push(process.env.TURBO_BROWSER_OPEN_URL);
+    process.stderr.write(
+      `Opening a normal Chrome window with profile ${userDataDir}. Log in / pass the check, then close the window.\n`
+    );
+    const child = spawn(executablePath, chromeArgs, { stdio: 'ignore' });
+    const code = await new Promise((resolve) => {
+      child.on('exit', (c) => resolve(c ?? 0));
+      child.on('error', () => resolve(1));
+    });
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          ok: code === 0,
+          userDataDir,
+          next: `Start the server with --user-data-dir "${userDataDir}" (or --launch-chrome) to reuse this session.`,
+          note: 'If Chrome was already running with this profile (for example one started by --launch-chrome, which has a debugging port), the window opened in that process and this command returned early. Close it first for a clean non-automated session.',
+        },
+        null,
+        2
+      )}\n`
+    );
+    process.exit(code === 0 ? 0 : 1);
   }
   if (parsed.bridge) {
     const existing = await getRunningBridgeInfo();
