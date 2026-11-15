@@ -1,151 +1,329 @@
 # turbo-browser-mcp
 
-Fast, token-efficient Playwright MCP server (`v0.4.0`, 10 tools) designed for AI coding agents. Built to cut MCP round-trips and context bloat through compact bounded snapshots, 1-turn batched form fills, parallel multi-tab opening (`open_many`), turbo ad/image/tracker presets, cross-iframe and Shadow DOM support, direct disk file uploads/drops, isolated browser sessions, and a strict default `allowSubmit=false` human-in-the-loop safety guard.
+[![CI](https://github.com/Tthanh2k6/turbo-browser-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Tthanh2k6/turbo-browser-mcp/actions/workflows/ci.yml)
+![Version](https://img.shields.io/badge/version-0.4.0-blue)
+![Tests](https://img.shields.io/badge/tests-405%20passing%20(85%20suites)-brightgreen)
+![Node](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen)
+![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
-## Why `turbo-browser-mcp`
+`turbo-browser-mcp` is a Playwright-based Model Context Protocol (MCP) server built to cut LLM token waste and multi-turn latency in browser automation. It consolidates 25-33 fine-grained browser primitives into **10 batched tools** featuring delta DOM snapshots, single-turn React/Shadow DOM/iframe form prefill, direct disk file uploads (no Base64 in context), parallel tab sessions, network blocking presets, and a default human-in-the-loop Submit guard.
 
-- **Tiny context footprint (`inspect_compact`)**: Emits deterministic `f<frameIdx>:e<N>` refs across main frame, nested `iframe`s, `<slot>` flattened light trees, open Shadow DOM (`el.shadowRoot`), and closed shadow roots captured after `attachShadow` init hooks, hard-capped at `maxChars` (default `4000`). Supports `query` filtering, `onlyChanged` delta snapshots, `[box=x,y,w,h]` geometry (`boxes: true`), and `savePath` file export.
-- **1-turn action + snapshot (`returnSnapshot: true`)**: Available on `act_fast`, `batch_actions`, and `smart_fill_form` so agents act and read the updated page in a single MCP turn instead of alternating action/snapshot calls.
-- **One-shot smart form fill (`smart_fill_form`)**:
-  - Uses native prototype setters + React `_valueTracker` reset + `input`/`change`/`blur` events so controlled React forms stay in sync.
-  - Fills `contenteditable` editors (ProseMirror, Quill, Gmail compose), single/multi `<select>` (`values`), `<input type="range">` sliders, ARIA `[role="combobox"]`, radios, and checkboxes across `iframe`s and open Shadow DOM.
-  - Attaches local disk files (`file`/`files`) directly via Playwright `setInputFiles` / `filechooser` without Base64 tokens passing through the LLM.
-- **Parallel tabs, isolated contexts & full input parity (`tabs_batch`, `act_fast`, `batch_actions`)**:
-  - Single `open` or concurrent `open_many` (`concurrency` 1–10), named `isolatedContext` sessions (separate cookies/storage per profile), `resize`, `emulate` (`colorScheme`, `media`, `reducedMotion`, `forcedColors`, `contrast`, `viewport`, `userAgent`, plus `null` resets), and `close_browser`.
-  - Full mouse/keyboard & drag/drop (`click`/`dblclick`/`hover` with `button`, `modifiers`, raw viewport `{ x, y }`, `drag`, `drop` disk files & `dropData` MIME, `type` with `slowly`/`delayMs`/`submit`, `wait` with `textGone`/`url`/`loadState`/`ms`).
-- **Human-in-the-loop submit guard (`act_fast`, `batch_actions`, `smart_fill_form`)**: Blocks target clicks, viewport `{ x, y }` clicks, `Enter` and key-chord submits, `type` `submit: true`, and unexpected synchronous or deferred `submit()` / `requestSubmit()` calls during batched actions on `submit`/`publish`/`post`/`send`/`pay`/`delete`/`đăng bài`/`nộp đơn`/`gửi` controls unless `allowSubmit: true` (or `--allow-submit` / `TURBO_BROWSER_ALLOW_SUBMIT=true`) is explicitly enabled.
-- **Turbo speed presets, diagnostics & downloads (`network_session`, `page_diagnostics`, `capture_page`, `evaluate_js`)**:
-  - Built-in blocking presets (`turbo`, `no-images`, `no-media`, `clean`) alongside cookie/storage/`storageState` management and custom resource/URL blocking.
-  - Console logs (`errors` | `all`), network buffer with `includeStatic: false` default filtering, `urlFilter`, `reqId` + `part` detail inspection, automatic `downloads` capture, `dialogPolicy`, element-targeted `evaluate_js` (`(el, arg)`), clean Markdown extraction, and PNG/JPEG (`scale: css|device`) or PDF capture.
-  - Cross-platform browser/Playwright discovery across Windows, macOS, and Linux, plus `elapsedMs` timing telemetry on DOM/tab calls.
+---
 
-## Measured Benchmarks (`npm run benchmark`)
+## At-a-Glance Performance & Token Scorecard
 
-Measured locally on Chromium headless against a self-contained HTTP fixture (`node ./benchmarks/benchmark.mjs`):
+All figures below come from [`benchmarks/benchmark.mjs`](benchmarks/benchmark.mjs) (`npm run benchmark`) running headless Chromium locally with exact OpenAI `o200k_base` tokenization (`tiktoken 0.14.0`):
 
-| Scenario | Baseline | `turbo-browser-mcp` | Measured Savings |
+| Capability | Typical Baseline | `turbo-browser-mcp` | Speed / Turn Gain | Token Savings (`o200k_base`) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Dense UI Snapshot** (140-btn SaaS console) | `18,654` tok HTML / `3,568` tok full ARIA | **`1,135` tok** compact (`28 ms`) | `1` call | **`93.9%` vs HTML** (`68.2%` vs ARIA) |
+| **Post-Click Delta Snapshot** (`onlyChanged: true`) | `3,582` tok full ARIA rescan | **`56` tok** changed lines (`18 ms`) | `1` call | **`98.4%` vs ARIA** (`99.7%` vs HTML) |
+| **10-Field Complex Form + Snapshot** (`smart_fill_form`) | `11` turns (`574 ms`, `12,197` dir / `72,614` cum tok) | **`1` turn** (`82 ms`, **`811` tok**) | **`7x` faster**, `11 -> 1` turns | **`93.4%` direct / `98.9%` cumulative** |
+| **48 KiB PDF Upload** (`49,152` bytes) | `44,728` tok inline Base64 tool arg | **`85` tok** disk path (`68 ms`) | Zero Base64 generation | **`99.8%` saved** |
+| **6-Step Interactive UI Flow** (`batch_actions`) | `6` turns (`411 ms`, `955` dir / `3,162` cum tok) | **`1` turn** (`357 ms`, **`406` tok**) | **`1.15x` faster**, `6 -> 1` turns | **`57.5%` direct / `87.2%` cumulative** |
+| **Open 6 Tabs Concurrently** (`open_many`) | `6` turns sequential (`998 ms`) | **`1` turn** batched (`420 ms`) | **`2.38x` faster**, `6x` fewer turns | `5` fewer prompt replays |
+| **Heavy Media Load** (`preset: "turbo"`, `304 KiB` assets) | `252 ms`, `9` media requests (`304 KiB`) | **`165 ms`**, `0` media requests (`0 KiB`) | **`1.53x` faster** | **`100%` media bandwidth cut** |
+| **Article Markdown Scraping** (`extract_clean_text`) | `3,595` tok raw HTML (`10,844` chars) | **`156` tok** clean Markdown (`641` chars) | Clean reader output | **`95.7%` saved** |
+| **Diagnostics Triage** (`page_diagnostics` errors-only) | `3,460` tok unfiltered (`32` req / `26` console) | **`601` tok** default errors (`2` req / `6` console) | Zero noise scrolling | **`82.6%` saved** |
+| **Static MCP Tool Schema** (every turn overhead) | `3,917` tok Playwright / `6,737` tok DevTools | **`3,010` tok** stripped (`3,314` full w/ annotations) | `10` tools vs `25` / `33` | **`23.2%` vs Playwright / `55.3%` vs DevTools** |
+
+> **Note on latency vs LLM inference turns:** Eliminating `10` round-trips on a 10-field form saves both `7x` in browser execution (`574 ms -> 82 ms`) and `10` separate LLM inference round-trips (`2-5s` per turn in agent loops) plus `~71,800` replayed history tokens.
+
+---
+
+## Why Browser Agents Stall: Side-by-Side Workflow
+
+Standard MCP servers charge an LLM round-trip for every snapshot, field fill, `<select>` choice, upload, and verification check. Each turn re-sends the growing conversation history back into the model.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Agent as LLM Agent
+    participant Std as Standard MCP (Playwright / DevTools)
+    participant Turbo as turbo-browser-mcp
+
+    Note over Agent,Std: Standard MCP (12+ LLM turns, full ARIA tree + history replay each step)
+    Agent->>Std: 1. snapshot() -> full ARIA (~3,568 tok)
+    loop Repeats 10+ times across fields, selects, checkboxes, upload
+        Agent->>Std: fill / select_option / click
+        Std-->>Agent: full ARIA or confirmation re-added to history
+    end
+    Agent->>Std: 12. upload inline or click chooser
+
+    Note over Agent,Turbo: turbo-browser-mcp (2 LLM turns total, delta & inline snapshot)
+    Agent->>Turbo: 1. inspect_compact(mode: "forms") -> compact refs (1,135 tok)
+    Agent->>Turbo: 2. smart_fill_form(fields: [...10 fields + disk PDF...], returnSnapshot: true)
+    Turbo-->>Agent: Filled 10 fields + guarded before Submit + inline snapshot (811 tok)
+```
+
+---
+
+## What `turbo-browser-mcp` Supports
+
+### 1. Connection & Session Isolation
+- **4 connection modes (`--mode auto|cdp|persistent|launch`):**
+  - `auto` (default): probes `--cdp http://127.0.0.1:9222` first so agents can reuse an existing signed-in browser session, then falls back to launching Chromium.
+  - `cdp`: attach directly to a running Chromium/Chrome/Edge remote debugging port.
+  - `persistent`: launch with a reusable `--user-data-dir` profile across runs.
+  - `launch`: start a clean browser session (`--headless` by default, or `--headed`).
+- **Auto binary discovery (`src/playwright-loader.mjs`):** checks `playwright-core` cache revisions across Windows, macOS, and Linux, system installs of Google Chrome, Microsoft Edge, Brave, and Chromium, or an explicit `--executable <path>`.
+- **Per-tab isolation (`tabs_batch`):** open tabs inside named `isolatedContext` sandboxes with separate cookies and storage, batch-open up to 10 concurrent URLs (`open_many`), activate, reload, go `back`/`forward`, `resize` viewport, and emulate `colorScheme`, `media`, `reducedMotion`, `contrast`, `forcedColors`, or custom `userAgent`.
+
+### 2. DOM, Iframe & Shadow DOM Inspection (`inspect_compact`)
+- **Snapshot modes:** `interactive`, `forms`, `article`, and `all`.
+- **Cross-boundary traversal:** flattens main frame DOM, child iframes (`includeFrames`, `frameIdx`), and open Shadow DOM. Injects an init script hooking `Element.prototype.attachShadow` (`WeakMap` + `WeakRef`/`FinalizationRegistry` + `window.__tbmGetShadowRoot`) to keep post-init closed Shadow roots inspectable and guarded, traverses `<slot>` `assignedNodes({ flatten: true })`, and supports Form-Associated Custom Elements.
+- **Token controls:** `onlyChanged: true` emits only elements added or changed since the prior snapshot; `query` filters by regex or substring; `boxes: true` adds `[box=x,y,w,h]` only when needed; `maxChars` caps payload size; `savePath` writes full output to disk.
+
+### 3. Single-Turn Smart Form Engine (`smart_fill_form`)
+Prefills an entire form in one MCP call while flushing microtasks and macrotasks between controlled inputs:
+- **Standard & framework inputs:** text, email, password, number, date, textarea, `<input type="range">`, checkboxes, radio groups (`check`, `not`, `overwrite`). Triggers React-controlled state updates via native property setters and synthetic events.
+- **Selects & custom widgets:** `<select>` and `<select multiple>` (`option` / `values`), ARIA comboboxes, ARIA switches, `contenteditable` rich editors, and Gmail compose dialogs (`gmail: { to, subject, body }`).
+- **Frame & wildcard targeting:** target specific iframes via `frameIdx`, or set `all: true` to populate matching controls across frames.
+- **Direct disk uploads:** pass `file` or `files` paths directly to Playwright `setInputFiles` without loading binary files or Base64 strings into LLM context.
+- **Atomic verification:** pass `returnSnapshot: true` to inspect the updated form state in the same tool response.
+
+### 4. 16 Interactive Actions & Multi-Step Chaining (`act_fast`, `batch_actions`)
+- **`act_fast` actions:** `click`, `dblclick`, `hover`, `focus`, `clear`, `fill`, `type` (`slowly`, `delayMs`, `submit`), `select`, `check`, `uncheck`, `drag`, `drop` (`file`, `files`, or custom MIME `dropData`), `press` (`key` + `modifiers`: `Alt`, `Control`, `ControlOrMeta`, `Meta`, `Shift`), `scroll` (`dx`, `dy`), `wait` (`ms`, `state`, `loadState`, `text`, `textGone`, `url`), and `upload`.
+- **Targeting options:** compact `[eN]` `ref`, CSS `selector`, visible `text`, `label`, or viewport `(x, y)` coordinates, with `button` (`left`, `right`, `middle`) and `frameIdx`.
+- **`batch_actions`:** runs an ordered list of DOM actions and nested `smart_fill_form` steps in one MCP call, stopping safely if blocked by the Submit guard or optionally continuing on step errors (`continueOnError`).
+
+### 5. Clean Extraction, Evaluation & Media Capture (`extract_clean_text`, `evaluate_js`, `capture_page`)
+- **`extract_clean_text`:** extracts readable plain text or compact Markdown (`format: "text" | "markdown"`) from main/article containers and iframes, stripped of script and style noise.
+- **`evaluate_js`:** runs JS expressions or `(el, arg)` element functions in any frame (`frameIdx`) with JSON-serialized results and optional `savePath` export.
+- **`capture_page`:** full-page or element-scoped screenshots (`png` or `jpeg` with `quality`, `css` or `device` scale, optional `returnImage`) and PDF generation saved to a confined `savePath`.
+
+### 6. Network Blocking, Storage State & Diagnostics (`network_session`, `page_diagnostics`)
+- **`network_session` presets:** `turbo`, `no-images`, `no-media`, and `clean` (unblock all), alongside custom `blockResources` and `blockUrls` patterns.
+- **Session & storage management:** read/write/clear browser `cookies`, `localStorage`/`sessionStorage`, and export or reload full Playwright `storageState` JSON files (`saveStorageStatePath`, `loadStorageStatePath`).
+- **`page_diagnostics`:** defaults to errors-only (`level: "errors"`, `statusFilter: "errors"`) to surface failures cleanly without flooding context, while supporting `all`, `includeStatic`, `urlFilter`, deep request/response inspection (`reqId` + `part`), completed downloads, and dialog auto-handling (`dialogPolicy`: `accept`/`dismiss`).
+
+---
+
+## Reproducible Benchmarks (`npm run benchmark`)
+
+Run the benchmark suite yourself with Chromium and Playwright installed:
+
+```bash
+npm run benchmark
+```
+
+**Environment & methodology:** Headless Chromium via `playwright-core`, counting exact OpenAI `o200k_base` tokens via Python `tiktoken` (`approx-bpe` fallback if `tiktoken` is unavailable). Cumulative workflow tokens model standard chat-history replay across $N$ sequential turns: $\sum_{i=1}^{N} (N - i + 1) \cdot T_i$, plus a one-shot baseline where the first turn captures context before acting.
+
+### 1. Snapshot & Reader Extraction (Chars & Exact `o200k_base` Tokens)
+
+| Scenario | Raw HTML | Full Playwright ARIA | `turbo-browser-mcp` Output | Saved vs ARIA | Saved vs HTML |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **140-Button SaaS Console** (`inspect_compact`) | `61,010` chars (`18,654` tok) | `12,771` chars (`3,568` tok) | **`3,968` chars (`1,135` tok)** | **`68.2%`** | **`93.9%`** |
+| **Post-Click Delta** (`onlyChanged: true`) | `61,010` chars (`18,654` tok) | `12,825` chars (`3,582` tok) | **`168` chars (`56` tok)** | **`98.4%`** | **`99.7%`** |
+| **Article Markdown Extraction** (`extract_clean_text`) | `10,844` chars (`3,595` tok) | n/a | **`641` chars (`156` tok)** | n/a | **`95.7%`** |
+| **Diagnostics Filter** (`32` reqs, `26` console logs) | `9,651` chars (`3,460` tok, `all`) | n/a | **`1,761` chars (`601` tok, `errors`)** | n/a | **`82.6%`** |
+
+### 2. Multi-Turn Forms, Workflows, Uploads & Network Speed
+
+| Scenario | Step-by-Step Baseline | `turbo-browser-mcp` | Execution Speedup | Token Savings |
+| :--- | :--- | :--- | :--- | :--- |
+| **10-Field Complex Form + Verify** (`smart_fill_form`) | `11` turns, `574 ms`, `12,197` direct / `72,614` cum tok | **`1` turn**, **`82 ms`**, **`811` tok** (`filled=10`) | **`7x` faster** | **`93.4%` dir / `98.9%` cum** |
+| **48 KiB PDF Upload** (`49,152` bytes via `file`) | `65,679` chars (`44,728` tok) Base64 payload | **`263` chars (`85` tok)** disk path (`68 ms`) | Zero LLM Base64 encode | **`99.8%`** |
+| **6-Step UI Flow** (`batch_actions`) | `6` turns, `411 ms`, `955` dir / `3,162` cum tok | **`1` turn**, **`357 ms`**, **`406` tok** | **`1.15x` faster** | **`57.5%` dir / `87.2%` cum** |
+| **Open 6 Tabs** (`tabs_batch` `open_many`, `60 ms` TTFB) | `6` turns sequential (`998 ms`) | **`1` turn** batched (`420 ms`) | **`2.38x` faster** (`6 -> 1` turns) | Eliminates `5` turns |
+| **Heavy Media Load** (`8x32 KiB` imgs + `48 KiB` font) | `252 ms`, `9` media hits (`304 KiB`) | **`165 ms`**, `0` media hits (`0 KiB`) | **`1.53x` faster** | **`100%` media saved** |
+
+### 3. Static MCP Tool Definition Footprint
+
+Measured against installed MCP JSON schemas on disk (compact parameter schemas without `annotations`):
+
+| MCP Server | Tool Count | Compact Schema Chars | Exact `o200k_base` Tokens | Savings with `turbo-browser-mcp` |
+| :--- | :--- | :--- | :--- | :--- |
+| `turbo-browser-mcp` | **`10`** (`14,186` full / `12,796` compact) | **`12,796`** | **`3,010`** (`3,314` full w/ annotations) | Baseline (`10` tools) |
+| `@playwright/mcp` | `25` | `18,457` | `3,917` | **`23.2%` fewer static tokens** |
+| `chrome-devtools-mcp` | `33` | `30,252` | `6,737` | **`55.3%` fewer static tokens** |
+
+---
+
+## Comparison vs `@playwright/mcp` and `chrome-devtools-mcp`
+
+| Feature | `turbo-browser-mcp` | `@playwright/mcp` | `chrome-devtools-mcp` |
 | :--- | :--- | :--- | :--- |
-| Dense 140-button DOM snapshot | `13,650` chars raw HTML | `3,920` chars compact / `157` chars delta | **`71.3%` fewer chars** |
-| 7-field form fill + snapshot | `14` MCP turns (`306 ms`) | `1` MCP turn (`59 ms`, `filled=7`) | **`14x` fewer turns, `5.19x` faster** |
-| Open 4 tabs (`domcontentloaded`) | `343 ms` sequential | `250 ms` parallel `open_many` | **`1.37x` faster** |
+| **Tool Surface Size** | **10 batched tools** | 25 granular tools | 33 granular tools |
+| **Delta Snapshots (`onlyChanged`)** | Built-in | Full tree every snapshot | Full tree every snapshot |
+| **Closed Shadow DOM Hook** | Post-init `attachShadow` hook + `<slot>` flattening | Open Shadow DOM | CDP / standard DOM access |
+| **Single-Call Smart Form + Contenteditable** | Yes (React, Shadow DOM, iframe, Gmail, ranges) | Multi-turn fill + separate select calls | Basic `fill_form` |
+| **Disk File Upload (Zero Base64)** | Native `file`/`files` path in `smart_fill_form` & `act_fast` | Dedicated `browser_file_upload` turn | Dedicated `upload_file` turn |
+| **Default Human-in-the-Loop Submit Guard** | Yes (`allowSubmit=false`, form/iframe/Enter hooks) | No | No |
+| **Parallel `open_many` + `isolatedContext`** | Single batched call | Separate sequential tab calls | Separate page calls |
+| **One-Call `turbo` Media Blocker** | Built-in (`turbo`, `no-images`, `no-media`) | Manual JS / routing | Network emulation |
+| **Performance / Heap Profiling** | Not included | Not included | **Trace, Lighthouse, Heap Snapshot** |
+
+> **When to keep Chrome DevTools MCP alongside `turbo-browser-mcp`:** `chrome-devtools-mcp` provides Lighthouse audits, performance trace analysis, CSS computed style panels, and V8 heap snapshots. `turbo-browser-mcp` focuses on fast multi-step UI automation, forms, and scraping with minimal token overhead.
+
+### Tool Parity Map
+
+| Capability | `turbo-browser-mcp` | `@playwright/mcp` | `chrome-devtools-mcp` |
+| :--- | :--- | :--- | :--- |
+| Multi-tab open, list, switch, resize, emulate | `tabs_batch` | `browser_tabs`, `browser_navigate`, `browser_resize`, ... | `new_page`, `list_pages`, `select_page`, `resize_page`, ... |
+| DOM / accessibility inspection | `inspect_compact` | `browser_snapshot` | `take_snapshot` |
+| Multi-field form & upload | `smart_fill_form` | `browser_fill_form` + `browser_select_option` + `browser_file_upload` | `fill_form` + `upload_file` |
+| Click, type, drag, press, scroll, wait | `act_fast` | `browser_click`, `browser_type`, `browser_drag`, ... | `click`, `type_text`, `drag`, `press_key`, `wait_for` |
+| Multi-step sequential macro | `batch_actions` | `browser_run_code_unsafe` or N tool calls | N separate tool calls |
+| Clean article extraction | `extract_clean_text` | `browser_evaluate` custom JS | `evaluate_script` custom JS |
+| Frame/element JS evaluation | `evaluate_js` | `browser_evaluate` | `evaluate_script` |
+| Errors, network & console triage | `page_diagnostics` | `browser_console_messages`, `browser_network_requests` | `list_console_messages`, `list_network_requests`, ... |
+| Screenshots & PDF export | `capture_page` | `browser_take_screenshot` | `take_screenshot` |
+| Blocking presets, cookies & storage | `network_session` | `browser_evaluate` + context config | Partial via `evaluate_script` / `emulate` |
+
+---
+
+## Safety: Human-in-the-Loop Submit Guard & Path Confinement
+
+1. **Human-in-the-loop Submit Guard (`allowSubmit=false` by default):**
+   - `smart_fill_form` (`stopBeforeSubmit: true`), `act_fast`, and `batch_actions` inspect matching elements, W3C AccName labels (`isSafeSubmitter`), implicit HTML form Enter submissions, key chords (`Shift+Enter`, `Enter+Shift`), `HTMLFormElement.prototype.submit`/`requestSubmit`, and same-origin iframe `contentWindow`/`contentDocument` proxies.
+   - Final actions resembling `Submit`, `Publish`, `Send`, `Post`, `Apply`, `Confirm`, or payment triggers are blocked unless `allowSubmit: true` is explicitly passed or `--allow-submit` is enabled at startup.
+   - Trade-off: pre-existing closed Shadow roots on already-open CDP tabs (attached before the init script ran) or strict cross-origin sandboxed frames fall back to Playwright frame handles, coordinate actions, and keyboard input.
+2. **Workspace Path Confinement (`TURBO_BROWSER_SAVE_ROOT`):**
+   - File outputs (`savePath`, `saveStorageStatePath`) and state inputs (`loadStorageStatePath`) are strictly confined to the current working directory or `TURBO_BROWSER_SAVE_ROOT`.
+   - Lexical checks, `lstatSync`/`readlinkSync` symlink verification, and `realpathSync` validation block `..` traversal, UNC network paths, dangling symlinks, cyclic symlinks, and Windows junctions before reading or writing.
+
+---
+
+## All 10 Tools Reference
+
+| Tool | Purpose | Key Parameters |
+| :--- | :--- | :--- |
+| `tabs_batch` | Ordered tab & browser lifecycle | `operations[]` (`list`, `open`, `open_many`, `navigate`, `activate`, `resize`, `emulate`, `reload`, `back`, `forward`, `close`, `close_browser`), `isolatedContext`, `concurrency` (1-10) |
+| `inspect_compact` | Token-capped element/form/article snapshot | `mode` (`interactive`, `forms`, `article`, `all`), `onlyChanged`, `query`, `boxes`, `maxChars`, `includeFrames`, `savePath` |
+| `smart_fill_form` | Batch form, editor & disk file prefill | `fields[]` (`ref`, `selector`, `value`, `option`, `values`, `check`, `not`, `keys`, `file`, `files`, `frameIdx`, `all`), `gmail`, `overwrite`, `stopBeforeSubmit`, `returnSnapshot` |
+| `act_fast` | Single targeted page action | `action` (`16` actions), `ref`/`selector`/`text`/`label`/`(x, y)`, `modifiers`, `dropData`, `allowSubmit`, `returnSnapshot` |
+| `batch_actions` | Ordered chain of actions + form steps | `steps[]`, `continueOnError`, `allowSubmit`, `returnSnapshot`, `snapshotMaxChars` |
+| `extract_clean_text` | Clean text or compact Markdown reader | `format` (`text`, `markdown`), `selector`, `includeFrames`, `maxChars`, `savePath` |
+| `evaluate_js` | Scoped JS expression or `(el, arg)` call | `expression`, `arg`, `frameIdx`, `ref`/`selector`/`text`, `savePath` |
+| `page_diagnostics` | Console, network, downloads & dialogs | `level` (`errors`, `all`), `statusFilter` (`errors`, `all`), `includeStatic`, `urlFilter`, `reqId`, `part`, `dialogPolicy`, `clear`, `savePath` |
+| `capture_page` | PNG/JPEG screenshots & PDF export | `mode` (`screenshot`, `pdf`), `type`, `quality`, `fullPage`, `scale` (`css`, `device`), `ref`/`selector`/`text`, `returnImage`, `savePath` |
+| `network_session` | Resource blockers, cookies & storage | `preset` (`turbo`, `no-images`, `no-media`, `clean`), `blockResources`, `blockUrls`, `cookieAction`, `storageAction`, `loadStorageStatePath`, `saveStorageStatePath` |
+
+### Copy-Paste JSON Examples
+
+#### 1. Fill a 10-field form with a disk PDF & inspect result in 1 turn
+```json
+{
+  "name": "smart_fill_form",
+  "arguments": {
+    "fields": [
+      { "selector": "#full_name", "value": "Alex Nguyen" },
+      { "selector": "#email", "value": "alex@example.com" },
+      { "selector": "#country", "option": "United States" },
+      { "selector": "#skills", "values": ["TypeScript", "Playwright"] },
+      { "selector": "#agree_terms", "check": true },
+      { "selector": "#resume_pdf", "file": "./assets/resume.pdf" }
+    ],
+    "stopBeforeSubmit": true,
+    "returnSnapshot": true
+  }
+}
+```
+
+#### 2. Read only changed controls after opening a modal (`onlyChanged`)
+```json
+{
+  "name": "inspect_compact",
+  "arguments": {
+    "mode": "interactive",
+    "onlyChanged": true,
+    "maxChars": 3000
+  }
+}
+```
+
+#### 3. Open tabs concurrently in isolated contexts & speed up loading with `turbo`
+```json
+{
+  "name": "tabs_batch",
+  "arguments": {
+    "operations": [
+      { "action": "open", "url": "https://example.com/app", "isolatedContext": "acct-a" },
+      { "action": "open_many", "urls": ["https://example.com/docs", "https://example.com/pricing"], "concurrency": 4 }
+    ]
+  }
+}
+```
+
+---
 
 ## Quick Start
 
-### 1. Check your environment
-
+### Install & Check Environment
 ```bash
-node ./src/index.mjs --doctor
+git clone https://github.com/Tthanh2k6/turbo-browser-mcp.git
+cd turbo-browser-mcp
+npm install
+npm run doctor
 ```
 
-Returns JSON verifying Node version, OS/arch, `playwright-core` resolution, Chromium binary path, and local CDP (`http://127.0.0.1:9222`) availability.
+If you need Playwright's bundled Chromium (or have no system Chrome/Edge/Brave installed):
+```bash
+npx playwright-core install chromium
+```
 
-### 2. Configure in any MCP Client (Claude Desktop, Claude Code, Cursor, Windsurf, Antigravity, VS Code)
+### MCP Client Config (Claude Code, Cursor, Antigravity, Codex)
 
-Using local path:
-
+Using local clone:
 ```json
 {
   "mcpServers": {
     "turbo-browser": {
       "command": "node",
-      "args": ["/path/to/turbo-browser-mcp/src/index.mjs"],
+      "args": ["/absolute/path/to/turbo-browser-mcp/src/index.mjs"],
       "env": {
-        "TURBO_BROWSER_MODE": "auto",
-        "TURBO_BROWSER_HEADLESS": "true"
+        "TURBO_BROWSER_SAVE_ROOT": "/absolute/path/to/allowed/workspace"
       }
     }
   }
 }
 ```
 
-Or via `npm` / `npx`:
-
+Using `npx` / binary entrypoint:
 ```json
 {
   "mcpServers": {
     "turbo-browser": {
       "command": "npx",
-      "args": ["-y", "turbo-browser-mcp", "--headless"]
+      "args": ["-y", "turbo-browser-mcp"]
     }
   }
 }
 ```
 
-## CLI Flags & Environment Variables
+---
+
+## CLI Options & Environment Variables
 
 | CLI Flag | Environment Variable | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `-h`, `--help` | — | — | Print usage and options |
-| `-v`, `--version` | — | — | Print version (`0.4.0`) |
-| `--doctor` | — | — | Inspect Node, Playwright, Chromium, and CDP reachability (JSON) |
-| `--mode <mode>` | `TURBO_BROWSER_MODE` | `auto` | `auto` (tries CDP, then persistent dir, then launch), `cdp`, `persistent`, or `launch` |
-| `--cdp <url>` | `TURBO_BROWSER_CDP_URL` | `http://127.0.0.1:9222` | CDP endpoint when attaching to an open Chrome/Edge session |
-| `--user-data-dir <dir>` | `TURBO_BROWSER_USER_DATA_DIR` | `""` | Browser profile directory for `persistent` mode |
-| `--executable <path>` | `TURBO_BROWSER_EXECUTABLE` | `""` | Override Chromium/Chrome/Edge/Brave binary path |
-| `--timeout <ms>` | `TURBO_BROWSER_TIMEOUT_MS` | `15000` | Default navigation and action timeout in ms |
-| `--headless` / `--headed` | `TURBO_BROWSER_HEADLESS` | `true` | Run headless or open a visible browser window |
-| `--allow-submit` | `TURBO_BROWSER_ALLOW_SUBMIT` | `false` | Permit Submit/Publish clicks globally without passing `allowSubmit: true` per call |
-| — | `TURBO_BROWSER_SAVE_ROOT` | `process.cwd()` | Optional `path.delimiter`-separated allow-list of root directories where `savePath`, `capture_page`, `saveStorageStatePath`, and `loadStorageStatePath` may read/write (canonicalized against traversal and symlinks/junctions) |
+| `--mode <auto\|cdp\|persistent\|launch>` | `TURBO_BROWSER_MODE` | `auto` | Connection strategy (`cdp` first then launch in `auto`) |
+| `--cdp <url>` | `TURBO_BROWSER_CDP_URL` | `http://127.0.0.1:9222` | Chrome DevTools Protocol HTTP endpoint |
+| `--user-data-dir <path>` | `TURBO_BROWSER_USER_DATA_DIR` | `""` | Persistent profile directory path |
+| `--executable <path>` | - | auto-detected | Custom Chromium, Chrome, Edge, or Brave executable |
+| `--timeout <ms>` | `TURBO_BROWSER_TIMEOUT_MS` | `15000` | Default Playwright action/navigation timeout in ms |
+| `--headless` / `--headed` | `TURBO_BROWSER_HEADLESS` | `true` (headless) | Run headless or visible browser window (`"false"` for headed) |
+| `--allow-submit` | - | `false` | Disable default Submit/Publish confirmation guard |
+| `--doctor` | - | - | Print Node, Playwright, Chromium, and CDP diagnostics as JSON |
+| `--version` / `-v` | - | - | Print server version (`0.4.0`) |
+| `--help` / `-h` | - | - | Print CLI usage summary |
+| - | `TURBO_BROWSER_SAVE_ROOT` | `process.cwd()` | Root directory confining `savePath` and `storageState` files |
+| - | `PLAYWRIGHT_CORE_PATH` | auto-resolved | Explicit path to `playwright-core/index.mjs` |
 
-## Tools (10)
+> **Tip - Reusing your logged-in Chrome tabs:** Enable remote debugging on port `9222` (via `chrome://inspect/#remote-debugging` or launching Chrome with `--remote-debugging-port=9222`). In default `--mode auto`, `turbo-browser-mcp` attaches to your open tabs directly instead of launching a fresh unauthenticated browser.
 
-| Tool | Read-Only | Purpose |
-| :--- | :--- | :--- |
-| `tabs_batch` | No | List, `open`, parallel `open_many`, `isolatedContext`, navigate, activate, resize, emulate (with `null` reset), reload, back/forward, close tabs, or close browser |
-| `inspect_compact` | Yes | Compact DOM inventory across frames + open Shadow DOM (`interactive`, `forms`, `article`, `all`, `query`, `onlyChanged`, `boxes`, `savePath`) |
-| `smart_fill_form` | No | Batch prefill for React, `contenteditable`, single/multi `<select>`, `<input type="range">`, ARIA comboboxes, radios/checkboxes, Shadow DOM, Gmail, iframes, disk uploads |
-| `act_fast` | No | Single action (`click`, `dblclick`, `hover`, `drag`, `drop`, `fill`, `type`, `select`, `upload`, `wait`, `press`, `button`/`modifiers`/`x`/`y`) with `allowSubmit=false` guard |
-| `batch_actions` | No | Execute sequential DOM and `smart_fill_form` steps in one turn with optional post-batch snapshot |
-| `extract_clean_text` | Yes | Extract readable plain text or compact Markdown across frames capped at `maxChars` with optional `savePath` |
-| `evaluate_js` | No | Evaluate a JS function or expression in a frame or target element `(el, arg)` with optional `savePath` |
-| `page_diagnostics` | No | Inspect console logs, filtered HTTP requests (`includeStatic`, `urlFilter`, `reqId`/`part`), captured `downloads`, dialog policy, and `savePath` |
-| `capture_page` | Yes | Capture full-page or element screenshot (`png`/`jpeg`, `scale: css\|device`) or PDF export to a safe `cwd`-relative path |
-| `network_session` | No | Apply presets (`turbo`, `no-images`, `no-media`, `clean`), manage cookies/`localStorage`/`sessionStorage`, save/load `storageState`, and block custom resources/URLs |
-
-## Parity vs `@playwright/mcp`
-
-| `@playwright/mcp` Tool | `turbo-browser-mcp` Coverage |
-| :--- | :--- |
-| `browser_tabs`, `browser_navigate`, `browser_navigate_back`, `browser_close`, `browser_resize`, `browser_emulate_media` | `tabs_batch` (adds parallel `open_many`, `isolatedContext` sessions, & `emulate` `forcedColors`/`contrast`/`null` resets in 1 batch) |
-| `browser_snapshot`, `browser_find` | `inspect_compact` (adds `maxChars` cap, `onlyChanged` delta, open Shadow DOM, `boxes`, `savePath`) |
-| `browser_fill_form`, `browser_select_option`, `browser_file_upload` | `smart_fill_form` + `act_fast` (adds React `_valueTracker`, `<select multiple>`, `<input type="range">`, ARIA comboboxes, Gmail compose, iframes, `drop` files) |
-| `browser_click`, `browser_hover`, `browser_drag`, `browser_drop`, `browser_type`, `browser_press_key`, `browser_wait_for` | `act_fast` + `batch_actions` (adds `button`/`modifiers`/`{x,y}`, `dropData`, `slowly`/`submit`, `textGone`/`url`/`loadState`, `returnSnapshot`, `allowSubmit=false` guard) |
-| `browser_evaluate` | `evaluate_js` (`frameIdx`, optional element `ref`/`selector`/`text` passing `(el, arg)`, `savePath`) |
-| `browser_console_messages`, `browser_network_requests`, `browser_network_request`, `browser_handle_dialog` | `page_diagnostics` (`includeStatic`, `urlFilter`, `reqId`/`part`, automatic `downloads` capture, `dialogPolicy`, `savePath`) |
-| `browser_take_screenshot` | `capture_page` (`scale: css\|device`, `png`/`jpeg`, `savePath`, `returnImage`, plus `mode: 'pdf'`) |
-| `browser_run_code_unsafe` | Intentionally omitted to preserve `allowSubmit=false` safety; covered by `evaluate_js` + `batch_actions` + `network_session` |
-
-## Chrome CDP Attach Tip
-
-To drive an already signed-in desktop Chrome profile, start Chrome with remote debugging enabled:
-
-```powershell
-# Windows
-"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="$env:LOCALAPPDATA\Google\Chrome\TurboProfile"
-```
-
-```bash
-# macOS
-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-port=9222 --user-data-dir="$HOME/Library/Application Support/Google/Chrome/TurboProfile"
-```
-
-When `TURBO_BROWSER_MODE=auto`, `turbo-browser-mcp` probes `http://127.0.0.1:9222/json/version` (800ms timeout) and attaches automatically if reachable, otherwise falling back to Playwright Chromium launch.
+---
 
 ## Verification
 
-Run the integration test suite, environment doctor, and benchmarks:
-
 ```bash
-npm run doctor
-npm test
-npm run benchmark
+npm test            # 405 passing tests across 85 suites (25 test files under test/*.test.mjs)
+npm run doctor      # Environment check for Node, Playwright, Chromium, and CDP
+npm run benchmark   # Local Chromium speed & exact o200k_base token benchmark
 ```
 
-Latest verified run (`npm test`): `405` passing tests across `85` suites and `25` test files (`test/*.test.mjs`: core integration, DOM/form & session/stdio stress suites, multi-round adversarial simulation suites, and 10 independent audit suites) with `0` failures, `0` cancelled, `0` skipped, and `0` todo. Key hardened areas covered in the test suite:
-
-- **Form, Shadow DOM, and cross-frame controls**: React setter tracking, `contenteditable`, HTML5 inputs (`date`/`time`/`datetime-local`/`month`/`number`/`tel`/`url`/`password`/`color`/`range`), ARIA comboboxes/radios/checkboxes/switches, `<select multiple>` and `<label>` matching, `<fieldset>` scoping, exact-before-prefix choice resolution, nested `iframe` and Shadow DOM traversal (`<slot>` `assignedNodes({ flatten: true })` and `Element.prototype.attachShadow` init hooks for closed roots), real temporary single/multi-file and `filechooser` uploads via `setInputFiles`, `drag`/`drop` (disk files and custom MIME `DataTransfer`), and safe literal matching for metacharacter labels (`C++`, `Phone (optional)`).
-- **Submit safety guard (`allowSubmit=false` default)**: init-script `HTMLFormElement.prototype.submit`/`requestSubmit` and frame `contentWindow`/`contentDocument` accessor proxies, form `submit` capture listeners across light and shadowed trees, microtask/macrotask flush around `smart_fill_form`, guarded `click`/`dblclick`/`hover`/`focus`/`clear`/`fill`/`type`/`select`/`check`/`upload`/`drag`/`drop` actions, nested `<span>`/`<svg>`, `<input type="image">`, `<label for>`, detached `form=` controls, coordinate and iframe/Shadow DOM hit-testing, HTML implicit Enter and key-chord checks (`Shift+Enter`, `Enter+Shift`, literal `' '` `Space`, `\r\n` `type`), W3C accessible-name / Vietnamese button matching (`"Xoá"`, `"Đăng bài"` without blocking `"Đăng nhập"`), and batch `allowSubmit: false` ceiling rules.
-- **Snapshots, diagnostics, sessions, and path confinement**: `query`, `onlyChanged` delta, `[box=x,y,w,h]`, and `maxChars` caps (`3951 <= 4000` on a 140-button fixture); Playwright cache lookup with numeric Chromium revision sorting; `TURBO_BROWSER_SAVE_ROOT` lexical + `canonicalizePath` checks rejecting UNC/traversal/junction/dangling/cyclic symlink escapes before writing or loading; concurrent `open_many` partial failure isolation; HTTP ring-buffer eviction, `reqId` inspection, browser downloads, dialog policies, `isolatedContext` + multi-origin `loadStorageStatePath`, `network_session` presets/globs, CLI `--version`/`--help`/`--doctor`, and stdio JSON-RPC conformance (`Content-Length` case-insensitivity across fragmented chunks, batch arrays, `-32700`/`-32600` recovery, and `protocolVersion` negotiation).
+Tested automatically on GitHub Actions (`ubuntu-latest`) across **Node 20** and **Node 22**.
 
 ## License
 
