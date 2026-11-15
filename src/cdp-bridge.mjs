@@ -10,36 +10,47 @@ const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 export const DEFAULT_BRIDGE_PORT = Number(process.env.TURBO_BROWSER_BRIDGE_PORT) || 9224;
 
 /**
- * Encode a UTF-8 string or Buffer into an unmasked server-to-client RFC 6455 WebSocket frame.
+ * Encode a UTF-8 string or Buffer into an RFC 6455 WebSocket frame.
+ * Set `mask = true` for client-to-server frames, `false` for server-to-client frames.
  */
-function encodeWsFrame(payload, opcode = 0x01) {
+function encodeWsFrame(payload, opcode = 0x01, mask = false) {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : Buffer.from(payload);
   const len = data.length;
+  const maskBit = mask ? 0x80 : 0x00;
   let header;
   if (len < 126) {
     header = Buffer.allocUnsafe(2);
     header[0] = 0x80 | (opcode & 0x0f);
-    header[1] = len;
+    header[1] = maskBit | len;
   } else if (len < 65536) {
     header = Buffer.allocUnsafe(4);
     header[0] = 0x80 | (opcode & 0x0f);
-    header[1] = 126;
+    header[1] = maskBit | 126;
     header.writeUInt16BE(len, 2);
   } else {
     header = Buffer.allocUnsafe(10);
     header[0] = 0x80 | (opcode & 0x0f);
-    header[1] = 127;
+    header[1] = maskBit | 127;
     header.writeBigUInt64BE(BigInt(len), 2);
   }
-  return Buffer.concat([header, data]);
+  if (!mask) {
+    return Buffer.concat([header, data]);
+  }
+  const maskKey = crypto.randomBytes(4);
+  const maskedData = Buffer.allocUnsafe(len);
+  for (let i = 0; i < len; i++) {
+    maskedData[i] = data[i] ^ maskKey[i & 3];
+  }
+  return Buffer.concat([header, maskKey, maskedData]);
 }
 
 /**
- * Minimal RFC 6455 WebSocket connection wrapper for accepted HTTP upgrade sockets.
+ * Minimal RFC 6455 WebSocket connection wrapper for upgraded HTTP sockets.
  */
 class ServerWsClient {
-  constructor(socket) {
+  constructor(socket, { maskOutgoing = false, initialChunk = null } = {}) {
     this.socket = socket;
+    this.maskOutgoing = maskOutgoing;
     this.buffer = Buffer.alloc(0);
     this.fragments = [];
     this.fragmentOpcode = 0;
@@ -52,6 +63,9 @@ class ServerWsClient {
     socket.on('close', () => this._handleClose());
     socket.on('end', () => this._handleClose());
     socket.on('error', () => this._handleClose());
+    if (initialChunk && initialChunk.length > 0) {
+      this._onData(initialChunk);
+    }
   }
 
   _onData(chunk) {
@@ -96,7 +110,7 @@ class ServerWsClient {
       if (opcode === 0x09) {
         // Ping -> Pong
         if (!this.closed) {
-          this.socket.write(encodeWsFrame(payload, 0x0a));
+          this.socket.write(encodeWsFrame(payload, 0x0a, this.maskOutgoing));
         }
         continue;
       }
@@ -125,7 +139,7 @@ class ServerWsClient {
   send(text) {
     if (this.closed || !this.socket.writable) return;
     try {
-      this.socket.write(encodeWsFrame(text, 0x01));
+      this.socket.write(encodeWsFrame(text, 0x01, this.maskOutgoing));
     } catch {
       this._handleClose();
     }
@@ -135,7 +149,7 @@ class ServerWsClient {
     if (this.closed) return;
     this.closed = true;
     try {
-      this.socket.end(encodeWsFrame(Buffer.alloc(0), 0x08));
+      this.socket.end(encodeWsFrame(Buffer.alloc(0), 0x08, this.maskOutgoing));
     } catch {
       this.socket.destroy();
     }
@@ -184,14 +198,14 @@ export async function createCdpBridgeServer({
   let discoverEnabledUpstream = false;
 
   function sendUpstreamRaw(obj) {
-    if (!upstreamWs || upstreamWs.readyState !== WebSocket.OPEN) return false;
+    if (!upstreamWs || upstreamWs.closed) return false;
     upstreamWs.send(JSON.stringify(obj));
     return true;
   }
 
   function callUpstreamInternal(method, params = {}) {
     return new Promise((resolve) => {
-      if (!upstreamWs || upstreamWs.readyState !== WebSocket.OPEN) {
+      if (!upstreamWs || upstreamWs.closed) {
         resolve(null);
         return;
       }
@@ -203,18 +217,97 @@ export async function createCdpBridgeServer({
 
   async function connectUpstream() {
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(upstreamUrl);
+      const parsed = new URL(upstreamUrl);
+      const key = crypto.randomBytes(16).toString('base64');
+      const req = http.request({
+        hostname: parsed.hostname || '127.0.0.1',
+        port: Number(parsed.port) || 9222,
+        path: `${parsed.pathname || '/'}${parsed.search || ''}`,
+        method: 'GET',
+        headers: {
+          Host: parsed.host,
+          Connection: 'Upgrade',
+          Upgrade: 'websocket',
+          'Sec-WebSocket-Key': key,
+          'Sec-WebSocket-Version': '13',
+        },
+      });
+
       const timer = setTimeout(() => {
         try {
-          ws.close();
+          req.destroy();
         } catch {}
         reject(new Error(`Timed out connecting to upstream CDP WebSocket: ${upstreamUrl}`));
       }, connectTimeoutMs);
 
-      ws.addEventListener('open', async () => {
+      req.on('upgrade', async (res, socket, head) => {
         clearTimeout(timer);
+        const ws = new ServerWsClient(socket, { maskOutgoing: true, initialChunk: head });
         upstreamWs = ws;
         upstreamConnected = true;
+
+        ws.onMessage = (rawText) => {
+          let msg;
+          try {
+            msg = JSON.parse(rawText);
+          } catch {
+            return;
+          }
+
+          // Track target attachment state on root browser session so concurrent/subsequent clients stay in sync
+          if (!msg.id && msg.method && !msg.sessionId) {
+            if (msg.method === 'Target.attachedToTarget' && msg.params?.sessionId) {
+              attachedTargets.set(msg.params.sessionId, msg.params);
+            } else if (msg.method === 'Target.detachedFromTarget' && msg.params?.sessionId) {
+              attachedTargets.delete(msg.params.sessionId);
+            } else if (msg.method === 'Target.targetCreated' && msg.params?.targetInfo?.targetId) {
+              discoveredTargets.set(msg.params.targetInfo.targetId, msg.params.targetInfo);
+            } else if (msg.method === 'Target.targetDestroyed' && msg.params?.targetId) {
+              discoveredTargets.delete(msg.params.targetId);
+            } else if (msg.method === 'Target.targetInfoChanged' && msg.params?.targetInfo?.targetId) {
+              const tInfo = msg.params.targetInfo;
+              discoveredTargets.set(tInfo.targetId, tInfo);
+              for (const [sid, entry] of attachedTargets.entries()) {
+                if (entry.targetInfo?.targetId === tInfo.targetId) {
+                  attachedTargets.set(sid, { ...entry, targetInfo: tInfo });
+                }
+              }
+            }
+          }
+
+          if (msg.id !== undefined) {
+            const pending = pendingCalls.get(msg.id);
+            if (pending) {
+              pendingCalls.delete(msg.id);
+              if (pending.internalResolve) {
+                pending.internalResolve(msg.result ?? null);
+                return;
+              }
+              if (pending.client && !pending.client.closed) {
+                const reply = { ...msg, id: pending.clientMsgId };
+                pending.client.send(JSON.stringify(reply));
+              }
+            }
+            return;
+          }
+
+          // Broadcast CDP events to all active downstream clients
+          for (const c of clients) {
+            if (!c.closed) {
+              c.send(rawText);
+            }
+          }
+        };
+
+        ws.onClose = () => {
+          upstreamConnected = false;
+          upstreamWs = null;
+          for (const c of clients) {
+            c.close();
+          }
+          clients.clear();
+        };
+
         try {
           const ver = await callUpstreamInternal('Browser.getVersion', {});
           if (ver && ver.product) {
@@ -230,75 +323,19 @@ export async function createCdpBridgeServer({
         resolve(ws);
       });
 
-      ws.addEventListener('message', (ev) => {
-        const rawText = typeof ev.data === 'string' ? ev.data : Buffer.from(ev.data).toString('utf8');
-        let msg;
-        try {
-          msg = JSON.parse(rawText);
-        } catch {
-          return;
-        }
-
-        // Track target attachment state on root browser session so concurrent/subsequent clients stay in sync
-        if (!msg.id && msg.method && !msg.sessionId) {
-          if (msg.method === 'Target.attachedToTarget' && msg.params?.sessionId) {
-            attachedTargets.set(msg.params.sessionId, msg.params);
-          } else if (msg.method === 'Target.detachedFromTarget' && msg.params?.sessionId) {
-            attachedTargets.delete(msg.params.sessionId);
-          } else if (msg.method === 'Target.targetCreated' && msg.params?.targetInfo?.targetId) {
-            discoveredTargets.set(msg.params.targetInfo.targetId, msg.params.targetInfo);
-          } else if (msg.method === 'Target.targetDestroyed' && msg.params?.targetId) {
-            discoveredTargets.delete(msg.params.targetId);
-          } else if (msg.method === 'Target.targetInfoChanged' && msg.params?.targetInfo?.targetId) {
-            const tInfo = msg.params.targetInfo;
-            discoveredTargets.set(tInfo.targetId, tInfo);
-            for (const [sid, entry] of attachedTargets.entries()) {
-              if (entry.targetInfo?.targetId === tInfo.targetId) {
-                attachedTargets.set(sid, { ...entry, targetInfo: tInfo });
-              }
-            }
-          }
-        }
-
-        if (msg.id !== undefined) {
-          const pending = pendingCalls.get(msg.id);
-          if (pending) {
-            pendingCalls.delete(msg.id);
-            if (pending.internalResolve) {
-              pending.internalResolve(msg.result ?? null);
-              return;
-            }
-            if (pending.client && !pending.client.closed) {
-              const reply = { ...msg, id: pending.clientMsgId };
-              pending.client.send(JSON.stringify(reply));
-            }
-          }
-          return;
-        }
-
-        // Broadcast CDP events to all active downstream clients
-        for (const c of clients) {
-          if (!c.closed) {
-            c.send(rawText);
-          }
-        }
+      req.on('response', (res) => {
+        clearTimeout(timer);
+        reject(new Error(`Upstream CDP rejected WebSocket upgrade with HTTP ${res.statusCode}`));
       });
 
-      ws.addEventListener('close', () => {
-        upstreamConnected = false;
-        upstreamWs = null;
-        for (const c of clients) {
-          c.close();
-        }
-        clients.clear();
-      });
-
-      ws.addEventListener('error', (err) => {
+      req.on('error', (err) => {
         if (!upstreamConnected) {
           clearTimeout(timer);
           reject(new Error(`Upstream CDP WebSocket error on ${upstreamUrl}: ${err?.message || 'connection failed'}`));
         }
       });
+
+      req.end();
     });
   }
 
@@ -494,7 +531,7 @@ export async function ensureCdpBridgeDaemon(
     try {
       // Spawn outside any temporary Job Object on Windows via Win32_Process.Create
       const cmdLine = `"${process.execPath}" "${selfPath}" --daemon --upstream "${upstreamUrl}" --port ${bridgePort} --host ${host}`;
-      const escaped = cmdLine.replace(/"/g, '\\"');
+      const escaped = cmdLine.replace(/'/g, "''");
       execSync(
         `powershell -NoProfile -Command "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${escaped}' }"`,
         { stdio: 'ignore', timeout: 5000 }
@@ -530,7 +567,7 @@ export async function ensureCdpBridgeDaemon(
  * so Chrome 136+/144+/157 exposes standard HTTP/WS CDP with ZERO "Allow remote debugging?" prompts.
  */
 export async function launchUnattendedChrome({
-   executablePath,
+  executablePath,
   port = 9222,
   userDataDir = path.join(os.homedir(), '.turbo-browser-mcp', 'chrome-profile'),
   headless = false,
@@ -548,7 +585,7 @@ export async function launchUnattendedChrome({
     try {
       const quotedArgs = args.map((a) => `"${a}"`).join(' ');
       const cmdLine = `"${executablePath}" ${quotedArgs}`;
-      const escaped = cmdLine.replace(/"/g, '\\"');
+      const escaped = cmdLine.replace(/'/g, "''");
       execSync(
         `powershell -NoProfile -Command "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${escaped}' }"`,
         { stdio: 'ignore', timeout: 5000 }
@@ -576,7 +613,9 @@ export async function launchUnattendedChrome({
 
 // CLI daemon entrypoint: node src/cdp-bridge.mjs --daemon --upstream ws://... --port 9224
 const isDirectRun =
-  process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+  process.argv[1] &&
+  path.resolve(process.argv[1]).toLowerCase() ===
+    path.resolve(fileURLToPath(import.meta.url)).toLowerCase();
 if (isDirectRun && process.argv.includes('--daemon')) {
   const getArg = (flag, fallback) => {
     const idx = process.argv.indexOf(flag);
