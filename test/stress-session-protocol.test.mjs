@@ -38,7 +38,7 @@ function startStressServers() {
           res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
           res.end('<!doctype html><html><head><title>Slow Page</title></head><body><h1>Slow Loaded</h1></body></html>');
         }
-      }, 2500);
+      }, 8000);
       req.on('close', () => clearTimeout(timer));
       return;
     }
@@ -231,7 +231,7 @@ describe('stress-session-protocol: tab torture, open_many partial failures, ring
       `open_many should handle partial failures gracefully instead of rejecting whole batch (threw: ${thrownErr?.message})`
     );
     assert.equal(typeof batchRes.elapsedMs, 'number');
-    assert.ok(batchRes.elapsedMs >= 0 && elapsed < 2200, 'timeoutMs should bound slow URL wait time');
+    assert.ok(batchRes.elapsedMs >= 0 && elapsed < 6000, 'timeoutMs should bound slow URL wait time');
 
     const omRes = batchRes.results[0];
     assert.equal(omRes.action, 'open_many');

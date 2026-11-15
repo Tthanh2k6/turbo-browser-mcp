@@ -39,16 +39,40 @@ function pushRing(arr, item, limit, onEvict) {
 }
 
 function compileUrlPattern(pattern) {
-  const raw = String(pattern);
-  if (raw.startsWith('*')) {
+  const raw = String(pattern ?? '').trim();
+  if (!raw) {
+    return {
+      source: '',
+      test() {
+        return false;
+      },
+    };
+  }
+  const rawLower = raw.toLowerCase();
+  let globRe = null;
+  if (
+    raw.includes('*') &&
+    !/\\[dwsbDWSB.]|\.\*|\.\+|^\^|\$$/.test(raw)
+  ) {
     const globSource = raw.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-    return new RegExp(globSource, 'i');
+    globRe = new RegExp(globSource, 'i');
   }
+  let regRe = null;
   try {
-    return new RegExp(raw, 'i');
+    regRe = new RegExp(raw, 'i');
   } catch {
-    return { test: (val) => val.toLowerCase().includes(raw.toLowerCase()) };
+    regRe = null;
   }
+  return {
+    source: globRe?.source ?? regRe?.source ?? raw,
+    test(val) {
+      const s = String(val || '');
+      if (raw && s.toLowerCase().includes(rawLower)) return true;
+      if (globRe) return globRe.test(s);
+      if (regRe) return regRe.test(s);
+      return false;
+    },
+  };
 }
 
 /**
@@ -81,7 +105,24 @@ export class BrowserManager {
     this.tempDownloadFiles = new Set();
   }
 
+  _resetBrowserState() {
+    this.context = null;
+    this.browser = null;
+    this.connectionType = null;
+    this.tabs.clear();
+    this.isolatedContexts.clear();
+    this.tabContextName.clear();
+    this.activeTabId = null;
+  }
+
   async ensureReady() {
+    if (
+      this.browser &&
+      typeof this.browser.isConnected === 'function' &&
+      !this.browser.isConnected()
+    ) {
+      this._resetBrowserState();
+    }
     if (this.context) return;
     if (!this.initPromise) {
       this.initPromise = this._init().finally(() => {
@@ -159,10 +200,237 @@ export class BrowserManager {
       this.connectionType = 'launch';
     }
 
+    const currentBrowser = this.browser;
+    const currentContext = this.context;
+    if (currentBrowser && typeof currentBrowser.on === 'function') {
+      currentBrowser.on('disconnected', () => {
+        if (this.browser === currentBrowser) {
+          this._resetBrowserState();
+        }
+      });
+    }
+    if (currentContext && typeof currentContext.on === 'function') {
+      currentContext.on('close', () => {
+        if (this.context === currentContext) {
+          this._resetBrowserState();
+        }
+      });
+    }
+
     this.context.setDefaultTimeout(this.defaultTimeoutMs);
+    await this._installContextInitScript(this.context);
     this.context.on('page', (page) => this._registerPage(page, true));
     for (const page of this.context.pages()) {
       this._registerPage(page, this.activeTabId === null);
+    }
+  }
+
+  _shadowInitFn() {
+    return () => {
+      const installFormGuardOnWin = (w) => {
+        if (!w || typeof w !== 'object') return;
+        try {
+          const proto = w.HTMLFormElement?.prototype;
+          if (proto) {
+            const readWinProp = (winObj, prop) => {
+              try {
+                return winObj ? winObj[prop] : undefined;
+              } catch {
+                return undefined;
+              }
+            };
+            const resolveGuardState = (formEl) => {
+              let fWin = w;
+              try {
+                fWin = formEl?.ownerDocument?.defaultView || w;
+              } catch {}
+              let parentWin = null;
+              try {
+                if (w.parent && w.parent !== w && typeof w.parent.document === 'object') parentWin = w.parent;
+              } catch {}
+              let topWin = null;
+              try {
+                if (w.top && w.top !== w && typeof w.top.document === 'object') topWin = w.top;
+              } catch {}
+              const wins = [fWin, w, parentWin, topWin];
+              const guardOn = wins.some((winObj) => Number(readWinProp(winObj, '__tbmSubmitGuardActive')) > 0);
+              const allowSafe = wins.some((winObj) => Boolean(readWinProp(winObj, '__tbmAllowSafeForm')));
+              let checkSub;
+              for (const winObj of wins) {
+                const fn = readWinProp(winObj, '__tbmIsSafeSubmitter');
+                if (typeof fn === 'function') {
+                  checkSub = fn;
+                  break;
+                }
+              }
+              return { guardOn, allowSafe, checkSub };
+            };
+            const origSub = proto.submit;
+            if (typeof origSub === 'function' && !origSub.__tbmProxy) {
+              const proxySub = new Proxy(origSub, {
+                apply(target, thisArg, args) {
+                  const { guardOn, allowSafe } = resolveGuardState(thisArg);
+                  if (guardOn) {
+                    if (!(allowSafe && thisArg && thisArg.__tbmAllowedSubmit === true)) {
+                      return undefined;
+                    }
+                  }
+                  return Reflect.apply(target, thisArg, args);
+                },
+              });
+              Object.defineProperty(proxySub, '__tbmProxy', { value: true, enumerable: false });
+              proto.submit = proxySub;
+            }
+            const origReqSub = proto.requestSubmit;
+            if (typeof origReqSub === 'function' && !origReqSub.__tbmProxy) {
+              const proxyReqSub = new Proxy(origReqSub, {
+                apply(target, thisArg, args) {
+                  const { guardOn, allowSafe, checkSub } = resolveGuardState(thisArg);
+                  if (guardOn) {
+                    if (!(allowSafe && thisArg && thisArg.__tbmAllowedSubmit === true)) {
+                      return undefined;
+                    }
+                    if (args.length > 0 && args[0] !== undefined && args[0] !== null) {
+                      if (typeof checkSub !== 'function' || !checkSub(args[0])) {
+                        return undefined;
+                      }
+                    }
+                  }
+                  return Reflect.apply(target, thisArg, args);
+                },
+              });
+              Object.defineProperty(proxyReqSub, '__tbmProxy', { value: true, enumerable: false });
+              proto.requestSubmit = proxyReqSub;
+            }
+          }
+          const wrapFrameAccessor = (Ctor, prop, extractWin) => {
+            const p = Ctor?.prototype;
+            if (!p) return;
+            const desc = Object.getOwnPropertyDescriptor(p, prop);
+            if (!desc || typeof desc.get !== 'function' || desc.get.__tbmProxy) return;
+            const proxyGet = new Proxy(desc.get, {
+              apply(target, thisArg, args) {
+                const res = Reflect.apply(target, thisArg, args);
+                try {
+                  const cw = extractWin(res);
+                  if (cw) installFormGuardOnWin(cw);
+                } catch {}
+                return res;
+              },
+            });
+            Object.defineProperty(proxyGet, '__tbmProxy', { value: true, enumerable: false });
+            Object.defineProperty(p, prop, { ...desc, get: proxyGet });
+          };
+          wrapFrameAccessor(w.HTMLIFrameElement, 'contentWindow', (v) => v);
+          wrapFrameAccessor(w.HTMLIFrameElement, 'contentDocument', (v) => v?.defaultView);
+          wrapFrameAccessor(w.HTMLFrameElement, 'contentWindow', (v) => v);
+          wrapFrameAccessor(w.HTMLFrameElement, 'contentDocument', (v) => v?.defaultView);
+          wrapFrameAccessor(w.HTMLObjectElement, 'contentWindow', (v) => v);
+          wrapFrameAccessor(w.HTMLObjectElement, 'contentDocument', (v) => v?.defaultView);
+        } catch {}
+      };
+      installFormGuardOnWin(window);
+      Object.defineProperty(window, '__tbmInstallFormGuard', {
+        value: installFormGuardOnWin,
+        configurable: true,
+        enumerable: false,
+      });
+      const origAttach = Element.prototype.attachShadow;
+      if (!origAttach || origAttach.__tbmProxy) return;
+      const closedRoots = new WeakMap();
+      const allRootRefs = new Set();
+      const registry =
+        typeof FinalizationRegistry === 'function'
+          ? new FinalizationRegistry((ref) => {
+              allRootRefs.delete(ref);
+            })
+          : null;
+      const guardSub = (e) => {
+        if (window.__tbmSubmitGuardActive > 0) {
+          const f = e.target;
+          if (window.__tbmAllowSafeForm && f && f.__tbmAllowedSubmit === true) return;
+          e.preventDefault();
+          e.stopImmediatePropagation();
+        }
+      };
+      const registerRoot = (host, sr) => {
+        if (!sr || typeof sr !== 'object') return;
+        try {
+          closedRoots.set(host, sr);
+          if (typeof WeakRef === 'function') {
+            const ref = new WeakRef(sr);
+            allRootRefs.add(ref);
+            if (registry) registry.register(sr, ref);
+          }
+          sr.addEventListener?.('submit', guardSub, true);
+          if (typeof window.__tbmOnShadowRoot === 'function') {
+            window.__tbmOnShadowRoot(sr);
+          }
+        } catch {}
+      };
+      const proxyAttach = new Proxy(origAttach, {
+        apply(target, thisArg, args) {
+          const sr = Reflect.apply(target, thisArg, args);
+          registerRoot(thisArg, sr);
+          return sr;
+        },
+      });
+      Object.defineProperty(proxyAttach, '__tbmProxy', { value: true, enumerable: false });
+      Element.prototype.attachShadow = proxyAttach;
+      Object.defineProperty(window, '__tbmGetShadowRoot', {
+        value: (el) => {
+          if (!el) return null;
+          if (el.shadowRoot) return el.shadowRoot;
+          const local = closedRoots.get(el);
+          if (local) return local;
+          try {
+            const ow = el.ownerDocument?.defaultView;
+            if (ow && ow !== window && typeof ow.__tbmGetShadowRoot === 'function') {
+              return ow.__tbmGetShadowRoot(el);
+            }
+          } catch {}
+          return null;
+        },
+        configurable: true,
+        enumerable: false,
+      });
+      Object.defineProperty(window, '__tbmGetAllShadowRoots', {
+        value: () => {
+          const live = [];
+          for (const ref of [...allRootRefs]) {
+            const sr = typeof ref.deref === 'function' ? ref.deref() : ref;
+            if (sr) {
+              live.push(sr);
+            } else {
+              allRootRefs.delete(ref);
+            }
+          }
+          return live;
+        },
+        configurable: true,
+        enumerable: false,
+      });
+    };
+  }
+
+  async _installContextInitScript(ctx) {
+    if (!ctx || typeof ctx.addInitScript !== 'function' || this._initScriptInstalled?.has(ctx)) return;
+    if (!this._initScriptInstalled) this._initScriptInstalled = new WeakSet();
+    this._initScriptInstalled.add(ctx);
+    const initFn = this._shadowInitFn();
+    await ctx.addInitScript(initFn).catch(() => {});
+    let pages = [];
+    try {
+      pages = ctx.pages();
+    } catch {}
+    for (const p of pages) {
+      let frames = [];
+      try {
+        frames = p.frames();
+      } catch {}
+      for (const f of frames) {
+        await f.evaluate(initFn).catch(() => {});
+      }
     }
   }
 
@@ -260,13 +528,23 @@ export class BrowserManager {
         );
       });
 
+      const ensureEntryInRing = (entry) => {
+        if (entry && !diag.requestMap.has(entry.reqId)) {
+          diag.requestMap.set(entry.reqId, entry);
+          pushRing(diag.requests, entry, REQUEST_RING_LIMIT, (old) => {
+            diag.requestMap.delete(old.reqId);
+          });
+        }
+        return entry;
+      };
+
       page.on('request', (req) => {
         this._recordRequest(diag, req);
       });
 
       page.on('response', (res) => {
         const req = res.request();
-        const entry = diag.reqObjToEntry.get(req) ?? this._recordRequest(diag, req);
+        const entry = ensureEntryInRing(diag.reqObjToEntry.get(req) ?? this._recordRequest(diag, req));
         entry.status = res.status();
         entry.statusText = res.statusText();
         entry.ok = res.ok();
@@ -276,7 +554,7 @@ export class BrowserManager {
       });
 
       page.on('requestfailed', (req) => {
-        const entry = diag.reqObjToEntry.get(req) ?? this._recordRequest(diag, req);
+        const entry = ensureEntryInRing(diag.reqObjToEntry.get(req) ?? this._recordRequest(diag, req));
         entry.ok = false;
         entry.failureText = req.failure()?.errorText || 'failed';
         entry.durationMs = Date.now() - entry.startTime;
@@ -305,7 +583,7 @@ export class BrowserManager {
 
       page.on('download', (download) => {
         const safeName = path.basename(download.suggestedFilename() || 'download.bin');
-        const savePath = path.join(os.tmpdir(), `tbm-dl-${Date.now()}-${safeName}`);
+        const savePath = path.join(os.tmpdir(), `tbm-dl-${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeName}`);
         this.tempDownloadFiles.add(savePath);
         const job = download.saveAs(savePath).then(() => {
           pushRing(
@@ -364,7 +642,14 @@ export class BrowserManager {
       ...this.isolatedContexts.entries(),
     ];
     for (const [ctxName, ctx] of contextPairs) {
-      for (const page of ctx.pages()) {
+      let pages = [];
+      try {
+        pages = ctx.pages();
+      } catch {
+        if (ctxName !== 'default') this.isolatedContexts.delete(ctxName);
+        continue;
+      }
+      for (const page of pages) {
         if (!page.isClosed()) {
           this._registerPage(page, false, ctxName);
         }
@@ -434,7 +719,13 @@ export class BrowserManager {
       return { name: 'default', ctx: this.context };
     }
     if (this.isolatedContexts.has(contextName)) {
-      return { name: contextName, ctx: this.isolatedContexts.get(contextName) };
+      const existingCtx = this.isolatedContexts.get(contextName);
+      try {
+        existingCtx.pages();
+        return { name: contextName, ctx: existingCtx };
+      } catch {
+        this.isolatedContexts.delete(contextName);
+      }
     }
     const browserRef = this.browser || this.context.browser();
     if (!browserRef) {
@@ -442,7 +733,23 @@ export class BrowserManager {
     }
     const isoCtx = await browserRef.newContext({ viewport: { width: 1280, height: 800 } });
     isoCtx.setDefaultTimeout(this.defaultTimeoutMs);
+    await this._installContextInitScript(isoCtx);
     isoCtx.on('page', (page) => this._registerPage(page, true, contextName));
+    isoCtx.on('close', () => {
+      if (this.isolatedContexts.get(contextName) === isoCtx) {
+        this.isolatedContexts.delete(contextName);
+      }
+      for (const [tid, cName] of [...this.tabContextName.entries()]) {
+        if (cName === contextName) {
+          this.tabs.delete(tid);
+          this.tabContextName.delete(tid);
+        }
+      }
+      if (this.activeTabId !== null && !this.tabs.has(this.activeTabId)) {
+        const remaining = [...this.tabs.keys()];
+        this.activeTabId = remaining.length > 0 ? remaining[remaining.length - 1] : null;
+      }
+    });
     this.isolatedContexts.set(contextName, isoCtx);
     return { name: contextName, ctx: isoCtx };
   }
@@ -478,7 +785,12 @@ export class BrowserManager {
       }
 
       if (action === 'open_many') {
-        const urls = Array.isArray(op.urls) ? op.urls.map((u) => String(u)).filter(Boolean) : [];
+        const urls = Array.isArray(op.urls)
+          ? op.urls
+              .filter((u) => u !== null && u !== undefined)
+              .map((u) => String(u).trim())
+              .filter(Boolean)
+          : [];
         if (urls.length === 0) throw new Error('open_many action requires a non-empty urls array.');
         const batchT0 = Date.now();
         const prevActiveTabId = this.activeTabId;
@@ -522,7 +834,10 @@ export class BrowserManager {
           opened.push(...chunkResults);
         }
         if (op.activate === false) {
-          this.activeTabId = prevActiveTabId;
+          this.activeTabId =
+            prevActiveTabId !== null && this.tabs.has(prevActiveTabId)
+              ? prevActiveTabId
+              : ([...this.tabs.keys()][0] ?? null);
         } else {
           const lastOk = [...opened].reverse().find((item) => item.ok !== false && item.tabId !== null);
           this.activeTabId = lastOk ? lastOk.tabId : prevActiveTabId;
@@ -541,16 +856,33 @@ export class BrowserManager {
         const page = await ctx.newPage();
         const tabId = this._registerPage(page, op.activate !== false, ctxName);
         if (op.activate === false) {
-          this.activeTabId = prevActiveTabId;
+          this.activeTabId =
+            prevActiveTabId !== null && this.tabs.has(prevActiveTabId)
+              ? prevActiveTabId
+              : tabId;
         }
         if (op.url) {
-          await page.goto(op.url, {
-            waitUntil: op.waitUntil || 'domcontentloaded',
-            timeout: op.timeoutMs || this.defaultTimeoutMs,
-          });
+          try {
+            await page.goto(op.url, {
+              waitUntil: op.waitUntil || 'domcontentloaded',
+              timeout: op.timeoutMs || this.defaultTimeoutMs,
+            });
+          } catch (err) {
+            await page.close().catch(() => {});
+            this.tabs.delete(tabId);
+            this.tabContextName.delete(tabId);
+            this.activeTabId =
+              prevActiveTabId !== null && this.tabs.has(prevActiveTabId)
+                ? prevActiveTabId
+                : ([...this.tabs.keys()].pop() ?? null);
+            throw err;
+          }
         }
         if (op.activate === false) {
-          this.activeTabId = prevActiveTabId;
+          this.activeTabId =
+            prevActiveTabId !== null && this.tabs.has(prevActiveTabId)
+              ? prevActiveTabId
+              : tabId;
         }
         results.push({
           action: 'open',
@@ -605,18 +937,22 @@ export class BrowserManager {
         if (Object.keys(mediaOpts).length > 0) {
           await page.emulateMedia(mediaOpts);
         }
-        if (op.viewport?.width && op.viewport?.height) {
-          await page.setViewportSize({
-            width: Number(op.viewport.width),
-            height: Number(op.viewport.height),
-          });
+        let appliedViewport;
+        if (op.viewport && (op.viewport.width !== undefined || op.viewport.height !== undefined)) {
+          appliedViewport = {
+            width: Math.max(200, Number(op.viewport.width) || 1280),
+            height: Math.max(200, Number(op.viewport.height) || 800),
+          };
+          await page.setViewportSize(appliedViewport);
         }
-        if (op.userAgent) {
+        if (op.userAgent !== undefined) {
           const diag = this._ensureDiagState(page);
           if (!diag.cdpSession) {
             diag.cdpSession = await page.context().newCDPSession(page);
           }
-          await diag.cdpSession.send('Emulation.setUserAgentOverride', { userAgent: String(op.userAgent) });
+          await diag.cdpSession.send('Emulation.setUserAgentOverride', {
+            userAgent: op.userAgent ? String(op.userAgent) : '',
+          });
           if (Object.keys(mediaOpts).length > 0) {
             await page.emulateMedia(mediaOpts);
           }
@@ -625,8 +961,8 @@ export class BrowserManager {
           action: 'emulate',
           tabId,
           ...mediaOpts,
-          viewport: op.viewport || undefined,
-          userAgent: op.userAgent ? true : undefined,
+          viewport: appliedViewport || undefined,
+          userAgent: op.userAgent !== undefined ? Boolean(op.userAgent) : undefined,
         });
         continue;
       }
@@ -673,7 +1009,7 @@ export class BrowserManager {
     if (diag.pendingDownloads.length > 0) {
       await Promise.race([
         Promise.allSettled([...diag.pendingDownloads]),
-        new Promise((r) => setTimeout(r, 1200)),
+        new Promise((r) => setTimeout(r, 2500)),
       ]);
     }
 
@@ -799,6 +1135,7 @@ export class BrowserManager {
       diag.console.length = 0;
       diag.requests.length = 0;
       diag.requestMap.clear();
+      diag.reqObjToEntry = new WeakMap();
       diag.dialogs.length = 0;
       diag.downloads.length = 0;
     }
@@ -831,17 +1168,20 @@ export class BrowserManager {
     const blockResourcesInput = [
       ...(presetSpec ? presetSpec.resources : []),
       ...(Array.isArray(params.blockResources) ? params.blockResources : []),
-    ];
+    ]
+      .map((r) => String(r ?? '').trim().toLowerCase())
+      .filter(Boolean);
     const blockUrlsInput = [
       ...(presetSpec ? presetSpec.urls : []),
       ...(Array.isArray(params.blockUrls) ? params.blockUrls : []),
-    ];
+    ]
+      .map((u) => String(u ?? '').trim())
+      .filter(Boolean);
 
     if (blockResourcesInput.length > 0 || blockUrlsInput.length > 0) {
-      for (const r of blockResourcesInput) diag.blockedResources.add(String(r).toLowerCase());
+      for (const r of blockResourcesInput) diag.blockedResources.add(r);
       const existingSources = new Set(diag.blockedUrlPatterns.map((p) => p.source));
-      for (const pat of blockUrlsInput) {
-        const src = String(pat);
+      for (const src of blockUrlsInput) {
         if (!existingSources.has(src)) {
           existingSources.add(src);
           diag.blockedUrlPatterns.push({ source: src, matcher: compileUrlPattern(src) });
@@ -877,23 +1217,50 @@ export class BrowserManager {
         await pageCtx.addCookies(raw.cookies);
       }
       if (Array.isArray(raw.origins) && raw.origins.length > 0) {
-        await pageCtx.addInitScript((origins) => {
-          const m = origins.find((o) => o.origin === window.location.origin);
-          if (m && Array.isArray(m.localStorage)) {
-            for (const item of m.localStorage) {
-              window.localStorage.setItem(item.name, item.value);
-            }
+        const normalizedOrigins = raw.origins.map((o) => {
+          let normOrigin = String(o?.origin || '');
+          try {
+            normOrigin = new URL(normOrigin).origin;
+          } catch {
+            normOrigin = normOrigin.replace(/\/+$/, '').toLowerCase();
           }
-        }, raw.origins);
+          return { ...o, origin: normOrigin };
+        });
+        const seedKey = `__tbm_ls_seeded_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        await pageCtx.addInitScript(
+          ({ origins, markerKey }) => {
+            try {
+              if (window.sessionStorage.getItem(markerKey) === '1') return;
+              const m = origins.find((o) => o.origin === window.location.origin);
+              if (m && Array.isArray(m.localStorage)) {
+                for (const item of m.localStorage) {
+                  window.localStorage.setItem(item.name, item.value);
+                }
+                window.sessionStorage.setItem(markerKey, '1');
+              }
+            } catch {
+              // Ignore storage access errors on opaque origins.
+            }
+          },
+          { origins: normalizedOrigins, markerKey: seedKey }
+        );
         if (page.url().startsWith('http')) {
           const curOrigin = new URL(page.url()).origin;
-          const match = raw.origins.find((o) => o.origin === curOrigin);
-          if (match && Array.isArray(match.localStorage)) {
-            await page.evaluate((entries) => {
-              for (const item of entries) {
-                window.localStorage.setItem(item.name, item.value);
-              }
-            }, match.localStorage);
+          const match = normalizedOrigins.find((o) => o.origin === curOrigin);
+          if (match) {
+            await page.evaluate(
+              ({ entries, markerKey }) => {
+                if (Array.isArray(entries)) {
+                  for (const item of entries) {
+                    window.localStorage.setItem(item.name, item.value);
+                  }
+                }
+                try {
+                  window.sessionStorage.setItem(markerKey, '1');
+                } catch {}
+              },
+              { entries: match.localStorage || null, markerKey: seedKey }
+            );
           }
         }
       }
@@ -935,6 +1302,7 @@ export class BrowserManager {
             const out = {};
             for (let i = 0; i < s.length; i++) {
               const k = s.key(i);
+              if (k && k.startsWith('__tbm_ls_seeded_')) continue;
               out[k] = s.getItem(k);
             }
             return out;

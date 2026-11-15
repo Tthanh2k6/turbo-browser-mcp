@@ -94,7 +94,9 @@ export const TOOL_DEFINITIONS = [
               contrast: {
                 oneOf: [{ type: 'string', enum: ['more', 'no-preference'] }, { type: 'null' }],
               },
-              userAgent: { type: 'string' },
+              userAgent: {
+                oneOf: [{ type: 'string' }, { type: 'null' }],
+              },
               viewport: {
                 type: 'object',
                 properties: {
@@ -201,6 +203,10 @@ export const TOOL_DEFINITIONS = [
               },
               file: { type: 'string' },
               files: { type: 'array', items: { type: 'string' } },
+              all: {
+                type: 'boolean',
+                description: 'When true, fill all matching controls across frames instead of only the best match.',
+              },
             },
           },
         },
@@ -518,7 +524,8 @@ export const TOOL_DEFINITIONS = [
   },
 ];
 
-export async function dispatchToolCall(manager, name, args = {}) {
+export async function dispatchToolCall(manager, name, rawArgs = {}) {
+  const args = rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs) ? rawArgs : {};
   switch (name) {
     case 'tabs_batch': {
       const res = await manager.tabsBatch(args.operations || []);
@@ -611,20 +618,8 @@ export async function dispatchToolCall(manager, name, args = {}) {
 }
 
 export function createJsonRpcHandler(manager) {
-  return async function handleMessage(msg) {
-    if (Array.isArray(msg)) {
-      if (msg.length === 0) {
-        return {
-          jsonrpc: '2.0',
-          id: null,
-          error: { code: -32600, message: 'Invalid Request: empty batch' },
-        };
-      }
-      const replies = (await Promise.all(msg.map((item) => handleMessage(item)))).filter(Boolean);
-      return replies.length > 0 ? replies : null;
-    }
-
-    if (!msg || typeof msg !== 'object') {
+  async function handleSingleRequest(msg) {
+    if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
       return {
         jsonrpc: '2.0',
         id: null,
@@ -632,20 +627,56 @@ export function createJsonRpcHandler(manager) {
       };
     }
 
-    // Notifications carry no id and expect no reply.
     const hasId = Object.prototype.hasOwnProperty.call(msg, 'id') && msg.id !== undefined;
+    const { id, method } = msg;
+
+    if (hasId) {
+      const isValidId =
+        id === null ||
+        typeof id === 'string' ||
+        (typeof id === 'number' && Number.isFinite(id));
+      if (!isValidId) {
+        return {
+          jsonrpc: '2.0',
+          id: null,
+          error: { code: -32600, message: 'Invalid Request: id must be a string, number, or null' },
+        };
+      }
+    }
+
+    if (msg.jsonrpc !== '2.0') {
+      return {
+        jsonrpc: '2.0',
+        id: hasId ? id : null,
+        error: { code: -32600, message: 'Invalid Request: jsonrpc must be "2.0"' },
+      };
+    }
+
+    if (!method || typeof method !== 'string') {
+      return {
+        jsonrpc: '2.0',
+        id: hasId ? id : null,
+        error: { code: -32600, message: 'Invalid Request: method must be a non-empty string' },
+      };
+    }
+
+    // Valid notifications carry no id and expect no reply.
     if (!hasId) {
       return null;
     }
 
-    const { id, method, params = {} } = msg;
-    if (!method || typeof method !== 'string') {
+    if (
+      msg.params !== undefined &&
+      msg.params !== null &&
+      (typeof msg.params !== 'object' || Array.isArray(msg.params))
+    ) {
       return {
         jsonrpc: '2.0',
         id,
-        error: { code: -32600, message: 'Invalid Request: method must be a non-empty string' },
+        error: { code: -32602, message: 'Invalid params: params must be an object' },
       };
     }
+    const params = msg.params ?? {};
 
     try {
       if (method === 'initialize') {
@@ -677,8 +708,26 @@ export function createJsonRpcHandler(manager) {
       }
 
       if (method === 'tools/call') {
+        if (!params.name || typeof params.name !== 'string') {
+          return {
+            jsonrpc: '2.0',
+            id,
+            error: { code: -32602, message: 'Invalid params: tools/call requires a string tool name' },
+          };
+        }
+        if (
+          params.arguments !== undefined &&
+          params.arguments !== null &&
+          (typeof params.arguments !== 'object' || Array.isArray(params.arguments))
+        ) {
+          return {
+            jsonrpc: '2.0',
+            id,
+            error: { code: -32602, message: 'Invalid params: arguments must be an object' },
+          };
+        }
         const toolName = params.name;
-        const toolArgs = params.arguments || {};
+        const toolArgs = params.arguments ?? {};
         try {
           const out = await dispatchToolCall(manager, toolName, toolArgs);
           const content = [{ type: 'text', text: out.text }];
@@ -721,6 +770,25 @@ export function createJsonRpcHandler(manager) {
         error: { code: -32603, message: String(err?.message || err) },
       };
     }
+  }
+
+  return async function handleMessage(msg) {
+    if (Array.isArray(msg)) {
+      if (msg.length === 0) {
+        return {
+          jsonrpc: '2.0',
+          id: null,
+          error: { code: -32600, message: 'Invalid Request: empty batch' },
+        };
+      }
+      const replies = [];
+      for (const item of msg) {
+        const rep = await handleSingleRequest(item);
+        if (rep) replies.push(rep);
+      }
+      return replies.length > 0 ? replies : null;
+    }
+    return handleSingleRequest(msg);
   };
 }
 
@@ -745,22 +813,33 @@ export function startStdioServer(manager = new BrowserManager()) {
   };
 
   const enqueueMessage = (rawJson) => {
-    rpcChain = rpcChain.then(async () => {
-      let msg;
-      try {
-        msg = JSON.parse(rawJson);
-      } catch (err) {
-        process.stderr.write(`[turbo-browser-mcp] JSON parse error: ${err.message}\n`);
-        writeReply({
-          jsonrpc: '2.0',
-          id: null,
-          error: { code: -32700, message: `Parse error: ${err.message}` },
-        });
-        return;
-      }
-      const reply = await handle(msg);
-      writeReply(reply);
-    });
+    rpcChain = rpcChain
+      .then(async () => {
+        let msg;
+        try {
+          msg = JSON.parse(rawJson);
+        } catch (err) {
+          process.stderr.write(`[turbo-browser-mcp] JSON parse error: ${err.message}\n`);
+          writeReply({
+            jsonrpc: '2.0',
+            id: null,
+            error: { code: -32700, message: `Parse error: ${err.message}` },
+          });
+          return;
+        }
+        try {
+          const reply = await handle(msg);
+          writeReply(reply);
+        } catch (err) {
+          process.stderr.write(`[turbo-browser-mcp] RPC handler error: ${err?.message || err}\n`);
+          writeReply({
+            jsonrpc: '2.0',
+            id: null,
+            error: { code: -32603, message: String(err?.message || err) },
+          });
+        }
+      })
+      .catch(() => {});
   };
 
   const drainBuffer = () => {
@@ -770,22 +849,45 @@ export function startStdioServer(manager = new BrowserManager()) {
       }
       if (buffer.length === 0) break;
 
-      const head = buffer.subarray(0, Math.min(buffer.length, 64)).toString('utf8');
-      if (buffer.length < 15 && 'content-length:'.startsWith(head.toLowerCase())) {
+      const head = buffer.subarray(0, Math.min(buffer.length, 256)).toString('utf8');
+      const lowerHead = head.toLowerCase();
+      if (
+        buffer.length < 32 &&
+        buffer.indexOf(0x0a) === -1 &&
+        ('content-length:'.startsWith(lowerHead) ||
+          'content-type:'.startsWith(lowerHead) ||
+          /^content-[a-z0-9-]*$/i.test(head) ||
+          /^x-[a-z0-9-]*$/i.test(head))
+      ) {
         break;
       }
-      if (/^content-length:/i.test(head)) {
+      if (/^(?:content-length|content-type|x-[a-z0-9-]+)\s*:/i.test(head)) {
         useContentLength = true;
-        const headerEnd = buffer.indexOf('\r\n\r\n');
-        if (headerEnd === -1) break;
+        const crlfEnd = buffer.indexOf('\r\n\r\n');
+        const lfEnd = buffer.indexOf('\n\n');
+        let headerEnd = -1;
+        let sepLen = 4;
+        if (crlfEnd !== -1 && (lfEnd === -1 || crlfEnd <= lfEnd)) {
+          headerEnd = crlfEnd;
+          sepLen = 4;
+        } else if (lfEnd !== -1) {
+          headerEnd = lfEnd;
+          sepLen = 2;
+        }
+        if (headerEnd === -1) {
+          if (buffer.length > 65536) {
+            buffer = Buffer.alloc(0);
+          }
+          break;
+        }
         const headerText = buffer.subarray(0, headerEnd).toString('utf8');
-        const match = /Content-Length:\s*(\d+)/i.exec(headerText);
+        const match = /(?:^|\r?\n)[ \t]*Content-Length[ \t]*:[ \t]*(\d+)/i.exec(headerText);
         if (!match) {
-          buffer = buffer.subarray(headerEnd + 4);
+          buffer = buffer.subarray(headerEnd + sepLen);
           continue;
         }
         const bodyLen = Number(match[1]);
-        const bodyStart = headerEnd + 4;
+        const bodyStart = headerEnd + sepLen;
         if (buffer.length < bodyStart + bodyLen) break;
         const body = buffer.subarray(bodyStart, bodyStart + bodyLen).toString('utf8');
         buffer = buffer.subarray(bodyStart + bodyLen);

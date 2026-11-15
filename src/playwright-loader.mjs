@@ -130,19 +130,28 @@ export function resolveChromiumExecutable(chromium, headless = true) {
 
   for (const cacheDir of cacheDirs) {
     if (!fs.existsSync(cacheDir)) continue;
-    const dirs = fs.readdirSync(cacheDir, { withFileTypes: true })
-      .filter((d) => d.isDirectory())
-      .map((d) => d.name)
-      .sort()
-      .reverse();
-
+    const parseRev = (name) => {
+      const m = /-(\d+)$/.exec(name);
+      return m ? Number(m[1]) : -1;
+    };
     const prefixes = headless ? ['chromium_headless_shell-', 'chromium-'] : ['chromium-'];
-    for (const prefix of prefixes) {
-      for (const dirName of dirs) {
-        if (!dirName.startsWith(prefix)) continue;
-        const hit = getCacheBinCandidates(cacheDir, dirName).find((p) => fs.existsSync(p));
-        if (hit) return { executablePath: hit };
-      }
+    const prefixRank = (name) => {
+      const idx = prefixes.findIndex((p) => name.startsWith(p));
+      return idx >= 0 ? idx : prefixes.length;
+    };
+    const dirs = fs.readdirSync(cacheDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && prefixes.some((p) => d.name.startsWith(p)))
+      .map((d) => d.name)
+      .sort((a, b) => {
+        const diff = parseRev(b) - parseRev(a);
+        if (diff !== 0) return diff;
+        const pDiff = prefixRank(a) - prefixRank(b);
+        return pDiff !== 0 ? pDiff : b.localeCompare(a);
+      });
+
+    for (const dirName of dirs) {
+      const hit = getCacheBinCandidates(cacheDir, dirName).find((p) => fs.existsSync(p));
+      if (hit) return { executablePath: hit };
     }
   }
 

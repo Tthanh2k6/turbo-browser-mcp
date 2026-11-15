@@ -16,7 +16,7 @@
   ],
   "scripts": {
     "start": "node ./src/index.mjs",
-    "test": "node --test test/*.test.mjs",
+    "test": "node --test --test-concurrency=4 test/*.test.mjs",
     "doctor": "node ./src/index.mjs --doctor",
     "benchmark": "node ./benchmarks/benchmark.mjs"
   },

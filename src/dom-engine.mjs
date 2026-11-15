@@ -4,13 +4,16 @@ import path from 'node:path';
 const DEFAULT_TIMEOUT_MS = 8000;
 
 const SUBMIT_LABEL_RE =
-  /^(submit|publish|post|send|apply(\s+now)?|confirm(\s+and)?\s*(pay|submit|order)|pay(\s+now)?|checkout|place\s+order|delete|remove|gửi|đăng(?!\s+nhập)(\s*bài)?|nộp(\s*đơn)?|xác\s*nhận(\s*(nộp|gửi|thanh\s*toán))?|thanh\s*toán|xoá|xóa)(?![\p{L}\p{N}_])/iu;
+  /^(submit|publish|post|send|apply(\s+now)?|confirm(\s+and)?\s*(pay|submit|order|booking)|pay(\s+now)?|buy(\s+now)?|order(\s+now)?|complete\s+(order|purchase)|checkout|place\s+order|delete|remove|gửi|đăng(?!\s+nhập)(\s*bài)?|nộp(\s*đơn)?|xác\s*nhận(\s*(nộp|gửi|thanh\s*toán|đặt))?|thanh\s*toán|đặt\s+hàng|mua\s+ngay|xoá|xóa)(?![\p{L}\p{N}_])/iu;
 
 const SAFE_SUBMIT_TYPE_RE =
-  /^(next|continue|search|filter|save\s*draft|tiếp(\s*tục)?|tìm(\s*kiếm)?|lọc|lưu\s*nháp)(?![\p{L}\p{N}_])/iu;
+  /^(next|continue|search|filter|save\s*draft|log\s*in|sign\s*in|tiếp(\s*tục)?|tìm(\s*kiếm)?|lọc|lưu\s*nháp|đăng\s+nhập)(?![\p{L}\p{N}_])/iu;
+
+const COMPOUND_DANGER_RE =
+  /(?:^|[^\p{L}\p{N}_])(submit|publish|post|send|apply(\s+now)?|pay|payment|purchase|buy|place\s+order|complete\s+(order|purchase)|checkout|delete|remove|confirm|thanh\s*toán|đặt\s+hàng|mua\s+ngay|đăng(?!\s+nhập)(\s*bài)?|xoá|xóa|gửi|nộp)(?![\p{L}\p{N}_])/iu;
 
 const QUESTION_BLOCK_SELECTOR =
-  '[role="listitem"], fieldset, .form-group, .field, [class*="Field"], [class*="field"], [class*="question"]';
+  '[role="listitem"], [role="radiogroup"], [role="group"], fieldset, .form-group, .field, [class*="Field"], [class*="field"], [class*="question"]';
 
 const SUBMIT_SCAN_SELECTOR =
   'button, input[type="submit"], input[type="image"], input[type="button"], [role="button"], a[role="button"]';
@@ -62,12 +65,47 @@ function inferMimeType(filePath) {
   return EXT_MIME_MAP[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
 }
 
-function canonicalizePath(targetPath) {
+function canonicalizePath(targetPath, { rejectDangling = false, allowUncTarget = false } = {}) {
   const resolved = path.resolve(targetPath);
   let cur = resolved;
   const tail = [];
   while (true) {
-    if (fs.existsSync(cur)) {
+    let st = null;
+    try {
+      st = fs.lstatSync(cur, { throwIfNoEntry: false });
+    } catch (err) {
+      if (rejectDangling && err?.code === 'ELOOP') {
+        throw new Error(
+          `Refusing cyclic symlink/junction "${cur}" (outside allowed root).`
+        );
+      }
+    }
+    if (st) {
+      if (st.isSymbolicLink()) {
+        let linkTarget = '';
+        try {
+          linkTarget = String(fs.readlinkSync(cur) || '').trim();
+        } catch {}
+        if (
+          !allowUncTarget &&
+          /^(?:[\\/]{2}|\\\\[?.]\\UNC\\|\\\?\?\\UNC\\)/i.test(linkTarget)
+        ) {
+          throw new Error(
+            `Refusing symlink/junction "${cur}" targeting network/UNC path "${linkTarget}" (outside allowed root).`
+          );
+        }
+        try {
+          const real = fs.realpathSync(cur);
+          return tail.length > 0 ? path.join(real, ...tail.reverse()) : real;
+        } catch {
+          if (rejectDangling) {
+            throw new Error(
+              `Refusing dangling or unresolvable symlink/junction "${cur}" (outside allowed root).`
+            );
+          }
+          return tail.length > 0 ? path.join(cur, ...tail.reverse()) : cur;
+        }
+      }
       try {
         const real = fs.realpathSync(cur);
         return tail.length > 0 ? path.join(real, ...tail.reverse()) : real;
@@ -86,25 +124,65 @@ function canonicalizePath(targetPath) {
  * Resolve a file path for saving/loading state confined to process.cwd() or TURBO_BROWSER_SAVE_ROOT.
  */
 export function resolveSafePath(inputPath, purpose = 'savePath') {
-  const raw = String(inputPath ?? '').trim();
+  const rawInput = String(inputPath ?? '');
+  if (rawInput.includes('\0')) {
+    throw new Error(`${purpose} contains invalid null byte.`);
+  }
+  const raw = rawInput.trim();
   if (!raw) {
     throw new Error(`${purpose} requires a non-empty file path.`);
   }
+  if (process.platform === 'win32') {
+    if (/^[a-zA-Z]:(?![\\/])/.test(raw)) {
+      throw new Error(`${purpose} rejects Windows drive-relative path "${raw}".`);
+    }
+    const withoutDrive = rawInput.replace(/^\s*[a-zA-Z]:[\\/]/, '');
+    if (withoutDrive.includes(':')) {
+      throw new Error(`${purpose} rejects Windows NTFS alternate data stream or colon in "${raw}".`);
+    }
+    const rawSegments = withoutDrive.split(/[\\/]+/).filter(Boolean);
+    for (const seg of rawSegments) {
+      if (seg !== '.' && seg !== '..' && /[\s.]$/.test(seg)) {
+        throw new Error(`${purpose} rejects trailing dot or space in path segment "${seg}".`);
+      }
+      if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i.test(seg)) {
+        throw new Error(`${purpose} rejects Windows reserved device name "${seg}".`);
+      }
+    }
+  }
+  const isPathInsideRoot = (candidatePath, rootDir) => {
+    const normCand = process.platform === 'win32' ? candidatePath.toLowerCase() : candidatePath;
+    const normRoot = process.platform === 'win32' ? rootDir.toLowerCase() : rootDir;
+    const rel = path.relative(normRoot, normCand);
+    return (
+      rel === '' ||
+      (!path.isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${path.sep}`) && !rel.startsWith('../'))
+    );
+  };
   const envRoots = (process.env.TURBO_BROWSER_SAVE_ROOT || '')
     .split(path.delimiter)
     .map((s) => s.trim())
     .filter(Boolean);
-  const allowedRoots = (envRoots.length > 0 ? envRoots : [process.cwd()]).map((r) =>
-    canonicalizePath(path.resolve(process.cwd(), r))
-  );
-  const candidate = canonicalizePath(path.resolve(process.cwd(), raw));
-  const normCand = process.platform === 'win32' ? candidate.toLowerCase() : candidate;
-
-  const isInside = allowedRoots.some((rootDir) => {
-    const normRoot = process.platform === 'win32' ? rootDir.toLowerCase() : rootDir;
-    const rel = path.relative(normRoot, normCand);
-    return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+  const rootPairs = (envRoots.length > 0 ? envRoots : [process.cwd()]).map((r) => {
+    const rawRoot = path.resolve(process.cwd(), r);
+    return {
+      rawRoot,
+      canonRoot: canonicalizePath(rawRoot, { rejectDangling: false, allowUncTarget: true }),
+    };
   });
+  const allowedRoots = rootPairs.map((p) => p.canonRoot);
+  const rawCandidate = path.resolve(process.cwd(), raw);
+  const lexicalInside = rootPairs.some(
+    ({ rawRoot, canonRoot }) => isPathInsideRoot(rawCandidate, rawRoot) || isPathInsideRoot(rawCandidate, canonRoot)
+  );
+  if (!lexicalInside) {
+    throw new Error(
+      `Path "${raw}" (${purpose}) resolves outside allowed root(s) (${allowedRoots.join(', ')}). Set TURBO_BROWSER_SAVE_ROOT to allow additional directories.`
+    );
+  }
+  const allowUncTarget = allowedRoots.some((r) => /^(?:[\\/]{2}|\\\\\?\\UNC\\)/i.test(r));
+  const candidate = canonicalizePath(rawCandidate, { rejectDangling: true, allowUncTarget });
+  const isInside = allowedRoots.some((rootDir) => isPathInsideRoot(candidate, rootDir));
 
   if (!isInside) {
     throw new Error(
@@ -147,11 +225,12 @@ async function withModifiers(page, modifiers, fn) {
 }
 
 async function performDropAction(targetHandleOrLocator, params) {
-  const rawFiles = Array.isArray(params.files)
-    ? params.files
-    : params.file
-      ? [params.file]
-      : [];
+  const rawFiles =
+    Array.isArray(params.files) && params.files.length > 0
+      ? params.files
+      : params.file
+        ? [params.file]
+        : [];
   const dropData =
     params.dropData && typeof params.dropData === 'object' && !Array.isArray(params.dropData)
       ? params.dropData
@@ -228,11 +307,28 @@ function parseRefString(refStr) {
   return null;
 }
 
+async function pickBestLocator(allLoc, allowHidden = false) {
+  const count = await allLoc.count().catch(() => 0);
+  if (count === 0) return null;
+  if (allowHidden) {
+    return { locator: allLoc.first(), visible: true };
+  }
+  const limit = Math.min(count, 12);
+  for (let i = 0; i < limit; i++) {
+    const cand = allLoc.nth(i);
+    if (await cand.isVisible().catch(() => false)) {
+      return { locator: cand, visible: true };
+    }
+  }
+  return { locator: allLoc.first(), visible: false };
+}
+
 /**
  * Resolve a compact ref (f0:e3 / e3), CSS/Playwright selector (piercing open Shadow DOM),
  * or text match across frames.
  */
-export async function resolveTarget(page, { ref, selector, text, frameIdx } = {}) {
+export async function resolveTarget(page, { ref, selector, text, frameIdx, allowHidden: paramAllowHidden } = {}, options = {}) {
+  const allowHidden = Boolean(options.allowHidden ?? paramAllowHidden);
   const frames = getAllFrames(page);
   if (frames.length === 0) {
     throw new Error('No active frames on page.');
@@ -247,12 +343,17 @@ export async function resolveTarget(page, { ref, selector, text, frameIdx } = {}
       ? frames.filter((f) => f.frameIdx === parsed.frameIdx)
       : frames;
 
+    let fallback = null;
     for (const f of candidates) {
-      const loc = f.frame.locator(`[data-tbm-ref="${parsed.refId}"]`).first();
-      if ((await loc.count().catch(() => 0)) > 0) {
-        return { frame: f.frame, frameIdx: f.frameIdx, locator: loc };
+      const allLoc = f.frame.locator(`[data-tbm-ref="${parsed.refId}"]`);
+      const picked = await pickBestLocator(allLoc, allowHidden);
+      if (picked) {
+        const res = { frame: f.frame, frameIdx: f.frameIdx, locator: picked.locator };
+        if (picked.visible) return res;
+        if (!fallback) fallback = res;
       }
     }
+    if (fallback) return fallback;
     throw new Error(`Element ref "${ref}" not found. Run inspect_compact again to refresh refs.`);
   }
 
@@ -261,22 +362,32 @@ export async function resolveTarget(page, { ref, selector, text, frameIdx } = {}
     : frames;
 
   if (selector) {
+    let fallback = null;
     for (const f of scopedFrames) {
-      const loc = f.frame.locator(selector).first();
-      if ((await loc.count().catch(() => 0)) > 0) {
-        return { frame: f.frame, frameIdx: f.frameIdx, locator: loc };
+      const allLoc = f.frame.locator(selector);
+      const picked = await pickBestLocator(allLoc, allowHidden);
+      if (picked) {
+        const res = { frame: f.frame, frameIdx: f.frameIdx, locator: picked.locator };
+        if (picked.visible) return res;
+        if (!fallback) fallback = res;
       }
     }
+    if (fallback) return fallback;
     throw new Error(`Selector "${selector}" matched 0 elements across ${scopedFrames.length} frame(s).`);
   }
 
   if (text) {
+    let fallback = null;
     for (const f of scopedFrames) {
-      const loc = f.frame.getByText(text, { exact: false }).first();
-      if ((await loc.count().catch(() => 0)) > 0) {
-        return { frame: f.frame, frameIdx: f.frameIdx, locator: loc };
+      const allLoc = f.frame.getByText(text, { exact: false });
+      const picked = await pickBestLocator(allLoc, allowHidden);
+      if (picked) {
+        const res = { frame: f.frame, frameIdx: f.frameIdx, locator: picked.locator };
+        if (picked.visible) return res;
+        if (!fallback) fallback = res;
       }
     }
+    if (fallback) return fallback;
     throw new Error(`Text "${text}" matched 0 elements across ${scopedFrames.length} frame(s).`);
   }
 
@@ -289,87 +400,418 @@ export async function resolveTarget(page, { ref, selector, text, frameIdx } = {}
 export async function isSubmitLikeElement(locator) {
   try {
     return await locator.evaluate((el, patterns) => {
+      if (!el) return { isSubmit: false, label: '', reason: '' };
       const submitRe = new RegExp(patterns.submit, 'iu');
       const safeRe = new RegExp(patterns.safe, 'iu');
-      const lbl = el.closest?.('label');
+      const dangerRe = new RegExp(patterns.danger, 'iu');
+      const isShadowRoot = (r) => Boolean(r && r.nodeType === 11 && 'host' in r);
+      const getSR = (node) => node?.shadowRoot || window.__tbmGetShadowRoot?.(node) || null;
+      const closestComposed = (node, sel) => {
+        let cur = node;
+        while (cur) {
+          if (cur.nodeType === 1 && cur.matches?.(sel)) return cur;
+          const root = cur.getRootNode?.();
+          cur = cur.assignedSlot || cur.parentElement || (isShadowRoot(root) ? root.host : null);
+        }
+        return null;
+      };
+      const isElementFocusableAndVisible = (node) => {
+        if (!node || node.nodeType !== 1) return false;
+        if (node.disabled || Boolean(node.matches?.(':disabled')) || node.getAttribute?.('aria-disabled') === 'true') return false;
+        if (typeof node.checkVisibility === 'function' && node.checkVisibility({ visibilityProperty: true, opacityProperty: false }) === false) return false;
+        let cur = node;
+        while (cur && cur.nodeType === 1) {
+          if (cur.hasAttribute('hidden') || cur.hasAttribute('inert') || Boolean(cur.inert)) return false;
+          const parent = cur.parentElement;
+          if (parent && parent.tagName === 'DETAILS' && !parent.open) {
+            const firstSummary = [...parent.children].find((c) => c.tagName === 'SUMMARY');
+            if (!firstSummary || cur !== firstSummary) return false;
+          }
+          if (parent && parent.tagName === 'FIELDSET' && parent.disabled) {
+            const firstLegend = [...parent.children].find((c) => c.tagName === 'LEGEND');
+            if (!firstLegend || cur !== firstLegend) return false;
+          }
+          try {
+            const st = getComputedStyle(cur);
+            if (st.display === 'none' || st.visibility === 'hidden' || st.visibility === 'collapse' || st.contentVisibility === 'hidden') return false;
+          } catch {}
+          const rn = cur.getRootNode?.();
+          cur = parent || (isShadowRoot(rn) ? rn.host : null);
+        }
+        const r = node.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      };
+      const resolveDelegatedFocus = (host) => {
+        let cur = host;
+        const seen = new Set();
+        while (getSR(cur)?.delegatesFocus && !seen.has(cur)) {
+          seen.add(cur);
+          const candidates = getSR(cur).querySelectorAll('*');
+          let next = null;
+          for (const c of candidates) {
+            if (!isElementFocusableAndVisible(c)) continue;
+            if (getSR(c)?.delegatesFocus) {
+              const inner = resolveDelegatedFocus(c);
+              if (inner) {
+                next = inner;
+                break;
+              }
+              continue;
+            }
+            const rawTab = c.getAttribute('tabindex');
+            const hasValidTab = rawTab !== null && /^\s*[+-]?\d+\s*$/.test(rawTab) && Number(rawTab) >= 0;
+            if (
+              c.isContentEditable ||
+              hasValidTab ||
+              (c.matches?.('input:not([type="hidden"]), select, textarea, button, a[href], area[href], summary') && c.tabIndex >= 0)
+            ) {
+              next = c;
+              break;
+            }
+          }
+          if (!next) return null;
+          cur = next;
+        }
+        return cur !== host ? cur : null;
+      };
+      if (getSR(el)?.delegatesFocus) {
+        const df = resolveDelegatedFocus(el);
+        if (df) el = df;
+      }
+      const lbl = closestComposed(el, 'label');
       const btn =
+        closestComposed(
+          el,
+          'button, input[type="submit"], input[type="image"], input[type="button"], [type="submit"], [type="image"], [role="button"], [role="switch"], [role="checkbox"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], a'
+        ) ||
         (lbl && lbl.control) ||
-        el.closest?.('button, input[type="submit"], input[type="image"], input[type="button"], [role="button"], a') ||
         el;
+      let hostEl = null;
+      let hostType = '';
+      let hostRole = '';
+      let curHost = isShadowRoot(btn.getRootNode?.()) ? btn.getRootNode().host : null;
+      while (curHost) {
+        if (!hostEl) hostEl = curHost;
+        if (!hostRole) hostRole = (curHost.getAttribute?.('role') || '').toLowerCase();
+        const ht = (curHost.getAttribute?.('type') || '').toLowerCase();
+        if (ht) {
+          hostType = ht;
+          break;
+        }
+        const nextRn = curHost.getRootNode?.();
+        curHost = isShadowRoot(nextRn) ? nextRn.host : null;
+      }
+      const findShadowInnerBtn = (rootHost) => {
+        const rootSr = getSR(rootHost);
+        if (!rootSr) return { btn: null, type: '' };
+        const stack = [rootSr];
+        let firstBtn = null;
+        while (stack.length > 0) {
+          const sr = stack.shift();
+          if (!sr || !sr.querySelectorAll) continue;
+          for (const node of sr.querySelectorAll('*')) {
+            if (
+              node.matches?.(
+                'button, input[type="submit"], input[type="image"], input[type="button"], [type="submit"], [type="image"], [role="button"]'
+              )
+            ) {
+              if (!firstBtn) firstBtn = node;
+              const nTag = (node.tagName || '').toLowerCase();
+              const sameScopeForm = Boolean(node.form || node.closest?.('form'));
+              const effType = (
+                nTag === 'button'
+                  ? (sameScopeForm ? (node.type || 'submit') : (node.getAttribute?.('type') || ''))
+                  : (node.getAttribute?.('type') || '')
+              ).toLowerCase();
+              if (effType === 'submit' || effType === 'image') {
+                return { btn: node, type: effType };
+              }
+            }
+            const childSr = getSR(node);
+            if (childSr) {
+              const childHostType = (node.getAttribute?.('type') || '').toLowerCase();
+              if (childHostType !== 'button' && childHostType !== 'reset') {
+                stack.push(childSr);
+              }
+            }
+          }
+        }
+        return { btn: firstBtn, type: '' };
+      };
+      const shadowInnerInfo = findShadowInnerBtn(btn);
+      const shadowInnerBtn = shadowInnerInfo.btn;
+      const innerType = shadowInnerInfo.type;
       const tag = (btn.tagName || '').toLowerCase();
-      const type = (
-        btn.getAttribute?.('type') ||
-        (tag === 'button' && btn.form ? btn.type : '') ||
-        ''
+      const sameScopeBtnForm = Boolean(btn.form || btn.closest?.('form'));
+      const rawType = (
+        tag === 'button'
+          ? (sameScopeBtnForm && hostType !== 'button' && hostType !== 'reset' ? (btn.type || 'submit') : (btn.getAttribute?.('type') || ''))
+          : (btn.getAttribute?.('type') || '')
       ).toLowerCase();
-      const role = (btn.getAttribute?.('role') || '').toLowerCase();
-      const rawLabel = (
-        btn.innerText ||
-        btn.textContent ||
-        btn.value ||
-        btn.getAttribute?.('alt') ||
-        btn.getAttribute?.('aria-label') ||
-        btn.getAttribute?.('title') ||
-        ''
-      )
-        .replace(/\s+/g, ' ')
-        .trim();
+      const type =
+        (!sameScopeBtnForm && rawType === 'button' && (hostType === 'submit' || hostType === 'image')
+          ? hostType
+          : rawType) ||
+        (hostType === 'submit' || hostType === 'image' || hostType === 'button' || hostType === 'reset' ? hostType : '') ||
+        (innerType === 'submit' || innerType === 'image' ? innerType : '');
+      const role = (btn.getAttribute?.('role') || hostRole || '').toLowerCase();
+      const normLbl = (s) =>
+        String(s || '')
+          .normalize('NFC')
+          .replace(/[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/g, '')
+          .replace(/\s+/g, ' ')
+          .trim();
+      const doc = btn.ownerDocument || document;
+      const BLOCK_TAGS = new Set([
+        'DIV', 'P', 'LI', 'UL', 'OL', 'TR', 'TD', 'TH',
+        'SECTION', 'ARTICLE', 'HEADER', 'FOOTER', 'ASIDE', 'NAV',
+        'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'BLOCKQUOTE', 'PRE', 'BR',
+      ]);
+      const extractAccessibleText = (rootNode, allowHidden = false) => {
+        if (!rootNode) return '';
+        const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'TITLE']);
+        const walkChildren = (nodes) => {
+          let out = '';
+          for (const c of nodes || []) {
+            const piece = walk(c);
+            if (!piece) continue;
+            const cTag = c.nodeType === 1 ? (c.tagName || '').toUpperCase() : '';
+            if (BLOCK_TAGS.has(cTag)) {
+              out += (out && !/\s$/.test(out) ? ' ' : '') + piece + ' ';
+            } else {
+              out += piece;
+            }
+          }
+          return out;
+        };
+        const walk = (n) => {
+          if (!n) return '';
+          if (n.nodeType === 3) return n.textContent || '';
+          if (n.nodeType !== 1 && n.nodeType !== 11) return '';
+          if (n.nodeType === 1) {
+            const t = (n.tagName || '').toUpperCase();
+            if (SKIP.has(t)) return '';
+            if (t === 'BR') return ' ';
+            if (!allowHidden && n !== rootNode) {
+              if (n.hasAttribute?.('hidden') || n.getAttribute?.('aria-hidden') === 'true') return '';
+              try {
+                const st = getComputedStyle(n);
+                if (st.display === 'none' || st.visibility === 'hidden') return '';
+              } catch {}
+            }
+            if (t === 'SLOT' && typeof n.assignedNodes === 'function') {
+              const assigned = n.assignedNodes({ flatten: true });
+              const list = assigned.length > 0 ? assigned : (n.childNodes || []);
+              return walkChildren(list);
+            }
+            const nSr = getSR(n);
+            if (nSr) {
+              const srOut = walkChildren(nSr.childNodes);
+              if (normLbl(srOut)) return srOut;
+            }
+          }
+          return walkChildren(n.childNodes);
+        };
+        return walk(rootNode);
+      };
+      const resolveAriaLabelledBy = (node) => {
+        const lby = node?.getAttribute?.('aria-labelledby');
+        if (!lby) return '';
+        const rn = node.getRootNode?.();
+        return lby
+          .split(/\s+/)
+          .map((id) => {
+            const refEl = (rn?.getElementById && rn.getElementById(id)) || doc.getElementById(id);
+            return extractAccessibleText(refEl, true) || refEl?.textContent || '';
+          })
+          .join(' ');
+      };
+      const candidates = [
+        resolveAriaLabelledBy(btn),
+        btn.getAttribute?.('aria-label'),
+        hostEl ? resolveAriaLabelledBy(hostEl) : '',
+        hostEl ? hostEl.getAttribute?.('aria-label') : '',
+        el !== btn ? resolveAriaLabelledBy(el) : '',
+        el !== btn ? el.getAttribute?.('aria-label') : '',
+        extractAccessibleText(btn),
+        extractAccessibleText(getSR(btn)),
+        hostEl ? extractAccessibleText(hostEl) : '',
+        el !== btn && el.getAttribute?.('aria-hidden') !== 'true' ? extractAccessibleText(el) : '',
+        tag === 'input' && type !== 'checkbox' && type !== 'radio' ? btn.value : '',
+        btn.getAttribute?.('alt'),
+        btn.querySelector?.('[alt]')?.getAttribute?.('alt'),
+        btn.querySelector?.('[aria-label]')?.getAttribute?.('aria-label'),
+        btn.querySelector?.('svg title')?.textContent,
+        btn.getAttribute?.('title'),
+        hostEl ? hostEl.getAttribute?.('title') : '',
+        el !== btn ? el.getAttribute?.('title') : '',
+        btn.labels && btn.labels.length > 0 ? [...btn.labels].map((l) => extractAccessibleText(l)).join(' ') : '',
+        extractAccessibleText(closestComposed(btn, 'label')),
+      ];
+      let rawLabel = '';
+      for (const c of candidates) {
+        const n = normLbl(c);
+        if (!n) continue;
+        if (!rawLabel) rawLabel = n;
+        if (/[\p{L}\p{N}]/u.test(n)) {
+          rawLabel = n;
+          break;
+        }
+      }
+      const cleanLbl = rawLabel.replace(/^[^\p{L}\p{N}]+/u, '').trim();
+      const isSafeLbl = Boolean(cleanLbl && safeRe.test(cleanLbl) && !dangerRe.test(cleanLbl));
+      const ownForm =
+        btn.form ||
+        shadowInnerBtn?.form ||
+        closestComposed(btn, 'form') ||
+        getSR(btn)?.querySelector?.('form') ||
+        null;
 
       if (tag === 'input' && (type === 'submit' || type === 'image')) {
         return {
-          isSubmit: !(rawLabel && safeRe.test(rawLabel)),
+          isSubmit: !isSafeLbl,
+          isSafeSubmit: Boolean(isSafeLbl && ownForm),
           label: rawLabel || 'submit',
           reason: `input[type=${type}]`,
         };
       }
-      if (tag === 'button' && type === 'submit') {
-        const isSafe = rawLabel && safeRe.test(rawLabel);
-        return { isSubmit: !isSafe, label: rawLabel || 'submit', reason: 'button[type=submit]' };
+      if (type === 'submit' || type === 'image') {
+        return {
+          isSubmit: !isSafeLbl,
+          isSafeSubmit: Boolean(isSafeLbl && ownForm),
+          label: rawLabel || 'submit',
+          reason: `${tag}[type=${type}]`,
+        };
       }
-      if ((tag === 'button' || role === 'button' || type === 'button' || tag === 'a') && rawLabel) {
-        if (submitRe.test(rawLabel)) {
-          return { isSubmit: true, label: rawLabel, reason: 'submit-label-match' };
+      const isButtonLike =
+        tag === 'button' ||
+        Boolean(shadowInnerBtn) ||
+        Boolean(hostEl) ||
+        role === 'button' ||
+        role === 'switch' ||
+        role === 'checkbox' ||
+        role === 'menuitem' ||
+        role === 'menuitemcheckbox' ||
+        role === 'menuitemradio' ||
+        type === 'button' ||
+        type === 'checkbox' ||
+        type === 'radio' ||
+        tag === 'a';
+      if (isButtonLike && cleanLbl) {
+        if ((submitRe.test(cleanLbl) || (safeRe.test(cleanLbl) && dangerRe.test(cleanLbl))) && !isSafeLbl) {
+          return { isSubmit: true, isSafeSubmit: false, label: rawLabel, reason: 'submit-label-match' };
         }
       }
-      return { isSubmit: false, label: rawLabel, reason: '' };
-    }, { submit: SUBMIT_LABEL_RE.source, safe: SAFE_SUBMIT_TYPE_RE.source });
+      const isSafeButtonWidget =
+        tag === 'button' ||
+        Boolean(shadowInnerBtn) ||
+        Boolean(hostEl) ||
+        role === 'button' ||
+        (tag === 'input' && type === 'button');
+      return {
+        isSubmit: false,
+        isSafeSubmit: Boolean(isSafeButtonWidget && isSafeLbl && ownForm),
+        label: rawLabel,
+        reason: '',
+      };
+    }, { submit: SUBMIT_LABEL_RE.source, safe: SAFE_SUBMIT_TYPE_RE.source, danger: COMPOUND_DANGER_RE.source });
   } catch {
     return { isSubmit: false, label: '', reason: '' };
   }
 }
 
+async function getDeepElementHandleAtPoint(page, x, y, climbInteractive = false) {
+  let curFrame = page.mainFrame();
+  let cx = x;
+  let cy = y;
+
+  for (let depth = 0; depth < 8; depth++) {
+    const stepHandle = await curFrame.evaluateHandle(
+      ([px, py, climb]) => {
+        const closestComposed = (node, sel) => {
+          let cur = node;
+          while (cur) {
+            if (cur.nodeType === 1 && cur.matches?.(sel)) return cur;
+            const root = cur.getRootNode?.();
+            cur = cur.assignedSlot || cur.parentElement || (root instanceof ShadowRoot ? root.host : null);
+          }
+          return null;
+        };
+
+        const getSR = (node) => node?.shadowRoot || window.__tbmGetShadowRoot?.(node) || null;
+        let hit = document.elementFromPoint(px, py);
+        while (hit) {
+          const sr = getSR(hit);
+          if (sr && typeof sr.elementFromPoint === 'function') {
+            const inner = sr.elementFromPoint(px, py);
+            if (inner && inner !== hit) {
+              hit = inner;
+              continue;
+            }
+          }
+          break;
+        }
+        if (!hit) return null;
+        const tag = (hit.tagName || '').toUpperCase();
+        if (tag === 'IFRAME' || tag === 'FRAME') {
+          return hit;
+        }
+        if (climb) {
+          const interactive = closestComposed(
+            hit,
+            'button, input[type="submit"], input[type="image"], input[type="button"], [type="submit"], [type="image"], [role="button"], [role="switch"], [role="checkbox"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], a'
+          );
+          if (interactive) return interactive;
+          const lbl = closestComposed(hit, 'label');
+          if (lbl && lbl.control) return lbl.control;
+          return hit;
+        }
+        return hit;
+      },
+      [cx, cy, climbInteractive]
+    );
+
+    const elemHandle = stepHandle.asElement();
+    if (!elemHandle) {
+      return stepHandle;
+    }
+
+    const frameOffset = await elemHandle
+      .evaluate((el) => {
+        const tag = (el.tagName || '').toUpperCase();
+        if (tag !== 'IFRAME' && tag !== 'FRAME') return null;
+        const rect = el.getBoundingClientRect();
+        const st = getComputedStyle(el);
+        const padLeft = parseFloat(st.paddingLeft) || 0;
+        const padTop = parseFloat(st.paddingTop) || 0;
+        return {
+          left: rect.left + (el.clientLeft || 0) + padLeft,
+          top: rect.top + (el.clientTop || 0) + padTop,
+        };
+      })
+      .catch(() => null);
+
+    if (!frameOffset) {
+      return elemHandle;
+    }
+
+    const childFrame = await elemHandle.contentFrame().catch(() => null);
+    await elemHandle.dispose().catch(() => {});
+    if (!childFrame) {
+      return await curFrame.evaluateHandle(() => null);
+    }
+    cx -= frameOffset.left;
+    cy -= frameOffset.top;
+    curFrame = childFrame;
+  }
+
+  return await curFrame.evaluateHandle(() => null);
+}
+
 export async function isSubmitAtPoint(page, x, y) {
   let handle = null;
   try {
-    handle = await page.evaluateHandle(([px, py]) => {
-      let curDoc = document;
-      let cx = px;
-      let cy = py;
-      let hit = curDoc.elementFromPoint(cx, cy);
-      while (hit) {
-        if (hit.shadowRoot && typeof hit.shadowRoot.elementFromPoint === 'function') {
-          const inner = hit.shadowRoot.elementFromPoint(cx, cy);
-          if (inner && inner !== hit) {
-            hit = inner;
-            continue;
-          }
-        }
-        const tag = (hit.tagName || '').toUpperCase();
-        if ((tag === 'IFRAME' || tag === 'FRAME') && hit.contentDocument) {
-          const rect = hit.getBoundingClientRect();
-          cx = cx - rect.left - (hit.clientLeft || 0);
-          cy = cy - rect.top - (hit.clientTop || 0);
-          curDoc = hit.contentDocument;
-          hit = curDoc.elementFromPoint(cx, cy);
-          continue;
-        }
-        break;
-      }
-      if (!hit) return null;
-      const lbl = hit.closest?.('label');
-      if (lbl && lbl.control) return lbl.control;
-      return hit.closest?.('button, input[type="submit"], input[type="image"], input[type="button"], [role="button"], a') || hit;
-    }, [x, y]);
+    handle = await getDeepElementHandleAtPoint(page, x, y, true);
     const empty = await handle.evaluate((el) => !el).catch(() => true);
     if (empty) return { isSubmit: false, label: '', reason: '' };
     return await isSubmitLikeElement(handle);
@@ -381,64 +823,416 @@ export async function isSubmitAtPoint(page, x, y) {
 }
 
 function checkEnterSubmitInBrowser(target, patterns) {
-  if (!target || target === document.body || target === document.documentElement) {
+  const doc = target?.ownerDocument || document;
+  const win = doc.defaultView || window;
+  if (!target || target === doc.body || target === doc.documentElement) {
     return { isSubmit: false, label: '', reason: '' };
+  }
+  const isShadowRoot = (r) => Boolean(r && r.nodeType === 11 && 'host' in r);
+  const closestComposed = (node, sel) => {
+    let cur = node;
+    while (cur) {
+      if (cur.nodeType === 1 && cur.matches?.(sel)) return cur;
+      const root = cur.getRootNode?.();
+      cur = cur.assignedSlot || cur.parentElement || (isShadowRoot(root) ? root.host : null);
+    }
+    return null;
+  };
+  const isElementFocusableAndVisible = (node) => {
+    if (!node || node.nodeType !== 1) return false;
+    if (node.disabled || Boolean(node.matches?.(':disabled')) || node.getAttribute?.('aria-disabled') === 'true') return false;
+    if (typeof node.checkVisibility === 'function' && node.checkVisibility({ visibilityProperty: true, opacityProperty: false }) === false) return false;
+    let cur = node;
+    while (cur && cur.nodeType === 1) {
+      if (cur.hasAttribute('hidden') || cur.hasAttribute('inert') || Boolean(cur.inert)) return false;
+      const parent = cur.parentElement;
+      if (parent && parent.tagName === 'DETAILS' && !parent.open) {
+        const firstSummary = [...parent.children].find((c) => c.tagName === 'SUMMARY');
+        if (!firstSummary || cur !== firstSummary) return false;
+      }
+      if (parent && parent.tagName === 'FIELDSET' && parent.disabled) {
+        const firstLegend = [...parent.children].find((c) => c.tagName === 'LEGEND');
+        if (!firstLegend || cur !== firstLegend) return false;
+      }
+      try {
+        const st = getComputedStyle(cur);
+        if (st.display === 'none' || st.visibility === 'hidden' || st.visibility === 'collapse' || st.contentVisibility === 'hidden') return false;
+      } catch {}
+      const rn = cur.getRootNode?.();
+      cur = parent || (isShadowRoot(rn) ? rn.host : null);
+    }
+    const r = node.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const getSR = (node) => node?.shadowRoot || win.__tbmGetShadowRoot?.(node) || window.__tbmGetShadowRoot?.(node) || null;
+  const resolveDelegatedFocus = (host) => {
+    let cur = host;
+    const seen = new Set();
+    while (getSR(cur)?.delegatesFocus && !seen.has(cur)) {
+      seen.add(cur);
+      const candidates = getSR(cur).querySelectorAll('*');
+      let next = null;
+      for (const c of candidates) {
+        if (!isElementFocusableAndVisible(c)) continue;
+        if (getSR(c)?.delegatesFocus) {
+          const inner = resolveDelegatedFocus(c);
+          if (inner) {
+            next = inner;
+            break;
+          }
+          continue;
+        }
+        const rawTab = c.getAttribute('tabindex');
+        const hasValidTab = rawTab !== null && /^\s*[+-]?\d+\s*$/.test(rawTab) && Number(rawTab) >= 0;
+        if (
+          c.isContentEditable ||
+          hasValidTab ||
+          (c.matches?.('input:not([type="hidden"]), select, textarea, button, a[href], area[href], summary') && c.tabIndex >= 0)
+        ) {
+          next = c;
+          break;
+        }
+      }
+      if (!next) return null;
+      cur = next;
+    }
+    return cur !== host ? cur : null;
+  };
+  if (getSR(target)?.delegatesFocus) {
+    const df = resolveDelegatedFocus(target);
+    if (df) target = df;
   }
   const submitRe = new RegExp(patterns.submit, 'iu');
   const safeRe = new RegExp(patterns.safe, 'iu');
-  const tag = (target.tagName || '').toLowerCase();
-  const type = (
-    target.getAttribute?.('type') ||
-    (tag === 'button' && target.form ? target.type : '') ||
-    ''
+  const dangerRe = new RegExp(patterns.danger, 'iu');
+  const effTarget =
+    closestComposed(
+      target,
+      'button, input[type="submit"], input[type="image"], input[type="button"], input[type="checkbox"], input[type="radio"], [type="submit"], [type="image"], [role="button"], [role="switch"], [role="checkbox"], [role="radio"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], a'
+    ) || target;
+  let hostEl = null;
+  let hostType = '';
+  let hostRole = '';
+  let curHost = isShadowRoot(effTarget.getRootNode?.()) ? effTarget.getRootNode().host : null;
+  while (curHost) {
+    if (!hostEl) hostEl = curHost;
+    if (!hostRole) hostRole = (curHost.getAttribute?.('role') || '').toLowerCase();
+    const ht = (curHost.getAttribute?.('type') || '').toLowerCase();
+    if (ht) {
+      hostType = ht;
+      break;
+    }
+    const nextRn = curHost.getRootNode?.();
+    curHost = isShadowRoot(nextRn) ? nextRn.host : null;
+  }
+  const findShadowInnerBtn = (rootHost) => {
+    const rootSr = getSR(rootHost);
+    if (!rootSr) return { btn: null, type: '' };
+    const stack = [rootSr];
+    let firstBtn = null;
+    while (stack.length > 0) {
+      const sr = stack.shift();
+      if (!sr || !sr.querySelectorAll) continue;
+      for (const node of sr.querySelectorAll('*')) {
+        if (
+          node.matches?.(
+            'button, input[type="submit"], input[type="image"], input[type="button"], [type="submit"], [type="image"], [role="button"]'
+          )
+        ) {
+          if (!firstBtn) firstBtn = node;
+          const nTag = (node.tagName || '').toLowerCase();
+          const sameScopeForm = Boolean(node.form || node.closest?.('form'));
+          const effType = (
+            nTag === 'button'
+              ? (sameScopeForm ? (node.type || 'submit') : (node.getAttribute?.('type') || ''))
+              : (node.getAttribute?.('type') || '')
+          ).toLowerCase();
+          if (effType === 'submit' || effType === 'image') {
+            return { btn: node, type: effType };
+          }
+        }
+        const childSr = getSR(node);
+        if (childSr) {
+          const childHostType = (node.getAttribute?.('type') || '').toLowerCase();
+          if (childHostType !== 'button' && childHostType !== 'reset') {
+            stack.push(childSr);
+          }
+        }
+      }
+    }
+    return { btn: firstBtn, type: '' };
+  };
+  const shadowInnerInfo = findShadowInnerBtn(effTarget);
+  const shadowInnerBtn = shadowInnerInfo.btn;
+  const innerType = shadowInnerInfo.type;
+  const tag = (effTarget.tagName || '').toLowerCase();
+  const sameScopeEffForm = Boolean(effTarget.form || effTarget.closest?.('form'));
+  const rawType = (
+    tag === 'button'
+      ? (sameScopeEffForm && hostType !== 'button' && hostType !== 'reset' ? (effTarget.type || 'submit') : (effTarget.getAttribute?.('type') || ''))
+      : (effTarget.getAttribute?.('type') || '')
   ).toLowerCase();
-  const role = (target.getAttribute?.('role') || '').toLowerCase();
-  const labelOf = (node) =>
-    (
-      node.innerText ||
-      node.textContent ||
-      node.value ||
-      node.getAttribute?.('alt') ||
-      node.getAttribute?.('aria-label') ||
-      node.getAttribute?.('title') ||
-      ''
-    )
+  const type =
+    (!sameScopeEffForm && rawType === 'button' && (hostType === 'submit' || hostType === 'image')
+      ? hostType
+      : rawType) ||
+    (hostType === 'submit' || hostType === 'image' || hostType === 'button' || hostType === 'reset' ? hostType : '') ||
+    (innerType === 'submit' || innerType === 'image' ? innerType : '');
+  const role = (effTarget.getAttribute?.('role') || hostRole || '').toLowerCase();
+  const normLbl = (s) =>
+    String(s || '')
+      .normalize('NFC')
+      .replace(/[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/g, '')
       .replace(/\s+/g, ' ')
       .trim();
+  const BLOCK_TAGS = new Set([
+    'DIV', 'P', 'LI', 'UL', 'OL', 'TR', 'TD', 'TH',
+    'SECTION', 'ARTICLE', 'HEADER', 'FOOTER', 'ASIDE', 'NAV',
+    'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'BLOCKQUOTE', 'PRE', 'BR',
+  ]);
+  const extractAccessibleText = (rootNode, allowHidden = false) => {
+    if (!rootNode) return '';
+    const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'TITLE']);
+    const walkChildren = (nodes) => {
+      let out = '';
+      for (const c of nodes || []) {
+        const piece = walk(c);
+        if (!piece) continue;
+        const cTag = c.nodeType === 1 ? (c.tagName || '').toUpperCase() : '';
+        if (BLOCK_TAGS.has(cTag)) {
+          out += (out && !/\s$/.test(out) ? ' ' : '') + piece + ' ';
+        } else {
+          out += piece;
+        }
+      }
+      return out;
+    };
+    const walk = (n) => {
+      if (!n) return '';
+      if (n.nodeType === 3) return n.textContent || '';
+      if (n.nodeType !== 1 && n.nodeType !== 11) return '';
+      if (n.nodeType === 1) {
+        const t = (n.tagName || '').toUpperCase();
+        if (SKIP.has(t)) return '';
+        if (t === 'BR') return ' ';
+        if (!allowHidden && n !== rootNode) {
+          if (n.hasAttribute?.('hidden') || n.getAttribute?.('aria-hidden') === 'true') return '';
+          try {
+            const st = getComputedStyle(n);
+            if (st.display === 'none' || st.visibility === 'hidden') return '';
+          } catch {}
+        }
+        if (t === 'SLOT' && typeof n.assignedNodes === 'function') {
+          const assigned = n.assignedNodes({ flatten: true });
+          const list = assigned.length > 0 ? assigned : (n.childNodes || []);
+          return walkChildren(list);
+        }
+        const nSr = getSR(n);
+        if (nSr) {
+          const srOut = walkChildren(nSr.childNodes);
+          if (normLbl(srOut)) return srOut;
+        }
+      }
+      return walkChildren(n.childNodes);
+    };
+    return walk(rootNode);
+  };
+  const resolveAriaLabelledBy = (node) => {
+    const lby = node?.getAttribute?.('aria-labelledby');
+    if (!lby) return '';
+    const rn = node.getRootNode?.();
+    return lby
+      .split(/\s+/)
+      .map((id) => {
+        const refEl = (rn?.getElementById && rn.getElementById(id)) || doc.getElementById(id);
+        return extractAccessibleText(refEl, true) || refEl?.textContent || '';
+      })
+      .join(' ');
+  };
+  const labelOf = (node) => {
+    const nTag = (node.tagName || '').toLowerCase();
+    const nType = (node.getAttribute?.('type') || '').toLowerCase();
+    const nRn = node.getRootNode?.();
+    const nHost = isShadowRoot(nRn) ? nRn.host : null;
+    const cands = [
+      resolveAriaLabelledBy(node),
+      node.getAttribute?.('aria-label'),
+      nHost ? resolveAriaLabelledBy(nHost) : '',
+      nHost ? nHost.getAttribute?.('aria-label') : '',
+      extractAccessibleText(node),
+      extractAccessibleText(getSR(node)),
+      nHost ? extractAccessibleText(nHost) : '',
+      nTag === 'input' && nType !== 'checkbox' && nType !== 'radio' ? node.value : '',
+      node.getAttribute?.('alt'),
+      node.querySelector?.('[alt]')?.getAttribute?.('alt'),
+      node.querySelector?.('[aria-label]')?.getAttribute?.('aria-label'),
+      node.querySelector?.('svg title')?.textContent,
+      node.getAttribute?.('title'),
+      nHost ? nHost.getAttribute?.('title') : '',
+      node.labels && node.labels.length > 0 ? [...node.labels].map((l) => extractAccessibleText(l)).join(' ') : '',
+      extractAccessibleText(closestComposed(node, 'label')),
+    ];
+    let first = '';
+    for (const c of cands) {
+      const n = normLbl(c);
+      if (!n) continue;
+      if (!first) first = n;
+      if (/[\p{L}\p{N}]/u.test(n)) return n;
+    }
+    return first;
+  };
+  const cleanLabelOf = (raw) => raw.replace(/^[^\p{L}\p{N}]+/u, '').trim();
 
-  const rawLabel = labelOf(target);
-  if ((tag === 'input' && (type === 'submit' || type === 'image')) || (tag === 'button' && type === 'submit')) {
+  const rawLabel = labelOf(effTarget);
+  const cleanLabel = cleanLabelOf(rawLabel);
+  const isSafeLbl = Boolean(cleanLabel && safeRe.test(cleanLabel) && !dangerRe.test(cleanLabel));
+  const ownForm =
+    effTarget.form ||
+    shadowInnerBtn?.form ||
+    closestComposed(effTarget, 'form') ||
+    getSR(effTarget)?.querySelector?.('form') ||
+    null;
+  if (type === 'submit' || type === 'image') {
     return {
-      isSubmit: !(rawLabel && safeRe.test(rawLabel)),
+      isSubmit: !isSafeLbl,
+      isSafeSubmit: Boolean(isSafeLbl && ownForm),
       label: rawLabel || 'submit',
       reason: `${tag}[type=${type}]`,
     };
   }
-  if ((tag === 'button' || role === 'button' || type === 'button' || tag === 'a') && rawLabel && submitRe.test(rawLabel)) {
-    return { isSubmit: true, label: rawLabel, reason: 'submit-label-match' };
+  const isButtonLike =
+    tag === 'button' ||
+    Boolean(shadowInnerBtn) ||
+    Boolean(hostEl) ||
+    role === 'button' ||
+    role === 'switch' ||
+    role === 'checkbox' ||
+    role === 'radio' ||
+    role === 'menuitem' ||
+    role === 'menuitemcheckbox' ||
+    role === 'menuitemradio' ||
+    type === 'button' ||
+    type === 'checkbox' ||
+    type === 'radio' ||
+    tag === 'a';
+  if (
+    isButtonLike &&
+    cleanLabel &&
+    (submitRe.test(cleanLabel) || (safeRe.test(cleanLabel) && dangerRe.test(cleanLabel))) &&
+    !isSafeLbl
+  ) {
+    return { isSubmit: true, isSafeSubmit: false, label: rawLabel, reason: 'submit-label-match' };
   }
 
-  const form = target.form || target.closest?.('form');
-  if (form && tag === 'input' && !['button', 'reset', 'checkbox', 'radio', 'file'].includes(type)) {
-    const submitBtns = [
-      ...form.querySelectorAll('button[type="submit"], button:not([type]), input[type="submit"], input[type="image"]'),
-    ];
-    if (submitBtns.length === 0) {
-      return { isSubmit: true, label: rawLabel || target.name || 'form', reason: 'implicit-form-enter' };
+  let isFormAssocHost = false;
+  let fh = isShadowRoot(target.getRootNode?.()) ? target.getRootNode().host : null;
+  while (fh) {
+    const ctor = win?.customElements?.get?.((fh.tagName || '').toLowerCase());
+    if (fh.form || Boolean(ctor?.formAssociated)) {
+      isFormAssocHost = true;
+      break;
     }
-    for (const btn of submitBtns) {
-      const btnLabel = labelOf(btn);
-      if (submitRe.test(btnLabel) || !safeRe.test(btnLabel)) {
-        return { isSubmit: true, label: btnLabel || 'submit', reason: 'implicit-form-enter' };
+    const nextRn = fh.getRootNode?.();
+    fh = isShadowRoot(nextRn) ? nextRn.host : null;
+  }
+
+  const form =
+    target.form ||
+    (isFormAssocHost || Boolean(patterns?.hasCtrlOrMeta)
+      ? closestComposed(target, 'form')
+      : target.closest?.('form'));
+  const isTextEntryInForm =
+    (tag === 'input' && !['button', 'reset', 'file'].includes(type)) ||
+    (Boolean(patterns?.hasCtrlOrMeta) && (tag === 'textarea' || Boolean(target.isContentEditable) || role === 'textbox'));
+  const BLOCKING_INPUT_TYPES = new Set([
+    'text', 'search', 'url', 'tel', 'email', 'password',
+    'date', 'month', 'week', 'time', 'datetime-local', 'number',
+  ]);
+  if (form && isTextEntryInForm) {
+    const formRoot = form.getRootNode?.() || doc;
+    const extImages = formRoot.querySelectorAll
+      ? [...formRoot.querySelectorAll('input[type="image"][form]')].filter((el) => el.form === form)
+      : [];
+    const descendantBtns = [...form.querySelectorAll('button, input[type="submit"], input[type="image"]')].filter(
+      (el) => !el.hasAttribute?.('form') || el.form === form
+    );
+    const candidates = new Set([
+      ...(form.elements ? [...form.elements] : []),
+      ...descendantBtns,
+      ...extImages,
+    ]);
+    const submitBtns = [];
+    for (const el of candidates) {
+      if (!el || el.disabled || Boolean(el.matches?.(':disabled'))) continue;
+      if (el.form && el.form !== form) continue;
+      const bTag = (el.tagName || '').toLowerCase();
+      const bType = (
+        bTag === 'button'
+          ? (el.type || 'submit')
+          : (el.getAttribute?.('type') || '')
+      ).toLowerCase();
+      if ((bTag === 'button' && bType === 'submit') || (bTag === 'input' && (bType === 'submit' || bType === 'image'))) {
+        submitBtns.push(el);
       }
     }
+    if (submitBtns.length === 0) {
+      let blockingInputs = 0;
+      for (const el of candidates) {
+        if (!el || (el.tagName || '').toLowerCase() !== 'input') continue;
+        if (el.form && el.form !== form) continue;
+        const iType = (el.type || el.getAttribute?.('type') || 'text').toLowerCase();
+        if (BLOCKING_INPUT_TYPES.has(iType)) {
+          blockingInputs++;
+        }
+      }
+      const targetInputType = tag === 'input' ? (effTarget.type || type || 'text').toLowerCase() : '';
+      const targetCanImplicitSubmit =
+        Boolean(patterns?.hasCtrlOrMeta) ||
+        Boolean(isFormAssocHost) ||
+        (tag === 'input' && BLOCKING_INPUT_TYPES.has(targetInputType));
+      if (targetCanImplicitSubmit && (blockingInputs <= 1 || Boolean(patterns?.hasCtrlOrMeta))) {
+        return { isSubmit: true, isSafeSubmit: false, label: rawLabel || target.name || 'form', reason: 'implicit-form-enter' };
+      }
+      return { isSubmit: false, isSafeSubmit: false, label: rawLabel, reason: '' };
+    }
+    submitBtns.sort((a, b) => {
+      if (a === b || typeof a.compareDocumentPosition !== 'function') return 0;
+      const pos = a.compareDocumentPosition(b);
+      if (pos & 4) return -1;
+      if (pos & 2) return 1;
+      return 0;
+    });
+    const defaultBtn = submitBtns[0];
+    const btnRaw = labelOf(defaultBtn);
+    const btnClean = cleanLabelOf(btnRaw);
+    const btnSafe = Boolean(btnClean && safeRe.test(btnClean) && !dangerRe.test(btnClean));
+    if (submitRe.test(btnClean) || !btnSafe) {
+      return { isSubmit: true, isSafeSubmit: false, label: btnRaw || 'submit', reason: 'implicit-form-enter' };
+    }
+    return { isSubmit: false, isSafeSubmit: true, label: rawLabel, reason: '' };
   }
 
-  return { isSubmit: false, label: rawLabel, reason: '' };
+  const isSafeButtonWidget =
+    tag === 'button' ||
+    Boolean(shadowInnerBtn) ||
+    Boolean(hostEl) ||
+    role === 'button' ||
+    (tag === 'input' && type === 'button');
+  return {
+    isSubmit: false,
+    isSafeSubmit: Boolean(isSafeButtonWidget && isSafeLbl && ownForm),
+    label: rawLabel,
+    reason: '',
+  };
 }
 
-async function isEnterSubmitTarget(page, locator) {
-  const patterns = { submit: SUBMIT_LABEL_RE.source, safe: SAFE_SUBMIT_TYPE_RE.source };
+async function isEnterSubmitTarget(page, locator, extra = {}) {
+  const patterns = {
+    submit: SUBMIT_LABEL_RE.source,
+    safe: SAFE_SUBMIT_TYPE_RE.source,
+    danger: COMPOUND_DANGER_RE.source,
+    hasCtrlOrMeta: Boolean(extra.hasCtrlOrMeta),
+  };
   if (locator) {
     try {
       return await locator.evaluate(checkEnterSubmitInBrowser, patterns);
@@ -449,20 +1243,64 @@ async function isEnterSubmitTarget(page, locator) {
   let handle = null;
   try {
     handle = await page.evaluateHandle(() => {
+      const getSR = (node) => node?.shadowRoot || window.__tbmGetShadowRoot?.(node) || null;
       let cur = document.activeElement;
-      while (cur && cur.shadowRoot && cur.shadowRoot.activeElement) {
-        cur = cur.shadowRoot.activeElement;
+      while (cur) {
+        const sr = getSR(cur);
+        if (sr && sr.activeElement) {
+          cur = sr.activeElement;
+          continue;
+        }
+        const tag = (cur.tagName || '').toUpperCase();
+        if ((tag === 'IFRAME' || tag === 'FRAME') && cur.contentDocument && cur.contentDocument.activeElement) {
+          cur = cur.contentDocument.activeElement;
+          continue;
+        }
+        break;
       }
       return cur || null;
     });
     const hasActive = await handle.evaluate((el) => Boolean(el)).catch(() => false);
-    if (!hasActive) return { isSubmit: false, label: '', reason: '' };
-    return await handle.evaluate(checkEnterSubmitInBrowser, patterns);
+    if (hasActive) {
+      const mainRes = await handle.evaluate(checkEnterSubmitInBrowser, patterns);
+      if (mainRes && (mainRes.isSubmit || mainRes.isSafeSubmit)) return mainRes;
+    }
   } catch {
-    return { isSubmit: false, label: '', reason: '' };
+    // Fall through to child frame inspection.
   } finally {
     await handle?.dispose().catch(() => {});
   }
+
+  for (const fInfo of getAllFrames(page).slice(1)) {
+    let fHandle = null;
+    try {
+      fHandle = await fInfo.frame.evaluateHandle(() => {
+        const getSR = (node) => node?.shadowRoot || window.__tbmGetShadowRoot?.(node) || null;
+        let cur = document.activeElement;
+        while (cur) {
+          const sr = getSR(cur);
+          if (sr && sr.activeElement) {
+            cur = sr.activeElement;
+            continue;
+          }
+          break;
+        }
+        if (!cur || cur === document.body || cur === document.documentElement) return null;
+        return cur;
+      });
+      const hasChildActive = await fHandle.evaluate((el) => Boolean(el)).catch(() => false);
+      if (hasChildActive) {
+        const fRes = await fHandle.evaluate(checkEnterSubmitInBrowser, patterns);
+        if (fRes && (fRes.isSubmit || fRes.isSafeSubmit)) return fRes;
+      }
+    } catch {
+      // Ignore detached frames.
+    } finally {
+      await fHandle?.dispose().catch(() => {});
+    }
+  }
+
+  return { isSubmit: false, label: '', reason: '' };
 }
 
 /**
@@ -480,8 +1318,60 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
   const boxes = Boolean(options.boxes);
   const queryRe = query ? compileFilterRegex(query) : null;
 
-  const frames = includeFrames ? getAllFrames(page) : getAllFrames(page).slice(0, 1);
+  const allFrames = getAllFrames(page);
+  const urlKey = `__url__:${page.url()}`;
+  const sameUrlAsBaseline = Boolean(previousLinesSet && previousLinesSet.has(urlKey));
+  const preserveRefs = Boolean(onlyChanged ? sameUrlAsBaseline : (query || rootSelector));
+
+  if (!preserveRefs && !includeFrames && allFrames.length > 1) {
+    for (const skippedFrame of allFrames.slice(1)) {
+      await skippedFrame.frame
+        .evaluate(() => {
+          const stack = [document];
+          while (stack.length > 0) {
+            const cur = stack.shift();
+            if (!cur || !cur.querySelectorAll) continue;
+            for (const el of cur.querySelectorAll('[data-tbm-ref]')) {
+              el.removeAttribute('data-tbm-ref');
+            }
+            for (const node of cur.querySelectorAll('*')) {
+              if (node.shadowRoot) stack.push(node.shadowRoot);
+            }
+          }
+        })
+        .catch(() => {});
+    }
+  }
+  const frames = includeFrames ? allFrames : allFrames.slice(0, 1);
   let nextRefNum = 1;
+  if (preserveRefs) {
+    for (const frameInfo of allFrames) {
+      const maxInFrame = await frameInfo.frame
+        .evaluate(() => {
+          let max = 0;
+          const stack = [document];
+          while (stack.length > 0) {
+            const cur = stack.shift();
+            if (!cur || !cur.querySelectorAll) continue;
+            for (const el of cur.querySelectorAll('[data-tbm-ref]')) {
+              const m = /^e(\d+)$/i.exec(el.getAttribute('data-tbm-ref') || '');
+              if (m) {
+                const n = Number(m[1]);
+                if (n > max) max = n;
+              }
+            }
+            for (const node of cur.querySelectorAll('*')) {
+              if (node.shadowRoot) stack.push(node.shadowRoot);
+            }
+          }
+          return max;
+        })
+        .catch(() => 0);
+      if (maxInFrame >= nextRefNum) {
+        nextRefNum = maxInFrame + 1;
+      }
+    }
+  }
   const entries = [];
   const nextSignatures = new Set();
   let totalMatched = 0;
@@ -490,7 +1380,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
     let chunk;
     try {
       chunk = await frameInfo.frame.evaluate(
-        ({ modeArg, frameIdxArg, startRef, rootSel, boxesArg }) => {
+        ({ modeArg, frameIdxArg, startRef, rootSel, boxesArg, preserveRefsArg }) => {
           const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
 
           const queryAllDeep = (rootNode, sel) => {
@@ -499,8 +1389,18 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
             const stack = [rootNode];
             while (stack.length > 0) {
               const cur = stack.shift();
-              if (!cur || !cur.querySelectorAll) continue;
-              for (const match of cur.querySelectorAll(sel)) {
+              if (!cur) continue;
+              if (cur.shadowRoot) {
+                stack.push(cur.shadowRoot);
+              }
+              if (!cur.querySelectorAll) continue;
+              let matches;
+              try {
+                matches = cur.querySelectorAll(sel);
+              } catch {
+                return out;
+              }
+              for (const match of matches) {
                 if (!seen.has(match)) {
                   seen.add(match);
                   out.push(match);
@@ -515,16 +1415,66 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
             return out;
           };
 
-          for (const oldRefEl of queryAllDeep(document, '[data-tbm-ref]')) {
-            oldRefEl.removeAttribute('data-tbm-ref');
+          let refCounter = startRef;
+          if (!preserveRefsArg) {
+            for (const oldRefEl of queryAllDeep(document, '[data-tbm-ref]')) {
+              oldRefEl.removeAttribute('data-tbm-ref');
+            }
+          } else {
+            for (const oldRefEl of queryAllDeep(document, '[data-tbm-ref]')) {
+              const m = /^e(\d+)$/i.exec(oldRefEl.getAttribute('data-tbm-ref') || '');
+              if (m) {
+                const num = Number(m[1]);
+                if (num >= refCounter) refCounter = num + 1;
+              }
+            }
           }
 
-          const root = rootSel
-            ? (queryAllDeep(document, rootSel)[0] || document.body)
-            : document.body;
-          if (!root) return { items: [], nextRef: startRef, total: 0 };
+          const isDisabledByFieldset = (node) => {
+            let cur = node;
+            while (cur && cur.nodeType === 1) {
+              const parent = cur.parentElement;
+              if (parent && parent.tagName === 'FIELDSET' && parent.disabled) {
+                const firstLegend = [...parent.children].find((c) => c.tagName === 'LEGEND');
+                if (!firstLegend || cur !== firstLegend) return true;
+              }
+              const rn = cur.getRootNode?.();
+              cur = parent || (rn instanceof ShadowRoot ? rn.host : null);
+            }
+            return false;
+          };
+
+          const isInert = (node) => {
+            let cur = node;
+            while (cur && cur.nodeType === 1) {
+              if (cur.hasAttribute('inert') || Boolean(cur.inert)) return true;
+              const rn = cur.getRootNode?.();
+              cur = cur.parentElement || (rn instanceof ShadowRoot ? rn.host : null);
+            }
+            return false;
+          };
+
+          const isClosedDetailsOrCvHidden = (node) => {
+            let cur = node;
+            while (cur && cur.nodeType === 1) {
+              const parent = cur.parentElement;
+              if (parent && parent.tagName === 'DETAILS' && !parent.open) {
+                const firstSummary = [...parent.children].find((c) => c.tagName === 'SUMMARY');
+                if (!firstSummary || cur !== firstSummary) return true;
+              }
+              try {
+                if (getComputedStyle(cur).contentVisibility === 'hidden') return true;
+              } catch {
+                // ignore
+              }
+              const rn = cur.getRootNode?.();
+              cur = parent || (rn instanceof ShadowRoot ? rn.host : null);
+            }
+            return false;
+          };
 
           const isHidden = (el) => {
+            if (isInert(el) || isClosedDetailsOrCvHidden(el)) return true;
             if (el.getAttribute('aria-hidden') === 'true' || Boolean(el.closest('[aria-hidden="true"]'))) {
               return true;
             }
@@ -537,9 +1487,77 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
             return rect.width === 0 || rect.height === 0;
           };
 
+          const rootMatches = rootSel ? queryAllDeep(document, rootSel) : [document.body];
+          const root = rootMatches.find((el) => el && !isHidden(el)) || rootMatches[0];
+          if (!root) return { items: [], nextRef: refCounter, total: 0 };
+
           const resolveById = (el, id) => {
             const rootNode = el.getRootNode?.();
             return (rootNode?.getElementById && rootNode.getElementById(id)) || document.getElementById(id);
+          };
+
+          const closestComposed = (node, sel) => {
+            let cur = node;
+            while (cur) {
+              if (cur.nodeType === 1 && cur.matches?.(sel)) return cur;
+              const rn = cur.getRootNode?.();
+              cur = cur.assignedSlot || cur.parentElement || (rn instanceof ShadowRoot ? rn.host : null);
+            }
+            return null;
+          };
+
+          const BLOCK_TAGS = new Set([
+            'DIV', 'P', 'LI', 'UL', 'OL', 'TR', 'TD', 'TH',
+            'SECTION', 'ARTICLE', 'HEADER', 'FOOTER', 'ASIDE', 'NAV',
+            'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'BLOCKQUOTE', 'PRE', 'BR',
+          ]);
+          const getSR = (node) => node?.shadowRoot || window.__tbmGetShadowRoot?.(node) || null;
+          const composedText = (rootNode, allowHidden = false) => {
+            if (!rootNode) return '';
+            const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'TITLE', 'SELECT', 'OPTION']);
+            const walkChildren = (nodes) => {
+              let out = '';
+              for (const c of nodes || []) {
+                const piece = walk(c);
+                if (!piece) continue;
+                const cTag = c.nodeType === 1 ? (c.tagName || '').toUpperCase() : '';
+                if (BLOCK_TAGS.has(cTag)) {
+                  out += (out && !/\s$/.test(out) ? ' ' : '') + piece + ' ';
+                } else {
+                  out += piece;
+                }
+              }
+              return out;
+            };
+            const walk = (n) => {
+              if (!n) return '';
+              if (n.nodeType === 3) return n.textContent || '';
+              if (n.nodeType !== 1 && n.nodeType !== 11) return '';
+              if (n.nodeType === 1) {
+                const t = (n.tagName || '').toUpperCase();
+                if (SKIP.has(t)) return '';
+                if (t === 'BR') return ' ';
+                if (!allowHidden && n !== rootNode) {
+                  if (n.hasAttribute?.('hidden') || n.getAttribute?.('aria-hidden') === 'true') return '';
+                  try {
+                    const st = getComputedStyle(n);
+                    if (st.display === 'none' || st.visibility === 'hidden') return '';
+                  } catch {}
+                }
+                if (t === 'SLOT' && typeof n.assignedNodes === 'function') {
+                  const assigned = n.assignedNodes({ flatten: true });
+                  const list = assigned.length > 0 ? assigned : (n.childNodes || []);
+                  return walkChildren(list);
+                }
+                const sr = getSR(n);
+                if (sr) {
+                  const srOut = walkChildren(sr.childNodes);
+                  if (clean(srOut)) return srOut;
+                }
+              }
+              return walkChildren(n.childNodes);
+            };
+            return clean(walk(rootNode));
           };
 
           const labelFor = (el) => {
@@ -547,7 +1565,10 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
             if (aria) return aria.slice(0, 80);
 
             if (el.labels && el.labels.length > 0) {
-              const lblText = [...el.labels].map((l) => clean(l.innerText)).filter(Boolean).join(' ');
+              const lblText = [...el.labels]
+                .map((l) => composedText(l) || clean(l.innerText))
+                .filter(Boolean)
+                .join(' ');
               if (lblText) return lblText.slice(0, 80);
             }
 
@@ -555,21 +1576,32 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
             if (lby) {
               const txt = lby
                 .split(/\s+/)
-                .map((id) => clean(resolveById(el, id)?.innerText))
+                .map((id) => {
+                  const refNode = resolveById(el, id);
+                  return composedText(refNode, true) || clean(refNode?.innerText);
+                })
                 .filter(Boolean)
                 .join(' ');
               if (txt) return txt.slice(0, 80);
             }
 
-            const wrapLabel = el.closest('label');
-            if (wrapLabel && clean(wrapLabel.innerText)) {
-              return clean(wrapLabel.innerText).slice(0, 80);
+            const wrapLabel = closestComposed(el, 'label');
+            const wrapTxt = wrapLabel ? (composedText(wrapLabel) || clean(wrapLabel.innerText)) : '';
+            if (wrapTxt) {
+              return wrapTxt.slice(0, 80);
             }
 
             const tag = el.tagName;
+            let fallbackVis = '';
             if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && !el.isContentEditable) {
-              const visText = clean(el.innerText || el.textContent);
-              if (visText) return visText.slice(0, 80);
+              const sr = getSR(el);
+              const visText =
+                composedText(el) ||
+                clean(el.innerText || el.textContent || sr?.innerText || sr?.textContent);
+              if (visText) {
+                if (/[\p{L}\p{N}]/u.test(visText)) return visText.slice(0, 80);
+                fallbackVis = visText;
+              }
             }
 
             for (const attr of ['placeholder', 'data-placeholder', 'title', 'name', 'id']) {
@@ -577,33 +1609,46 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
               if (v) return v.slice(0, 80);
             }
 
-            return clean(el.innerText || el.textContent).slice(0, 80);
+            if (fallbackVis) return fallbackVis.slice(0, 80);
+
+            return (
+              composedText(el) ||
+              clean(el.innerText || el.textContent || el.shadowRoot?.innerText || el.shadowRoot?.textContent)
+            ).slice(0, 80);
           };
 
           const selectorByMode = {
             interactive:
-              'a[href], button, input, textarea, select, [contenteditable="true"], [contenteditable=""], [role="button"], [role="link"], [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], [role="switch"], [role="tab"], [role="menuitem"], summary',
+              'a[href], button, input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="link"], [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], [role="switch"], [role="tab"], [role="menuitem"], summary',
             forms:
-              'input, textarea, select, [contenteditable="true"], [contenteditable=""], [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], [role="switch"], button, [role="button"]',
+              'input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], [role="switch"], button, [role="button"]',
             article: 'h1, h2, h3, h4, p, li, a[href], button',
-            all: 'h1, h2, h3, a[href], button, input, textarea, select, [contenteditable="true"], [role="button"], [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], [role="switch"], p',
+            all: 'h1, h2, h3, a[href], button, input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], [role="switch"], p',
           };
 
           const sel = selectorByMode[modeArg] || selectorByMode.interactive;
-          const nodes = queryAllDeep(root, sel).filter((el) => !isHidden(el));
+          const rawNodes = queryAllDeep(root, sel);
+          if (root.nodeType === 1 && root.matches?.(sel) && !rawNodes.includes(root)) {
+            rawNodes.unshift(root);
+          }
+          const nodes = rawNodes.filter((el) => !isHidden(el));
 
-          let refCounter = startRef;
+          const usedRefs = new Set();
           const items = [];
           for (const el of nodes) {
             const tag = el.tagName.toLowerCase();
-            const refId = `e${refCounter++}`;
-            el.setAttribute('data-tbm-ref', refId);
+            let refId = preserveRefsArg ? el.getAttribute('data-tbm-ref') : null;
+            if (!refId || !/^e\d+$/i.test(refId) || usedRefs.has(refId)) {
+              refId = `e${refCounter++}`;
+              el.setAttribute('data-tbm-ref', refId);
+            }
+            usedRefs.add(refId);
             const fullRef = `f${frameIdxArg}:${refId}`;
             const inShadow = el.getRootNode?.() instanceof ShadowRoot;
             const shadowTag = inShadow ? ' [shadow]' : '';
 
             if (modeArg === 'article' && (tag === 'h1' || tag === 'h2' || tag === 'h3' || tag === 'h4' || tag === 'p' || tag === 'li')) {
-              const txt = clean(el.innerText || el.textContent).slice(0, 220);
+              const txt = (composedText(el) || clean(el.innerText || el.textContent)).slice(0, 220);
               if (txt) {
                 const line = `[${fullRef}] <${tag}> ${txt}`;
                 items.push({ line, sig: `f${frameIdxArg}:<${tag}>:${txt}` });
@@ -641,7 +1686,15 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
               extra += ` href="${el.getAttribute('href').slice(0, 50)}"`;
             }
 
-            if (el.disabled || el.getAttribute('aria-disabled') === 'true') extra += ' [disabled]';
+            if (
+              el.disabled ||
+              Boolean(el.matches?.(':disabled')) ||
+              isDisabledByFieldset(el) ||
+              el.getAttribute('aria-disabled') === 'true' ||
+              Boolean(el.closest?.('[aria-disabled="true"]'))
+            ) {
+              extra += ' [disabled]';
+            }
             if (el.required || el.getAttribute('aria-required') === 'true') extra += ' [req]';
 
             let boxTag = '';
@@ -660,8 +1713,9 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
           modeArg: mode,
           frameIdxArg: frameInfo.frameIdx,
           startRef: nextRefNum,
-          rootSel: frameInfo.isMain ? rootSelector : null,
+          rootSel: rootSelector,
           boxesArg: boxes,
+          preserveRefsArg: preserveRefs,
         }
       );
     } catch {
@@ -676,7 +1730,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
     for (const item of chunk.items) {
       nextSignatures.add(item.sig);
       if (queryRe && !queryRe.test(item.line)) continue;
-      if (onlyChanged && previousLinesSet && previousLinesSet.size > 0 && previousLinesSet.has(item.sig)) {
+      if (onlyChanged && sameUrlAsBaseline && previousLinesSet.has(item.sig)) {
         continue;
       }
       frameItems.push(item.line);
@@ -690,8 +1744,9 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
     }
   }
 
-  if (previousLinesSet && !query) {
+  if (previousLinesSet && !query && !rootSelector) {
     previousLinesSet.clear();
+    previousLinesSet.add(urlKey);
     for (const s of nextSignatures) previousLinesSet.add(s);
   }
 
@@ -724,6 +1779,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
     text += `\n... [truncated: ${shownCount}/${totalMatched} elements]`;
   }
   if (text.length > maxChars) {
+    truncated = true;
     text = text.slice(0, maxChars);
   }
   const savedPath = writeSaveFile(options.savePath, text);
@@ -756,27 +1812,228 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
 
   const fileFields = [];
   const domFields = [];
+  const filled = [];
+  const skipped = [];
   fields.forEach((f, idx) => {
-    if (f && (f.file || (Array.isArray(f.files) && f.files.length > 0))) {
+    if (!f) return;
+    const hasNonEmptyFile = typeof f.file === 'string' ? f.file.trim().length > 0 : Boolean(f.file);
+    const hasNonEmptyFiles =
+      Array.isArray(f.files) &&
+      f.files.some((p) => p !== undefined && p !== null && String(p).trim() !== '');
+    if (hasNonEmptyFile || hasNonEmptyFiles) {
       fileFields.push({ ...f, _idx: idx });
-    } else if (f) {
+    } else if (
+      (Array.isArray(f.files) || f.file !== undefined) &&
+      f.value === undefined &&
+      f.values === undefined &&
+      f.option === undefined &&
+      f.check === undefined
+    ) {
+      skipped.push({ idx, reason: 'empty-file-list' });
+    } else {
       domFields.push({ ...f, _idx: idx });
     }
   });
 
-  const filled = [];
-  const skipped = [];
   const submitButtons = [];
   const leftoverSet = new Set();
   const matchedFieldIndexes = new Set();
 
+  const withFrameSubmitGuard = async (frame, fn) => {
+    const allFrames = spec.stopBeforeSubmit !== false ? getAllFrames(page).map((f) => f.frame) : [];
+    const targetFrames =
+      spec.stopBeforeSubmit !== false && frame && !allFrames.includes(frame)
+        ? [...allFrames, frame]
+        : allFrames;
+    for (const targetFrame of targetFrames) {
+      await targetFrame
+        .evaluate(() => {
+          const win = window;
+          if (win.__tbmCleanupFileGuard) win.__tbmCleanupFileGuard();
+          Object.defineProperty(win, '__tbmSubmitGuardActive', {
+            value: (win.__tbmSubmitGuardActive || 0) + 1,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+          });
+          if (typeof win.__tbmInstallFormGuard === 'function') {
+            win.__tbmInstallFormGuard(win);
+          }
+          const origSub = win.HTMLFormElement?.prototype?.submit;
+          const origReqSub = win.HTMLFormElement?.prototype?.requestSubmit;
+          const hasProxySub = Boolean(origSub?.__tbmProxy);
+          const hasProxyReqSub = Boolean(origReqSub?.__tbmProxy);
+          const origAttachShadow = win.Element?.prototype?.attachShadow;
+          const guardSub = (e) => {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+          };
+          const guardedRoots = new Set();
+          const attachToRoot = (root) => {
+            if (!root || guardedRoots.has(root)) return;
+            guardedRoots.add(root);
+            root.addEventListener?.('submit', guardSub, true);
+            if (root.querySelectorAll) {
+              for (const el of root.querySelectorAll('*')) {
+                const sr = el.shadowRoot || win.__tbmGetShadowRoot?.(el);
+                if (sr) attachToRoot(sr);
+              }
+            }
+          };
+          win.addEventListener('submit', guardSub, true);
+          attachToRoot(win.document);
+          for (const sr of win.__tbmGetAllShadowRoots?.() || []) {
+            attachToRoot(sr);
+          }
+          if (win.HTMLFormElement?.prototype) {
+            if (!hasProxySub) win.HTMLFormElement.prototype.submit = function () {};
+            if (typeof origReqSub === 'function' && !hasProxyReqSub) {
+              win.HTMLFormElement.prototype.requestSubmit = function () {};
+            }
+          }
+          if (win.Element?.prototype && typeof origAttachShadow === 'function') {
+            win.Element.prototype.attachShadow = function (init) {
+              const sr = origAttachShadow.call(this, init);
+              attachToRoot(sr);
+              return sr;
+            };
+          }
+          Object.defineProperty(win, '__tbmCleanupFileGuard', {
+            value: () => {
+              Object.defineProperty(win, '__tbmSubmitGuardActive', {
+                value: Math.max(0, (win.__tbmSubmitGuardActive || 1) - 1),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+              });
+              win.removeEventListener('submit', guardSub, true);
+              for (const r of guardedRoots) {
+                r.removeEventListener?.('submit', guardSub, true);
+              }
+              guardedRoots.clear();
+              if (win.HTMLFormElement?.prototype) {
+                if (origSub && !hasProxySub) win.HTMLFormElement.prototype.submit = origSub;
+                if (origReqSub && !hasProxyReqSub) win.HTMLFormElement.prototype.requestSubmit = origReqSub;
+              }
+              if (win.Element?.prototype && origAttachShadow) {
+                win.Element.prototype.attachShadow = origAttachShadow;
+              }
+              delete win.__tbmCleanupFileGuard;
+            },
+            writable: true,
+            enumerable: false,
+            configurable: true,
+          });
+        })
+        .catch(() => {});
+    }
+    try {
+      return await fn();
+    } finally {
+      for (const targetFrame of targetFrames) {
+        await targetFrame
+          .evaluate(async () => {
+            await Promise.resolve();
+            await new Promise((r) => setTimeout(r, 0));
+            if (window.__tbmCleanupFileGuard) window.__tbmCleanupFileGuard();
+          })
+          .catch(() => {});
+      }
+    }
+  };
+
   // Pass 1: Run fast batch DOM fill (including open Shadow DOM) inside each frame.
+  const selectorHandlesToDispose = [];
+  const tagSelectorMatches = async (frame, f) => {
+    if (!f.selector) return;
+    try {
+      const handles = await frame.locator(f.selector).elementHandles();
+      for (let order = 0; order < handles.length; order++) {
+        const h = handles[order];
+        selectorHandlesToDispose.push(h);
+        await h
+          .evaluate(
+            (el, { idx, ord }) => {
+              if (!el || el.nodeType !== 1) return;
+              const prev = el.getAttribute('data-tbm-sel-match');
+              const list = prev ? prev.split(',').filter((t) => t !== String(idx) && !t.startsWith(`${idx}:`)) : [];
+              list.push(`${idx}:${ord}`);
+              el.setAttribute('data-tbm-sel-match', list.join(','));
+            },
+            { idx: f._idx, ord: order }
+          )
+          .catch(() => {});
+      }
+    } catch {
+      // Ignore invalid or unsupported selectors
+    }
+  };
   for (const frameInfo of frames) {
+    const activeDomFields = domFields.filter((f) => {
+      if (f.frameIdx !== undefined && f.frameIdx !== null && Number(f.frameIdx) !== frameInfo.frameIdx) {
+        return false;
+      }
+      if (matchedFieldIndexes.has(f._idx) && !f.all) {
+        return false;
+      }
+      return true;
+    });
+
+    await frameInfo.frame
+      .evaluate(() => {
+        const stack = [document];
+        while (stack.length > 0) {
+          const cur = stack.shift();
+          if (!cur || !cur.querySelectorAll) continue;
+          for (const el of cur.querySelectorAll('[data-tbm-sel-match]')) {
+            el.removeAttribute('data-tbm-sel-match');
+          }
+          for (const node of cur.querySelectorAll('*')) {
+            if (node.shadowRoot) stack.push(node.shadowRoot);
+          }
+        }
+      })
+      .catch(() => {});
+
+    for (const f of activeDomFields) {
+      await tagSelectorMatches(frameInfo.frame, f);
+    }
+
     let res;
     try {
-      res = await frameInfo.frame.evaluate(
-        ({ domSpec, mainVal, gmailSpec, overwriteFlag, frameIdxArg, qBlockSel, submitSel }) => {
-          const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+      res = await withFrameSubmitGuard(frameInfo.frame, () =>
+        frameInfo.frame.evaluate(
+          ({ domSpec, mainVal, gmailSpec, overwriteFlag, stopBeforeSubmitFlag, frameIdxArg, qBlockSel, submitSel }) => {
+            const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+            const getSR = (node) => node?.shadowRoot || window.__tbmGetShadowRoot?.(node) || null;
+
+            const safeControlClick = (node) => {
+            if (stopBeforeSubmitFlag) {
+              const btn = node.tagName === 'BUTTON' ? node : node.closest?.('button');
+              const form = node.form || btn?.form || node.closest?.('form');
+              const isSubmitBtn =
+                btn && form && (btn.type || 'submit').toLowerCase() === 'submit';
+              const guardClick = (ev) => {
+                if (isSubmitBtn) ev.preventDefault();
+              };
+              const guardSubmit = (ev) => {
+                ev.preventDefault();
+                ev.stopImmediatePropagation();
+              };
+              window.addEventListener('click', guardClick, false);
+              window.addEventListener('submit', guardSubmit, true);
+              if (form) form.addEventListener('submit', guardSubmit, true);
+              try {
+                node.click();
+              } finally {
+                window.removeEventListener('click', guardClick, false);
+                window.removeEventListener('submit', guardSubmit, true);
+                if (form) form.removeEventListener('submit', guardSubmit, true);
+              }
+            } else {
+              node.click();
+            }
+          };
 
           const queryAllDeep = (rootNode, sel) => {
             const seen = new Set();
@@ -784,8 +2041,18 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             const stack = [rootNode];
             while (stack.length > 0) {
               const cur = stack.shift();
-              if (!cur || !cur.querySelectorAll) continue;
-              for (const match of cur.querySelectorAll(sel)) {
+              if (!cur) continue;
+              if (cur.shadowRoot) {
+                stack.push(cur.shadowRoot);
+              }
+              if (!cur.querySelectorAll) continue;
+              let matches;
+              try {
+                matches = cur.querySelectorAll(sel);
+              } catch {
+                return out;
+              }
+              for (const match of matches) {
                 if (!seen.has(match)) {
                   seen.add(match);
                   out.push(match);
@@ -800,10 +2067,160 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             return out;
           };
 
+          const isDisabledByFieldset = (node) => {
+            let cur = node;
+            while (cur && cur.nodeType === 1) {
+              const parent = cur.parentElement;
+              if (parent && parent.tagName === 'FIELDSET' && parent.disabled) {
+                const firstLegend = [...parent.children].find((c) => c.tagName === 'LEGEND');
+                if (!firstLegend || cur !== firstLegend) return true;
+              }
+              const rn = cur.getRootNode?.();
+              cur = parent || (rn instanceof ShadowRoot ? rn.host : null);
+            }
+            return false;
+          };
+
+          const isInert = (node) => {
+            let cur = node;
+            while (cur && cur.nodeType === 1) {
+              if (cur.hasAttribute('inert') || Boolean(cur.inert)) return true;
+              const rn = cur.getRootNode?.();
+              cur = cur.parentElement || (rn instanceof ShadowRoot ? rn.host : null);
+            }
+            return false;
+          };
+
+          const isClosedDetailsOrCvHidden = (node) => {
+            let cur = node;
+            while (cur && cur.nodeType === 1) {
+              const parent = cur.parentElement;
+              if (parent && parent.tagName === 'DETAILS' && !parent.open) {
+                const firstSummary = [...parent.children].find((c) => c.tagName === 'SUMMARY');
+                if (!firstSummary || cur !== firstSummary) return true;
+              }
+              try {
+                if (getComputedStyle(cur).contentVisibility === 'hidden') return true;
+              } catch {
+                // ignore
+              }
+              const rn = cur.getRootNode?.();
+              cur = parent || (rn instanceof ShadowRoot ? rn.host : null);
+            }
+            return false;
+          };
+
+          const compareComposedOrder = (a, b) => {
+            if (a === b) return 0;
+            const pathOf = (n) => {
+              const p = [];
+              let c = n;
+              while (c) {
+                p.unshift(c);
+                const rn = c.getRootNode?.();
+                c = c.assignedSlot || c.parentNode || (rn instanceof ShadowRoot ? rn.host : null);
+              }
+              return p;
+            };
+            const pa = pathOf(a);
+            const pb = pathOf(b);
+            const len = Math.min(pa.length, pb.length);
+            for (let i = 0; i < len; i++) {
+              if (pa[i] !== pb[i]) {
+                if (pa[i] instanceof ShadowRoot) return -1;
+                if (pb[i] instanceof ShadowRoot) return 1;
+                const pos = pa[i].compareDocumentPosition(pb[i]);
+                if (pos & 4) return -1;
+                if (pos & 2) return 1;
+                return 0;
+              }
+            }
+            return pa.length - pb.length;
+          };
+
+          const closestComposed = (node, sel) => {
+            let cur = node;
+            while (cur) {
+              if (cur.nodeType === 1 && cur.matches?.(sel)) return cur;
+              const rn = cur.getRootNode?.();
+              cur = cur.assignedSlot || cur.parentElement || (rn instanceof ShadowRoot ? rn.host : null);
+            }
+            return null;
+          };
+
+          const BLOCK_TAGS = new Set([
+            'DIV', 'P', 'LI', 'UL', 'OL', 'TR', 'TD', 'TH',
+            'SECTION', 'ARTICLE', 'HEADER', 'FOOTER', 'ASIDE', 'NAV',
+            'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'BLOCKQUOTE', 'PRE', 'BR',
+          ]);
+          const composedText = (rootNode, allowHidden = false) => {
+            if (!rootNode) return '';
+            const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'TITLE', 'SELECT', 'OPTION']);
+            const walkChildren = (nodes) => {
+              let out = '';
+              for (const c of nodes || []) {
+                const piece = walk(c);
+                if (!piece) continue;
+                const cTag = c.nodeType === 1 ? (c.tagName || '').toUpperCase() : '';
+                if (BLOCK_TAGS.has(cTag)) {
+                  out += (out && !/\s$/.test(out) ? ' ' : '') + piece + ' ';
+                } else {
+                  out += piece;
+                }
+              }
+              return out;
+            };
+            const walk = (n) => {
+              if (!n) return '';
+              if (n.nodeType === 3) return n.textContent || '';
+              if (n.nodeType !== 1 && n.nodeType !== 11) return '';
+              if (n.nodeType === 1) {
+                const t = (n.tagName || '').toUpperCase();
+                if (SKIP.has(t)) return '';
+                if (t === 'BR') return ' ';
+                if (!allowHidden && n !== rootNode) {
+                  if (n.hasAttribute?.('hidden') || n.getAttribute?.('aria-hidden') === 'true') return '';
+                  try {
+                    const st = getComputedStyle(n);
+                    if (st.display === 'none' || st.visibility === 'hidden') return '';
+                  } catch {}
+                }
+                if (t === 'SLOT' && typeof n.assignedNodes === 'function') {
+                  const assigned = n.assignedNodes({ flatten: true });
+                  const list = assigned.length > 0 ? assigned : (n.childNodes || []);
+                  return walkChildren(list);
+                }
+                const sr = getSR(n);
+                if (sr) {
+                  const srOut = walkChildren(sr.childNodes);
+                  if (clean(srOut)) return srOut;
+                }
+              }
+              return walkChildren(n.childNodes);
+            };
+            return clean(walk(rootNode));
+          };
+
+          const getSelOrder = (el, idx) => {
+            const raw = el?.getAttribute?.('data-tbm-sel-match') || '';
+            const prefix = `${idx}:`;
+            for (const part of raw.split(',')) {
+              if (part === String(idx)) return 0;
+              if (part.startsWith(prefix)) return Number(part.slice(prefix.length)) || 0;
+            }
+            return -1;
+          };
+
+          const hasSelToken = (el, idx) => getSelOrder(el, idx) >= 0;
+
           const vis = (el) => {
             if (!el) return false;
             if (
               el.disabled ||
+              Boolean(el.matches?.(':disabled')) ||
+              isDisabledByFieldset(el) ||
+              isInert(el) ||
+              isClosedDetailsOrCvHidden(el) ||
               el.readOnly ||
               el.hasAttribute('readonly') ||
               el.getAttribute('aria-readonly') === 'true' ||
@@ -825,37 +2242,38 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             return (rootNode?.getElementById && rootNode.getElementById(id)) || document.getElementById(id);
           };
 
-          const describe = (el) => {
+          const describeParts = (el) => {
             const parts = [];
             for (const a of ['aria-label', 'placeholder', 'name', 'id', 'title', 'data-placeholder']) {
               const v = el.getAttribute(a);
               if (v) parts.push(v);
             }
             if (el.labels) {
-              for (const l of el.labels) parts.push(l.innerText);
+              for (const l of el.labels) parts.push(composedText(l) || l.innerText);
             }
             const lby = el.getAttribute('aria-labelledby');
             if (lby) {
               for (const id of lby.split(/\s+/)) {
                 const n = resolveById(el, id);
-                if (n) parts.push(n.innerText);
+                if (n) parts.push(composedText(n, true) || n.innerText);
               }
             }
-            const wl = el.closest('label');
-            if (wl) parts.push(wl.innerText);
-            const blk = el.closest(qBlockSel) || el.getRootNode?.()?.host?.closest?.(qBlockSel);
+            const wl = closestComposed(el, 'label');
+            if (wl) parts.push(composedText(wl) || wl.innerText);
+            const blk = closestComposed(el, qBlockSel);
             if (blk) {
               const blkTextInputs = queryAllDeep(
                 blk,
-                'input:not([type="radio"]):not([type="checkbox"]):not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="image"]):not([type="reset"]), textarea, select, [contenteditable="true"], [role="textbox"]'
+                'input:not([type="radio"]):not([type="checkbox"]):not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="image"]):not([type="reset"]):not([type="file"]), textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="combobox"]'
               );
               if (blkTextInputs.length <= 1) {
-                parts.push(blk.innerText.slice(0, 300));
+                parts.push((composedText(blk) || blk.innerText || '').slice(0, 300));
               }
             }
             const elRoleDesc = (el.getAttribute('role') || '').toLowerCase();
             if (elRoleDesc === 'switch' || elRoleDesc === 'checkbox' || elRoleDesc === 'radio') {
-              if (el.innerText) parts.push(el.innerText);
+              const ct = composedText(el) || el.innerText;
+              if (ct) parts.push(ct);
             }
             const host = el.getRootNode?.()?.host;
             if (host) {
@@ -863,27 +2281,101 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
               if (hostAttr) parts.push(hostAttr);
             }
             const prev = el.previousElementSibling;
-            if (prev && !prev.matches('button, input, select, textarea, a, [role="button"], [role="switch"], [role="checkbox"], [role="radio"], [role="textbox"]')) {
-              parts.push(prev.innerText);
+            if (prev && !prev.matches('button, input, select, textarea, a, [role="button"], [role="switch"], [role="checkbox"], [role="radio"], [role="textbox"], [role="combobox"]')) {
+              parts.push(composedText(prev) || prev.innerText);
             }
+            const primaryParts = parts.map((p) => clean(p)).filter(Boolean);
+            const contextParts = [];
+            let curFs = closestComposed(el, 'fieldset');
+            while (curFs) {
+              const leg = curFs.querySelector('legend');
+              const legTxt = leg ? (composedText(leg) || clean(leg.innerText)) : '';
+              if (legTxt) contextParts.unshift(legTxt);
+              const rnFs = curFs.getRootNode?.();
+              curFs = closestComposed(curFs.assignedSlot || curFs.parentElement || (rnFs instanceof ShadowRoot ? rnFs.host : null), 'fieldset');
+            }
+            const sec = closestComposed(el, 'section, [role="region"], [role="group"]');
+            if (sec && sec.tagName !== 'FIELDSET') {
+              const secAria = sec.getAttribute('aria-label');
+              const secLby = sec.getAttribute('aria-labelledby');
+              let secHeading = '';
+              if (secAria) {
+                secHeading = secAria;
+              } else if (secLby) {
+                secHeading = secLby
+                  .split(/\s+/)
+                  .map((id) => {
+                    const rn = resolveById(sec, id);
+                    return composedText(rn, true) || rn?.innerText || '';
+                  })
+                  .join(' ');
+              } else {
+                const h = sec.querySelector(':scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > legend');
+                if (h) secHeading = composedText(h) || h.innerText;
+              }
+              if (clean(secHeading)) contextParts.push(clean(secHeading));
+            }
+            if (contextParts.length > 0) {
+              const ctxJoined = contextParts.join(' ');
+              if (primaryParts.length > 0) {
+                for (const pp of primaryParts) {
+                  parts.push(`${ctxJoined} ${pp}`);
+                }
+              } else {
+                parts.push(ctxJoined);
+              }
+            }
+            return parts.map((p) => clean(p).toLowerCase()).filter(Boolean);
+          };
+
+          const describe = (el) => describeParts(el).join(' | ');
+
+          const describeBlock = (blk) => {
+            const parts = [];
+            const aria = blk.getAttribute('aria-label');
+            if (aria) parts.push(aria);
+            const lby = blk.getAttribute('aria-labelledby');
+            if (lby) {
+              for (const id of lby.split(/\s+/)) {
+                const n = resolveById(blk, id);
+                if (n) parts.push(composedText(n, true) || n.innerText || n.textContent);
+              }
+            }
+            const titleAttr = blk.getAttribute('title');
+            if (titleAttr) parts.push(titleAttr);
+            const ct = composedText(blk) || blk.innerText;
+            if (ct) parts.push(ct);
             return clean(parts.join(' | ')).toLowerCase();
           };
 
-          const currentValue = (el) =>
-            el.isContentEditable ? clean(el.innerText) : (el.value || '').trim();
+          const parseBoolValue = (val) => {
+            if (typeof val === 'boolean') return val;
+            if (typeof val === 'string') {
+              const norm = val.trim().toLowerCase();
+              if (norm === 'true') return true;
+              if (norm === 'false') return false;
+            }
+            return null;
+          };
+
+          const currentValue = (el) => {
+            if (el.isContentEditable) return clean(el.innerText);
+            if (typeof el.value === 'string') return el.value.trim();
+            return clean(el.getAttribute('data-value') || el.innerText || '');
+          };
 
           const setNativeValue = (el, val) => {
             el.focus();
             if (el.isContentEditable) {
               document.execCommand('selectAll', false);
               const ok = document.execCommand('insertText', false, val);
-              if (!ok || clean(el.innerText) === '') {
+              if (!ok || clean(el.innerText) !== clean(val)) {
                 el.textContent = val;
               }
               el.dispatchEvent(new InputEvent('input', { bubbles: true, data: val, inputType: 'insertText' }));
-            } else {
+            } else if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
               const proto =
-                el.tagName === 'TEXTAREA'
+                el instanceof HTMLTextAreaElement
                   ? HTMLTextAreaElement.prototype
                   : HTMLInputElement.prototype;
               if (el._valueTracker && typeof el._valueTracker.setValue === 'function') {
@@ -893,6 +2385,10 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
               if (setter) setter.call(el, val);
               else el.value = val;
               el.dispatchEvent(new Event('input', { bubbles: true }));
+            } else {
+              el.textContent = val;
+              el.setAttribute('data-value', val);
+              el.dispatchEvent(new InputEvent('input', { bubbles: true, data: val, inputType: 'insertText' }));
             }
             el.dispatchEvent(new Event('change', { bubbles: true }));
             el.dispatchEvent(new Event('blur', { bubbles: true }));
@@ -934,6 +2430,11 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             const patterns = specs.filter((p) => p !== undefined && p !== null && String(p) !== '');
             if (patterns.length === 0) return null;
 
+            const enabledOptions = [...sel.options].filter(
+              (opt) => !opt.disabled && !opt.closest('optgroup:disabled')
+            );
+            if (enabledOptions.length === 0) return null;
+
             if (sel._valueTracker && typeof sel._valueTracker.setValue === 'function') {
               sel._valueTracker.setValue('');
             }
@@ -943,7 +2444,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
               const selectedSet = new Set();
               for (const pat of patterns) {
                 let bestTier = 0;
-                const scored = [...sel.options].map((opt) => {
+                const scored = enabledOptions.map((opt) => {
                   const tier = rankOptionMatch(opt, pat);
                   if (tier > bestTier) bestTier = tier;
                   return { opt, tier };
@@ -954,11 +2455,11 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                   }
                 }
               }
-              const matched = [...sel.options].filter((opt) => selectedSet.has(opt));
+              const matched = enabledOptions.filter((opt) => selectedSet.has(opt));
+              if (matched.length === 0) return null;
               for (const opt of sel.options) {
                 opt.selected = sel.multiple ? selectedSet.has(opt) : false;
               }
-              if (matched.length === 0) return null;
               if (!sel.multiple) {
                 sel.value = matched[0].value;
                 chosen = clean(matched[0].text);
@@ -969,7 +2470,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
               const pat = patterns[0];
               let bestOpt = null;
               let bestTier = 0;
-              for (const o of sel.options) {
+              for (const o of enabledOptions) {
                 const tier = rankOptionMatch(o, pat);
                 if (tier > bestTier) {
                   bestTier = tier;
@@ -981,6 +2482,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
               sel.value = bestOpt.value;
               chosen = clean(bestOpt.text);
             }
+            sel.dataset.tbmSelectFilled = '1';
             sel.dispatchEvent(new Event('input', { bubbles: true }));
             sel.dispatchEvent(new Event('change', { bubbles: true }));
             sel.style.outline = '2px solid #E0461D';
@@ -993,6 +2495,41 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             if (keys.length === 0) return false;
             if (nots.some((n) => safePatternMatch(text, n))) return false;
             return keys.some((k) => safePatternMatch(text, k));
+          };
+
+          const rankFieldMatch = (el, f) => {
+            const keys = Array.isArray(f.keys) ? f.keys : f.keys ? [f.keys] : [];
+            const nots = Array.isArray(f.not) ? f.not : f.not ? [f.not] : [];
+            if (keys.length === 0) return 0;
+            const parts = describeParts(el);
+            const fullText = parts.join(' | ');
+            if (nots.some((n) => safePatternMatch(fullText, n))) return 0;
+
+            let bestTier = 0;
+            for (const k of keys) {
+              const raw = clean(String(k ?? ''));
+              if (!raw) continue;
+              const rawLower = raw.toLowerCase();
+              if (parts.some((p) => p === rawLower)) {
+                if (bestTier < 4) bestTier = 4;
+                continue;
+              }
+              const escaped = rawLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              const partPrefixRe = new RegExp(`^${escaped}(?![\\p{L}\\p{N}_])`, 'iu');
+              if (parts.some((p) => partPrefixRe.test(p))) {
+                if (bestTier < 3) bestTier = 3;
+                continue;
+              }
+              const wordBoundaryRe = new RegExp(`(?:^|[^\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, 'iu');
+              if (wordBoundaryRe.test(fullText)) {
+                if (bestTier < 2) bestTier = 2;
+                continue;
+              }
+              if (safePatternMatch(fullText, k)) {
+                if (bestTier < 1) bestTier = 1;
+              }
+            }
+            return bestTier;
           };
 
           const frameFilled = [];
@@ -1021,7 +2558,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             );
             fillGmailInput(['input[name="subjectbox"]', 'input[aria-label*="Subject"]'], gmailSpec.subject, 'subject');
             fillGmailInput(
-              ['div[aria-label="Message Body"]', 'div[aria-label="Nội dung thư"]', 'div[role="textbox"][contenteditable="true"]'],
+              ['div[aria-label="Message Body"]', 'div[aria-label="Nội dung thư"]', 'div[role="textbox"][contenteditable]:not([contenteditable="false"])'],
               gmailSpec.body,
               'body'
             );
@@ -1030,7 +2567,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
           // 2. Text / Select / Radio / Checkbox / ARIA Switch fields across light + open Shadow DOM
           const inputs = queryAllDeep(
             document,
-            'input, textarea, select, [contenteditable="true"], [role="textbox"], [role="checkbox"], [role="radio"], [role="switch"]'
+            'input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="checkbox"], [role="radio"], [role="switch"]'
           ).filter((el) => {
             if (!vis(el)) return false;
             const r = (el.getAttribute('role') || '').toLowerCase();
@@ -1039,7 +2576,76 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             return !['hidden', 'submit', 'button', 'image', 'reset', 'file'].includes(t);
           });
 
-          const blocks = queryAllDeep(document, qBlockSel).filter(vis);
+          const containsComposed = (ancestor, node) => {
+            let cur = node;
+            while (cur) {
+              if (cur === ancestor) return true;
+              if (ancestor.contains && ancestor.contains(cur)) return true;
+              const rn = cur.getRootNode?.();
+              cur = cur.assignedSlot || cur.parentElement || (rn instanceof ShadowRoot ? rn.host : null);
+            }
+            return false;
+          };
+
+          const isCustomCombobox = (el) =>
+            Boolean(
+              el &&
+              (el.getAttribute('role') || '').toLowerCase() === 'combobox' &&
+              !['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) &&
+              !el.isContentEditable
+            );
+
+          const choiceSel =
+            'input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"], [role="switch"]';
+          const getChoiceOptLabel = (ctrl) => {
+            const wrap = closestComposed(ctrl, 'label');
+            const lblListTxt = ctrl.labels?.length
+              ? [...ctrl.labels].map((l) => composedText(l) || l.innerText).join(' ')
+              : '';
+            const selfLabel = clean(
+              (ctrl.hasAttribute('role') ? (composedText(ctrl) || ctrl.innerText) : '') ||
+              ctrl.getAttribute('aria-label') ||
+              ctrl.getAttribute('title') ||
+              ''
+            );
+            const parentTxt =
+              !wrap &&
+              !lblListTxt &&
+              !selfLabel &&
+              ctrl.parentElement &&
+              !/^(FORM|BODY|HTML|MAIN|SECTION)$/i.test(ctrl.parentElement.tagName)
+                ? (composedText(ctrl.parentElement) || ctrl.parentElement.innerText)
+                : '';
+            return clean(
+              (wrap ? (composedText(wrap) || wrap.innerText) : '') || lblListTxt || selfLabel || parentTxt || ctrl.value || ''
+            );
+          };
+
+          const rawBlocks = queryAllDeep(document, qBlockSel).filter(vis);
+          const blockChoiceMap = new Map(
+            rawBlocks.map((b) => [b, queryAllDeep(b, choiceSel).filter(vis)])
+          );
+          const blockChoiceCounts = new Map(
+            rawBlocks.map((b) => [b, (blockChoiceMap.get(b) || []).length])
+          );
+          const blocks = rawBlocks.filter((b) => {
+            const ctrls = blockChoiceMap.get(b) || [];
+            if (ctrls.length === 1 && !b.matches('fieldset, [role="radiogroup"], [role="group"]')) {
+              const singleOptLbl = getChoiceOptLabel(ctrls[0]).toLowerCase();
+              const blkText = (composedText(b) || clean(b.innerText || '')).toLowerCase();
+              const isPureOptionWrapper = Boolean(singleOptLbl && blkText === singleOptLbl);
+              if (isPureOptionWrapper) {
+                const hasMultiAncestor = rawBlocks.some(
+                  (anc) => anc !== b && containsComposed(anc, b) && (blockChoiceCounts.get(anc) || 0) > 1
+                );
+                if (hasMultiAncestor) return false;
+              }
+            }
+            return true;
+          });
+          const claimed = new Set();
+          const radioGroupMap = new Map();
+          let nextRadioGroupId = 1;
 
           for (const f of domSpec) {
             if (f.option !== undefined || f.check !== undefined) {
@@ -1048,35 +2654,41 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
               let hitAny = false;
 
               const toggleChoiceControls = (container, requireKeyMatch) => {
-                const controls = queryAllDeep(
-                  container,
-                  'input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"], [role="switch"]'
-                ).filter(vis);
+                const rawControls =
+                  container && container.nodeType === 1 && container.matches?.(choiceSel)
+                    ? [container]
+                    : queryAllDeep(container, choiceSel);
+                const containerHasMatchingSelectOrCombo =
+                  container !== document &&
+                  Boolean(f.keys) &&
+                  f.check === undefined &&
+                  queryAllDeep(container, 'select, [role="combobox"]')
+                    .filter(vis)
+                    .some((s) => rankFieldMatch(s, f) > 0 || matchesSpec(describe(s), f));
 
-                const decorated = controls.map((ctrl) => {
-                  const wrap = ctrl.closest('label');
-                  const lblListTxt = ctrl.labels?.length
-                    ? [...ctrl.labels].map((l) => l.innerText).join(' ')
-                    : '';
-                  const selfLabel = clean(
-                    (ctrl.hasAttribute('role') ? ctrl.innerText : '') ||
-                    ctrl.getAttribute('aria-label') ||
-                    ctrl.getAttribute('title') ||
-                    ''
-                  );
-                  const parentTxt =
-                    !wrap &&
-                    !lblListTxt &&
-                    !selfLabel &&
-                    ctrl.parentElement &&
-                    !/^(FORM|BODY|HTML|MAIN|SECTION)$/i.test(ctrl.parentElement.tagName)
-                      ? ctrl.parentElement.innerText
-                      : '';
-                  const optLabel = clean(
-                    (wrap ? wrap.innerText : '') || lblListTxt || selfLabel || parentTxt || ctrl.value || ''
-                  );
-                  return { ctrl, optLabel };
+                const controls = rawControls.filter((ctrl) => {
+                  if (!vis(ctrl)) return false;
+                  if (container !== document && f.keys) {
+                    const nestedUnmatchedBlock = blocks.some(
+                      (subBlk) =>
+                        subBlk !== container &&
+                        containsComposed(container, subBlk) &&
+                        containsComposed(subBlk, ctrl) &&
+                        (blockChoiceCounts.get(subBlk) || 0) > 0 &&
+                        !matchesSpec(describeBlock(subBlk), f)
+                    );
+                    if (nestedUnmatchedBlock) return false;
+                    if (containerHasMatchingSelectOrCombo && !matchesSpec(describe(ctrl), f)) {
+                      return false;
+                    }
+                  }
+                  return true;
                 });
+
+                const decorated = controls.map((ctrl) => ({
+                  ctrl,
+                  optLabel: getChoiceOptLabel(ctrl),
+                }));
 
                 const rankChoiceMatch = (optLabel, val, pat) => {
                   const raw = String(pat ?? '').trim();
@@ -1096,7 +2708,12 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                   let bestTier = 0;
                   const scored = [];
                   for (const item of decorated) {
-                    if (requireKeyMatch && !matchesSpec(item.optLabel.toLowerCase(), f)) continue;
+                    if (
+                      requireKeyMatch &&
+                      !matchesSpec(`${item.optLabel.toLowerCase()} ${describe(item.ctrl)}`, f)
+                    ) {
+                      continue;
+                    }
                     const tier = rankChoiceMatch(item.optLabel, item.ctrl.value, pat);
                     if (tier > 0) {
                       if (tier > bestTier) bestTier = tier;
@@ -1111,7 +2728,14 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                     const isAria = ctrl.hasAttribute('role');
                     const isRadio = (isAria ? ctrl.getAttribute('role') : ctrl.type) === 'radio';
                     if (isRadio) {
-                      const groupKey = ctrl.name || '__radio_group__';
+                      const rg = ctrl.closest('[role="radiogroup"], [role="group"], fieldset, .form-group, .field');
+                      if (rg && !radioGroupMap.has(rg)) {
+                        radioGroupMap.set(rg, `__rg_${nextRadioGroupId++}`);
+                      }
+                      const groupKey =
+                        ctrl.name ||
+                        ctrl.getAttribute('name') ||
+                        (rg ? radioGroupMap.get(rg) : '__default_aria_radio__');
                       if (clickedRadioGroups.has(groupKey)) continue;
                       clickedRadioGroups.add(groupKey);
                     }
@@ -1119,9 +2743,10 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                       ? ctrl.getAttribute('aria-checked') === 'true'
                       : Boolean(ctrl.checked);
                     if (!isChecked) {
-                      ctrl.click();
+                      safeControlClick(ctrl);
                     }
                     ctrl.style.outline = '2px solid #E0461D';
+                    claimed.add(ctrl);
                     frameFilled.push({
                       idx: f._idx,
                       frameIdx: frameIdxArg,
@@ -1133,18 +2758,62 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                 }
               };
 
-              if (f.keys) {
-                for (const blk of blocks) {
-                  if (matchesSpec(clean(blk.innerText).toLowerCase(), f)) {
-                    toggleChoiceControls(blk, false);
+              if (f.ref || f.selector) {
+                let explicitTargets = [];
+                if (f.ref) {
+                  const m = /^(?:f(\d+):)?(e\d+)$/i.exec(f.ref.trim());
+                  if (m && (m[1] === undefined || Number(m[1]) === frameIdxArg)) {
+                    const el = queryAllDeep(document, `[data-tbm-ref="${m[2]}"]`)[0];
+                    if (el && vis(el)) explicitTargets = [el];
+                  }
+                } else if (f.selector) {
+                  if (f.frameIdx === undefined || f.frameIdx === frameIdxArg) {
+                    const preTagged = queryAllDeep(document, '[data-tbm-sel-match]')
+                      .filter((el) => hasSelToken(el, f._idx))
+                      .sort(compareComposedOrder)
+                      .filter(vis);
+                    const matchedEls =
+                      preTagged.length > 0
+                        ? preTagged
+                        : queryAllDeep(document, f.selector).filter(vis).sort(compareComposedOrder);
+                    explicitTargets = f.all ? matchedEls : matchedEls.slice(0, 1);
+                  }
+                }
+                if (
+                  explicitTargets.length > 0 &&
+                  !explicitTargets.some((el) => el.tagName === 'SELECT' || isCustomCombobox(el))
+                ) {
+                  for (const tEl of explicitTargets) {
+                    toggleChoiceControls(tEl, false);
+                  }
+                }
+              } else if (f.keys) {
+                const matchingBlocks = blocks.filter((blk) => matchesSpec(describeBlock(blk), f));
+                const innermostBlocks = matchingBlocks.filter(
+                  (blk) => !matchingBlocks.some((other) => other !== blk && containsComposed(blk, other))
+                );
+                for (const blk of innermostBlocks) {
+                  toggleChoiceControls(blk, false);
+                }
+                if (!hitAny) {
+                  const hasMatchingSelectOrCombo = queryAllDeep(document, 'select, [role="combobox"]')
+                    .filter(vis)
+                    .some((s) => rankFieldMatch(s, f) > 0 || matchesSpec(describe(s), f));
+                  if (f.check !== undefined || !hasMatchingSelectOrCombo) {
+                    toggleChoiceControls(document, true);
                   }
                 }
               } else {
                 toggleChoiceControls(document, false);
               }
 
-              if (hitAny) matchedIndexes.push(f._idx);
-              continue;
+              if (hitAny) {
+                matchedIndexes.push(f._idx);
+                continue;
+              }
+              if (f.check !== undefined) {
+                continue;
+              }
             }
 
             let targets = [];
@@ -1152,23 +2821,68 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
               const m = /^(?:f(\d+):)?(e\d+)$/i.exec(f.ref.trim());
               if (m && (m[1] === undefined || Number(m[1]) === frameIdxArg)) {
                 const el = queryAllDeep(document, `[data-tbm-ref="${m[2]}"]`)[0];
-                if (el && vis(el)) targets = [el];
+                if (el && vis(el) && !isCustomCombobox(el)) targets = [el];
               }
             } else if (f.selector) {
               if (f.frameIdx === undefined || f.frameIdx === frameIdxArg) {
-                targets = queryAllDeep(document, f.selector).filter(vis).slice(0, 1);
+                const preTagged = queryAllDeep(document, '[data-tbm-sel-match]')
+                  .filter((el) => hasSelToken(el, f._idx))
+                  .sort(compareComposedOrder)
+                  .map((el) => (el.tagName === 'LABEL' && el.control ? el.control : el))
+                  .filter((el) => vis(el) && !isCustomCombobox(el));
+                const matchedEls =
+                  preTagged.length > 0
+                    ? preTagged
+                    : queryAllDeep(document, f.selector)
+                        .filter((el) => vis(el) && !isCustomCombobox(el))
+                        .sort(compareComposedOrder);
+                targets = f.all ? matchedEls : matchedEls.slice(0, 1);
               }
             } else if (f.keys) {
-              targets = inputs.filter((el) => matchesSpec(describe(el), f));
+              const scored = [];
+              let bestTier = 0;
+              for (const el of inputs) {
+                if (!f.all && claimed.has(el)) continue;
+                const tier = rankFieldMatch(el, f);
+                if (tier > 0) {
+                  if (tier > bestTier) bestTier = tier;
+                  scored.push({ el, tier });
+                }
+              }
+              if (bestTier > 0) {
+                if (f.all) {
+                  targets = scored.map((s) => s.el);
+                } else {
+                  const winner = scored.find((s) => s.tier === bestTier);
+                  if (winner) targets = [winner.el];
+                }
+              }
             }
 
             if (targets.length === 0) continue;
 
             for (const el of targets) {
               if (el.tagName === 'SELECT') {
-                const selectSpec = f.values !== undefined ? f.values : (f.value ?? '');
+                const selOpt = !el.multiple && el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
+                const isSelectAlreadyFilled = Boolean(
+                  el.dataset.tbmSelectFilled === '1' ||
+                  (selOpt && selOpt.value !== '' && !selOpt.disabled && (el.selectedIndex > 0 || selOpt.hasAttribute('selected')))
+                );
+                if (isSelectAlreadyFilled && !overwriteFlag) {
+                  claimed.add(el);
+                  frameSkipped.push({
+                    idx: f._idx,
+                    frameIdx: frameIdxArg,
+                    reason: 'already-filled',
+                    label: describe(el).slice(0, 50),
+                  });
+                  matchedIndexes.push(f._idx);
+                  continue;
+                }
+                const selectSpec = f.values !== undefined ? f.values : (f.value ?? f.option ?? '');
                 const chosen = chooseSelect(el, selectSpec);
                 if (chosen !== null) {
+                  claimed.add(el);
                   frameFilled.push({
                     idx: f._idx,
                     frameIdx: frameIdxArg,
@@ -1182,11 +2896,13 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
               }
 
               const elRole = (el.getAttribute('role') || '').toLowerCase();
+              const parsedBool = parseBoolValue(f.value);
               if (elRole === 'switch' || elRole === 'checkbox' || elRole === 'radio') {
-                if (typeof f.value === 'boolean') {
+                if (parsedBool !== null) {
                   const curChecked = el.getAttribute('aria-checked') === 'true';
-                  if (curChecked !== f.value) el.click();
+                  if (curChecked !== parsedBool) safeControlClick(el);
                   el.style.outline = '2px solid #E0461D';
+                  claimed.add(el);
                   frameFilled.push({
                     idx: f._idx,
                     frameIdx: frameIdxArg,
@@ -1200,9 +2916,10 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
               }
 
               if (el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio')) {
-                if (typeof f.value === 'boolean') {
-                  if (Boolean(el.checked) !== f.value) el.click();
+                if (parsedBool !== null) {
+                  if (Boolean(el.checked) !== parsedBool) safeControlClick(el);
                   el.style.outline = '2px solid #E0461D';
+                  claimed.add(el);
                   frameFilled.push({
                     idx: f._idx,
                     frameIdx: frameIdxArg,
@@ -1217,6 +2934,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
 
               if (el.tagName === 'INPUT' && el.type === 'color') {
                 if (el.dataset.tbmColorFilled === '1' && !overwriteFlag) {
+                  claimed.add(el);
                   frameSkipped.push({
                     idx: f._idx,
                     frameIdx: frameIdxArg,
@@ -1226,8 +2944,19 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                   matchedIndexes.push(f._idx);
                   continue;
                 }
-                setNativeValue(el, String(f.value ?? ''));
+                const rawColor = String(f.value ?? '').trim();
+                if (!/^#[0-9a-f]{6}$/i.test(rawColor)) {
+                  frameSkipped.push({
+                    idx: f._idx,
+                    frameIdx: frameIdxArg,
+                    reason: 'value-rejected-by-input',
+                    label: describe(el).slice(0, 50),
+                  });
+                  continue;
+                }
+                setNativeValue(el, rawColor);
                 el.dataset.tbmColorFilled = '1';
+                claimed.add(el);
                 frameFilled.push({
                   idx: f._idx,
                   frameIdx: frameIdxArg,
@@ -1241,6 +2970,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
 
               if (el.tagName === 'INPUT' && el.type === 'range') {
                 if (el.dataset.tbmRangeFilled === '1' && !overwriteFlag) {
+                  claimed.add(el);
                   frameSkipped.push({
                     idx: f._idx,
                     frameIdx: frameIdxArg,
@@ -1250,8 +2980,20 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                   matchedIndexes.push(f._idx);
                   continue;
                 }
-                setNativeValue(el, String(f.value ?? ''));
+                const rawRange = String(f.value ?? '').trim();
+                const numRange = Number(rawRange);
+                if (rawRange === '' || !Number.isFinite(numRange)) {
+                  frameSkipped.push({
+                    idx: f._idx,
+                    frameIdx: frameIdxArg,
+                    reason: 'value-rejected-by-input',
+                    label: describe(el).slice(0, 50),
+                  });
+                  continue;
+                }
+                setNativeValue(el, rawRange);
                 el.dataset.tbmRangeFilled = '1';
+                claimed.add(el);
                 frameFilled.push({
                   idx: f._idx,
                   frameIdx: frameIdxArg,
@@ -1263,8 +3005,13 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                 continue;
               }
 
+              if (f.value === undefined && f.option !== undefined) {
+                continue;
+              }
+
               const cur = currentValue(el);
               if (cur && !overwriteFlag) {
+                claimed.add(el);
                 frameSkipped.push({
                   idx: f._idx,
                   frameIdx: frameIdxArg,
@@ -1275,13 +3022,28 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                 continue;
               }
 
-              setNativeValue(el, String(f.value ?? ''));
+              const strVal = String(f.value ?? '');
+              setNativeValue(el, strVal);
+              const afterVal = currentValue(el);
+              if (
+                (strVal !== '' && afterVal === '') ||
+                (overwriteFlag && cur !== '' && clean(afterVal) === clean(cur) && clean(strVal) !== clean(cur))
+              ) {
+                frameSkipped.push({
+                  idx: f._idx,
+                  frameIdx: frameIdxArg,
+                  reason: 'value-rejected-by-input',
+                  label: describe(el).slice(0, 50),
+                });
+                continue;
+              }
+              claimed.add(el);
               frameFilled.push({
                 idx: f._idx,
                 frameIdx: frameIdxArg,
                 tag: el.isContentEditable ? 'contenteditable' : el.tagName.toLowerCase(),
                 label: describe(el).slice(0, 50),
-                value: String(f.value ?? '').slice(0, 60),
+                value: strVal.slice(0, 60),
               });
               matchedIndexes.push(f._idx);
             }
@@ -1323,29 +3085,137 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             .slice(0, 10)
             .map((el) => `[f${frameIdxArg}] ${describe(el).slice(0, 70)}`);
 
+          const extractAccessibleText = (rootNode, allowHidden = false) => {
+            if (!rootNode) return '';
+            const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'TITLE']);
+            const walkChildren = (nodes) => {
+              let out = '';
+              for (const c of nodes || []) {
+                const piece = walk(c);
+                if (!piece) continue;
+                const cTag = c.nodeType === 1 ? (c.tagName || '').toUpperCase() : '';
+                if (BLOCK_TAGS.has(cTag)) {
+                  out += (out && !/\s$/.test(out) ? ' ' : '') + piece + ' ';
+                } else {
+                  out += piece;
+                }
+              }
+              return out;
+            };
+            const walk = (n) => {
+              if (!n) return '';
+              if (n.nodeType === 3) return n.textContent || '';
+              if (n.nodeType !== 1 && n.nodeType !== 11) return '';
+              if (n.nodeType === 1) {
+                const t = (n.tagName || '').toUpperCase();
+                if (SKIP.has(t)) return '';
+                if (t === 'BR') return ' ';
+                if (!allowHidden && n !== rootNode) {
+                  if (n.hasAttribute?.('hidden') || n.getAttribute?.('aria-hidden') === 'true') return '';
+                  try {
+                    const st = getComputedStyle(n);
+                    if (st.display === 'none' || st.visibility === 'hidden') return '';
+                  } catch {}
+                }
+                if (t === 'SLOT' && typeof n.assignedNodes === 'function') {
+                  const assigned = n.assignedNodes({ flatten: true });
+                  const list = assigned.length > 0 ? assigned : (n.childNodes || []);
+                  return walkChildren(list);
+                }
+                const sr = getSR(n);
+                if (sr) {
+                  const srOut = walkChildren(sr.childNodes);
+                  if (clean(srOut)) return srOut;
+                }
+              }
+              return walkChildren(n.childNodes);
+            };
+            return walk(rootNode);
+          };
+
+          const resolveAriaLabelledBy = (node) => {
+            const lby = node?.getAttribute?.('aria-labelledby');
+            if (!lby) return '';
+            const rn = node.getRootNode?.();
+            return lby
+              .split(/\s+/)
+              .map((id) => {
+                const refEl = (rn?.getElementById && rn.getElementById(id)) || document.getElementById(id);
+                return extractAccessibleText(refEl, true) || refEl?.textContent || '';
+              })
+              .join(' ');
+          };
+
           const submits = queryAllDeep(document, submitSel)
-            .filter(vis)
+            .filter((el) => {
+              if (!vis(el)) return false;
+              const r = (el.getAttribute('role') || '').toLowerCase();
+              if (['switch', 'checkbox', 'radio', 'combobox', 'option', 'tab', 'menuitem', 'slider'].includes(r)) {
+                return false;
+              }
+              return true;
+            })
             .map((el) => {
-              const txt = clean(
-                el.innerText || el.textContent || el.value || el.getAttribute('alt') || el.getAttribute('aria-label') || ''
-              );
+              const cands = [
+                resolveAriaLabelledBy(el),
+                el.getAttribute('aria-label'),
+                extractAccessibleText(el),
+                extractAccessibleText(getSR(el)),
+                el.value,
+                el.getAttribute('alt'),
+                el.querySelector?.('[alt]')?.getAttribute?.('alt'),
+                el.querySelector?.('[aria-label]')?.getAttribute?.('aria-label'),
+                el.querySelector?.('svg title')?.textContent,
+                el.getAttribute('title'),
+              ];
+              let txt = '';
+              for (const c of cands) {
+                const n = clean(c).normalize('NFC');
+                if (!n) continue;
+                if (!txt) txt = n;
+                if (/[\p{L}\p{N}]/u.test(n)) {
+                  txt = n;
+                  break;
+                }
+              }
               const tag = (el.tagName || '').toLowerCase();
-              const rawType = (el.getAttribute('type') || (tag === 'button' && el.form ? el.type : '') || '').toLowerCase();
+              let hostType = '';
+              let curHost = el.getRootNode?.() instanceof ShadowRoot ? el.getRootNode().host : null;
+              while (curHost) {
+                const ht = (curHost.getAttribute?.('type') || '').toLowerCase();
+                if (ht) {
+                  hostType = ht;
+                  break;
+                }
+                const nextRn = curHost.getRootNode?.();
+                curHost = nextRn instanceof ShadowRoot ? nextRn.host : null;
+              }
+              const sameScopeForm = Boolean(el.form || el.closest?.('form'));
+              const ownType = (
+                tag === 'button'
+                  ? (sameScopeForm && hostType !== 'button' && hostType !== 'reset' ? (el.type || 'submit') : (el.getAttribute('type') || ''))
+                  : (el.getAttribute('type') || '')
+              ).toLowerCase();
+              const rawType =
+                ownType ||
+                (hostType === 'submit' || hostType === 'image' || hostType === 'button' || hostType === 'reset' ? hostType : '');
               return { frameIdx: frameIdxArg, text: txt, type: rawType };
             })
             .filter((b) => b.type === 'submit' || b.type === 'image' || b.text);
 
           return { frameFilled, frameSkipped, matchedIndexes, leftover, submits };
-        },
-        {
-          domSpec: domFields,
-          mainVal: spec.main || '',
-          gmailSpec: spec.gmail || null,
-          overwriteFlag: overwrite,
-          frameIdxArg: frameInfo.frameIdx,
-          qBlockSel: QUESTION_BLOCK_SELECTOR,
-          submitSel: SUBMIT_SCAN_SELECTOR,
-        }
+          },
+          {
+            domSpec: activeDomFields,
+            mainVal: spec.main || '',
+            gmailSpec: spec.gmail || null,
+            overwriteFlag: overwrite,
+            stopBeforeSubmitFlag: spec.stopBeforeSubmit !== false,
+            frameIdxArg: frameInfo.frameIdx,
+            qBlockSel: QUESTION_BLOCK_SELECTOR,
+            submitSel: SUBMIT_SCAN_SELECTOR,
+          }
+        )
       );
     } catch {
       continue;
@@ -1357,125 +3227,600 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
     for (const mIdx of res.matchedIndexes) matchedFieldIndexes.add(mIdx);
     for (const l of res.leftover) leftoverSet.add(l);
     for (const s of res.submits) {
-      if (SUBMIT_LABEL_RE.test(s.text) || ((s.type === 'submit' || s.type === 'image') && !SAFE_SUBMIT_TYPE_RE.test(s.text))) {
+      const cleanLbl = (s.text || '').normalize('NFC').replace(/^[^\p{L}\p{N}]+/u, '').trim();
+      const isSafe = Boolean(cleanLbl && SAFE_SUBMIT_TYPE_RE.test(cleanLbl) && !COMPOUND_DANGER_RE.test(cleanLbl));
+      if (
+        SUBMIT_LABEL_RE.test(cleanLbl) ||
+        (SAFE_SUBMIT_TYPE_RE.test(cleanLbl) && COMPOUND_DANGER_RE.test(cleanLbl)) ||
+        ((s.type === 'submit' || s.type === 'image') && !isSafe)
+      ) {
         submitButtons.push(s);
       }
     }
   }
 
   // Pass 1.5: Fallback to custom ARIA [role="combobox"] dropdowns (light + open Shadow DOM)
+  for (const frameInfo of frames) {
+    await frameInfo.frame
+      .evaluate(() => {
+        const stack = [document];
+        while (stack.length > 0) {
+          const cur = stack.shift();
+          if (!cur || !cur.querySelectorAll) continue;
+          for (const el of cur.querySelectorAll('[data-tbm-combo-claimed]')) {
+            el.removeAttribute('data-tbm-combo-claimed');
+          }
+          for (const node of cur.querySelectorAll('*')) {
+            if (node.shadowRoot) stack.push(node.shadowRoot);
+          }
+        }
+      })
+      .catch(() => {});
+  }
+
   for (const f of domFields) {
-    if (matchedFieldIndexes.has(f._idx) || typeof f.value !== 'string') continue;
+    const comboWanted =
+      typeof f.value === 'string'
+        ? f.value
+        : typeof f.option === 'string'
+          ? f.option
+          : null;
+    if ((matchedFieldIndexes.has(f._idx) && !f.all) || !comboWanted) continue;
+
     for (const frameInfo of frames) {
-      let comboTag = null;
+      if (f.frameIdx !== undefined && f.frameIdx !== null && Number(f.frameIdx) !== frameInfo.frameIdx) {
+        continue;
+      }
+      if (f.selector) {
+        await tagSelectorMatches(frameInfo.frame, f);
+      }
+      let comboRes = null;
       try {
-        comboTag = await frameInfo.frame.evaluate(({ fieldSpec }) => {
-          const clean = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-          const queryAllDeep = (rootNode, sel) => {
-            const seen = new Set();
-            const out = [];
-            const stack = [rootNode];
-            while (stack.length > 0) {
-              const cur = stack.shift();
-              if (!cur || !cur.querySelectorAll) continue;
-              for (const match of cur.querySelectorAll(sel)) {
-                if (!seen.has(match)) {
-                  seen.add(match);
-                  out.push(match);
+        comboRes = await frameInfo.frame.evaluate(
+          ({ fieldSpec, frameIdxArg, overwriteFlag }) => {
+            const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+            const queryAllDeep = (rootNode, sel) => {
+              const seen = new Set();
+              const out = [];
+              const stack = [rootNode];
+              while (stack.length > 0) {
+                const cur = stack.shift();
+                if (!cur) continue;
+                if (cur.shadowRoot) stack.push(cur.shadowRoot);
+                if (!cur.querySelectorAll) continue;
+                let matches;
+                try {
+                  matches = cur.querySelectorAll(sel);
+                } catch {
+                  return out;
+                }
+                for (const match of matches) {
+                  if (!seen.has(match)) {
+                    seen.add(match);
+                    out.push(match);
+                  }
+                }
+                for (const node of cur.querySelectorAll('*')) {
+                  if (node.shadowRoot) stack.push(node.shadowRoot);
                 }
               }
-              for (const node of cur.querySelectorAll('*')) {
-                if (node.shadowRoot) stack.push(node.shadowRoot);
+              return out;
+            };
+
+            const safePatternMatch = (text, pat) => {
+              if (pat === undefined || pat === null) return false;
+              const raw = String(pat);
+              if (!raw) return false;
+              const hay = String(text || '');
+              if (hay.toLowerCase().includes(raw.toLowerCase())) return true;
+              try {
+                return new RegExp(raw, 'i').test(hay);
+              } catch {
+                const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                return new RegExp(escaped, 'i').test(hay);
               }
+            };
+
+            for (const old of queryAllDeep(document, '[data-tbm-combo]')) {
+              old.removeAttribute('data-tbm-combo');
             }
-            return out;
-          };
 
-          const safePatternMatch = (text, pat) => {
-            if (pat === undefined || pat === null) return false;
-            const raw = String(pat);
-            if (!raw) return false;
-            const hay = String(text || '');
-            if (hay.toLowerCase().includes(raw.toLowerCase())) return true;
-            try {
-              return new RegExp(raw, 'i').test(hay);
-            } catch {
-              const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-              return new RegExp(escaped, 'i').test(hay);
-            }
-          };
-
-          for (const old of queryAllDeep(document, '[data-tbm-combo]')) {
-            old.removeAttribute('data-tbm-combo');
-          }
-
-          const combos = queryAllDeep(document, '[role="combobox"]').filter((el) => {
-            if (el.tagName === 'SELECT') return false;
-            if (
-              el.disabled ||
-              el.readOnly ||
-              el.hasAttribute('readonly') ||
-              el.getAttribute('aria-readonly') === 'true' ||
-              el.getAttribute('aria-disabled') === 'true' ||
-              Boolean(el.closest('[aria-disabled="true"]')) ||
-              el.getAttribute('aria-hidden') === 'true' ||
-              Boolean(el.closest('[aria-hidden="true"]'))
-            ) {
+            const isDisabledByFieldset = (node) => {
+              let cur = node;
+              while (cur && cur.nodeType === 1) {
+                const parent = cur.parentElement;
+                if (parent && parent.tagName === 'FIELDSET' && parent.disabled) {
+                  const firstLegend = [...parent.children].find((c) => c.tagName === 'LEGEND');
+                  if (!firstLegend || cur !== firstLegend) return true;
+                }
+                const rn = cur.getRootNode?.();
+                cur = parent || (rn instanceof ShadowRoot ? rn.host : null);
+              }
               return false;
-            }
-            const st = getComputedStyle(el);
-            const r = el.getBoundingClientRect();
-            return st.display !== 'none' && st.visibility !== 'hidden' && Number(st.opacity) !== 0 && r.width > 0 && r.height > 0;
-          });
-          const keys = Array.isArray(fieldSpec.keys) ? fieldSpec.keys : fieldSpec.keys ? [fieldSpec.keys] : [];
-          const nots = Array.isArray(fieldSpec.not) ? fieldSpec.not : fieldSpec.not ? [fieldSpec.not] : [];
-          const hit = combos.find((el) => {
-            if (fieldSpec.selector && el.matches(fieldSpec.selector)) return true;
-            if (keys.length === 0) return false;
-            const rootNode = el.getRootNode?.();
-            const lblBy = (el.getAttribute('aria-labelledby') || '')
-              .split(/\s+/)
-              .map((id) => ((rootNode?.getElementById && rootNode.getElementById(id)) || document.getElementById(id))?.innerText || '')
-              .join(' ');
-            const txt = clean(
-              [
+            };
+
+            const isInert = (node) => {
+              let cur = node;
+              while (cur && cur.nodeType === 1) {
+                if (cur.hasAttribute('inert') || Boolean(cur.inert)) return true;
+                const rn = cur.getRootNode?.();
+                cur = cur.parentElement || (rn instanceof ShadowRoot ? rn.host : null);
+              }
+              return false;
+            };
+
+            const isClosedDetailsOrCvHidden = (node) => {
+              let cur = node;
+              while (cur && cur.nodeType === 1) {
+                const parent = cur.parentElement;
+                if (parent && parent.tagName === 'DETAILS' && !parent.open) {
+                  const firstSummary = [...parent.children].find((c) => c.tagName === 'SUMMARY');
+                  if (!firstSummary || cur !== firstSummary) return true;
+                }
+                try {
+                  if (getComputedStyle(cur).contentVisibility === 'hidden') return true;
+                } catch {
+                  // ignore
+                }
+                const rn = cur.getRootNode?.();
+                cur = parent || (rn instanceof ShadowRoot ? rn.host : null);
+              }
+              return false;
+            };
+
+            const compareComposedOrder = (a, b) => {
+              if (a === b) return 0;
+              const pathOf = (n) => {
+                const p = [];
+                let c = n;
+                while (c) {
+                  p.unshift(c);
+                  const rn = c.getRootNode?.();
+                  c = c.assignedSlot || c.parentNode || (rn instanceof ShadowRoot ? rn.host : null);
+                }
+                return p;
+              };
+              const pa = pathOf(a);
+              const pb = pathOf(b);
+              const len = Math.min(pa.length, pb.length);
+              for (let i = 0; i < len; i++) {
+                if (pa[i] !== pb[i]) {
+                  if (pa[i] instanceof ShadowRoot) return -1;
+                  if (pb[i] instanceof ShadowRoot) return 1;
+                  const pos = pa[i].compareDocumentPosition(pb[i]);
+                  if (pos & 4) return -1;
+                  if (pos & 2) return 1;
+                  return 0;
+                }
+              }
+              return pa.length - pb.length;
+            };
+
+            const getSelOrder = (el, idx) => {
+              const raw = el?.getAttribute?.('data-tbm-sel-match') || '';
+              const prefix = `${idx}:`;
+              for (const part of raw.split(',')) {
+                if (part === String(idx)) return 0;
+                if (part.startsWith(prefix)) return Number(part.slice(prefix.length)) || 0;
+              }
+              return -1;
+            };
+
+            const hasSelToken = (el, idx) => getSelOrder(el, idx) >= 0;
+
+            const combos = queryAllDeep(document, '[role="combobox"]').filter((el) => {
+              if (el.tagName === 'SELECT') return false;
+              if (!fieldSpec.all && el.getAttribute('data-tbm-combo-claimed') === '1') return false;
+              if (
+                el.disabled ||
+                Boolean(el.matches?.(':disabled')) ||
+                isDisabledByFieldset(el) ||
+                isInert(el) ||
+                isClosedDetailsOrCvHidden(el) ||
+                el.readOnly ||
+                el.hasAttribute('readonly') ||
+                el.getAttribute('aria-readonly') === 'true' ||
+                el.getAttribute('aria-disabled') === 'true' ||
+                Boolean(el.closest('[aria-disabled="true"]')) ||
+                el.getAttribute('aria-hidden') === 'true' ||
+                Boolean(el.closest('[aria-hidden="true"]'))
+              ) {
+                return false;
+              }
+              const st = getComputedStyle(el);
+              const r = el.getBoundingClientRect();
+              return st.display !== 'none' && st.visibility !== 'hidden' && Number(st.opacity) !== 0 && r.width > 0 && r.height > 0;
+            });
+
+            const keys = Array.isArray(fieldSpec.keys) ? fieldSpec.keys : fieldSpec.keys ? [fieldSpec.keys] : [];
+            const nots = Array.isArray(fieldSpec.not) ? fieldSpec.not : fieldSpec.not ? [fieldSpec.not] : [];
+
+            const resolveById = (el, id) => {
+              const rootNode = el.getRootNode?.();
+              return (rootNode?.getElementById && rootNode.getElementById(id)) || document.getElementById(id);
+            };
+
+            const closestComposed = (node, sel) => {
+              let cur = node;
+              while (cur) {
+                if (cur.nodeType === 1 && cur.matches?.(sel)) return cur;
+                const rn = cur.getRootNode?.();
+                cur = cur.assignedSlot || cur.parentElement || (rn instanceof ShadowRoot ? rn.host : null);
+              }
+              return null;
+            };
+
+            const BLOCK_TAGS = new Set([
+              'DIV', 'P', 'LI', 'UL', 'OL', 'TR', 'TD', 'TH',
+              'SECTION', 'ARTICLE', 'HEADER', 'FOOTER', 'ASIDE', 'NAV',
+              'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'BLOCKQUOTE', 'PRE', 'BR',
+            ]);
+            const getSR = (node) => node?.shadowRoot || window.__tbmGetShadowRoot?.(node) || null;
+            const composedText = (rootNode, allowHidden = false, excludeNode = null) => {
+              if (!rootNode) return '';
+              const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'TITLE', 'SELECT', 'OPTION']);
+              const walkChildren = (nodes) => {
+                let out = '';
+                for (const c of nodes || []) {
+                  const piece = walk(c);
+                  if (!piece) continue;
+                  const cTag = c.nodeType === 1 ? (c.tagName || '').toUpperCase() : '';
+                  if (BLOCK_TAGS.has(cTag)) {
+                    out += (out && !/\s$/.test(out) ? ' ' : '') + piece + ' ';
+                  } else {
+                    out += piece;
+                  }
+                }
+                return out;
+              };
+              const walk = (n) => {
+                if (!n || n === excludeNode) return '';
+                if (n.nodeType === 3) return n.textContent || '';
+                if (n.nodeType !== 1 && n.nodeType !== 11) return '';
+                if (n.nodeType === 1) {
+                  const t = (n.tagName || '').toUpperCase();
+                  if (SKIP.has(t)) return '';
+                  if (t === 'BR') return ' ';
+                  if (!allowHidden && n !== rootNode) {
+                    if (n.hasAttribute?.('hidden') || n.getAttribute?.('aria-hidden') === 'true') return '';
+                    try {
+                      const st = getComputedStyle(n);
+                      if (st.display === 'none' || st.visibility === 'hidden') return '';
+                    } catch {}
+                  }
+                  if (t === 'SLOT' && typeof n.assignedNodes === 'function') {
+                    const assigned = n.assignedNodes({ flatten: true });
+                    const list = assigned.length > 0 ? assigned : (n.childNodes || []);
+                    return walkChildren(list);
+                  }
+                  const sr = getSR(n);
+                  if (sr) {
+                    const srOut = walkChildren(sr.childNodes);
+                    if (clean(srOut)) return srOut;
+                  }
+                }
+                return walkChildren(n.childNodes);
+              };
+              return clean(walk(rootNode));
+            };
+
+            const describeComboParts = (el) => {
+              const lblBy = (el.getAttribute('aria-labelledby') || '')
+                .split(/\s+/)
+                .map((id) => {
+                  const refNode = resolveById(el, id);
+                  return composedText(refNode, true) || refNode?.innerText || '';
+                })
+                .join(' ');
+              const prev = el.previousElementSibling;
+              const prevTxt =
+                prev && !prev.matches('button, input, select, textarea, a, [role="button"], [role="combobox"]')
+                  ? (composedText(prev) || prev.innerText)
+                  : '';
+              const blk = closestComposed(el, '[class*="field"], [class*="Field"], .form-group, [role="listitem"]');
+              let blkTxt = '';
+              let blkLblTxt = '';
+              if (blk) {
+                const siblings = queryAllDeep(
+                  blk,
+                  'input:not([type="radio"]):not([type="checkbox"]):not([type="hidden"]):not([type="file"]), textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="combobox"]'
+                );
+                if (siblings.length <= 1) {
+                  blkTxt = composedText(blk, false, el) || composedText(blk) || blk.innerText;
+                  const innerLbl = blk.querySelector('label');
+                  if (innerLbl) blkLblTxt = composedText(innerLbl, false, el) || composedText(innerLbl) || innerLbl.innerText;
+                }
+              }
+              const wrapLbl = closestComposed(el, 'label');
+              const wrapLblClean = wrapLbl ? (composedText(wrapLbl, false, el) || composedText(wrapLbl) || wrapLbl.innerText) : '';
+              const host = el.getRootNode?.()?.host;
+              const hostAttr = host ? (host.getAttribute('aria-label') || host.getAttribute('data-label') || '') : '';
+              const rawParts = [
                 el.getAttribute('aria-label'),
                 el.getAttribute('placeholder'),
+                el.getAttribute('name'),
+                el.getAttribute('id'),
                 lblBy,
-                el.closest('label')?.innerText,
-                el.closest('[class*="field"], [class*="Field"], .form-group, [role="listitem"]')?.innerText,
-              ].join(' ')
+                wrapLblClean,
+                hostAttr,
+                prevTxt,
+                blkLblTxt,
+                blkTxt,
+              ];
+              const primaryParts = rawParts.map((p) => clean(p)).filter(Boolean);
+              const contextParts = [];
+              let curFs = closestComposed(el, 'fieldset');
+              while (curFs) {
+                const leg = curFs.querySelector('legend');
+                const legTxt = leg ? (composedText(leg) || clean(leg.innerText)) : '';
+                if (legTxt) contextParts.unshift(legTxt);
+                const rnFs = curFs.getRootNode?.();
+                curFs = closestComposed(curFs.assignedSlot || curFs.parentElement || (rnFs instanceof ShadowRoot ? rnFs.host : null), 'fieldset');
+              }
+              const sec = closestComposed(el, 'section, [role="region"], [role="group"]');
+              if (sec && sec.tagName !== 'FIELDSET') {
+                const secAria = sec.getAttribute('aria-label');
+                const secLby = sec.getAttribute('aria-labelledby');
+                let secHeading = '';
+                if (secAria) {
+                  secHeading = secAria;
+                } else if (secLby) {
+                  secHeading = secLby
+                    .split(/\s+/)
+                    .map((id) => {
+                      const rn = resolveById(sec, id);
+                      return composedText(rn, true) || rn?.innerText || '';
+                    })
+                    .join(' ');
+                } else {
+                  const h = sec.querySelector(':scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > legend');
+                  if (h) secHeading = composedText(h) || h.innerText;
+                }
+                if (clean(secHeading)) contextParts.push(clean(secHeading));
+              }
+              const allParts = [...primaryParts];
+              if (contextParts.length > 0) {
+                const ctxJoined = contextParts.join(' ');
+                if (primaryParts.length > 0) {
+                  for (const pp of primaryParts) {
+                    allParts.push(`${ctxJoined} ${pp}`);
+                  }
+                } else {
+                  allParts.push(ctxJoined);
+                }
+              }
+              return allParts.map((p) => clean(p).toLowerCase()).filter(Boolean);
+            };
+
+            const describeCombo = (el) => describeComboParts(el).join(' | ');
+
+            const rankCombo = (el) => {
+              if (keys.length === 0) return 0;
+              const parts = describeComboParts(el);
+              const fullText = parts.join(' | ');
+              if (nots.some((n) => safePatternMatch(fullText, n))) return 0;
+              let bestTier = 0;
+              for (const k of keys) {
+                const raw = clean(String(k ?? ''));
+                if (!raw) continue;
+                const rawLower = raw.toLowerCase();
+                if (parts.some((p) => p === rawLower)) {
+                  if (bestTier < 4) bestTier = 4;
+                  continue;
+                }
+                const escaped = rawLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const partPrefixRe = new RegExp(`^${escaped}(?![\\p{L}\\p{N}_])`, 'iu');
+                if (parts.some((p) => partPrefixRe.test(p))) {
+                  if (bestTier < 3) bestTier = 3;
+                  continue;
+                }
+                const wordBoundaryRe = new RegExp(`(?:^|[^\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, 'iu');
+                if (wordBoundaryRe.test(fullText)) {
+                  if (bestTier < 2) bestTier = 2;
+                  continue;
+                }
+                if (safePatternMatch(fullText, k)) {
+                  if (bestTier < 1) bestTier = 1;
+                }
+              }
+              return bestTier;
+            };
+
+            let hit = null;
+            if (fieldSpec.ref) {
+              const m = /^(?:f(\d+):)?(e\d+)$/i.exec(fieldSpec.ref.trim());
+              if (m && (m[1] === undefined || Number(m[1]) === frameIdxArg)) {
+                hit = combos.find((el) => el.getAttribute('data-tbm-ref') === m[2]) || null;
+              }
+            } else if (fieldSpec.selector) {
+              const taggedCombos = combos
+                .filter((el) => hasSelToken(el, fieldSpec._idx))
+                .sort(compareComposedOrder);
+              hit =
+                taggedCombos[0] ||
+                combos
+                  .filter((el) => {
+                    try {
+                      return el.matches(fieldSpec.selector);
+                    } catch {
+                      return false;
+                    }
+                  })
+                  .sort(compareComposedOrder)[0] ||
+                null;
+            } else if (keys.length > 0) {
+              let bestTier = 0;
+              for (const el of combos) {
+                const t = rankCombo(el);
+                if (t > bestTier) {
+                  bestTier = t;
+                  hit = el;
+                  if (t === 4) break;
+                }
+              }
+            }
+
+            if (!hit) return null;
+
+            const rawComboVal = clean(
+              hit.value ||
+              hit.getAttribute('data-value') ||
+              hit.getAttribute('data-selected') ||
+              composedText(hit) ||
+              (hit.innerText || hit.textContent || '')
             );
-            if (nots.some((n) => safePatternMatch(txt, n))) return false;
-            return keys.some((k) => safePatternMatch(txt, k));
-          });
-          if (!hit) return null;
-          const marker = `c${fieldSpec._idx}`;
-          hit.setAttribute('data-tbm-combo', marker);
-          return marker;
-        }, { fieldSpec: f });
+            const placeholderAttr = clean(hit.getAttribute('placeholder') || hit.getAttribute('data-placeholder') || '');
+            const isPlaceholderText =
+              !rawComboVal ||
+              (placeholderAttr && rawComboVal.toLowerCase() === placeholderAttr.toLowerCase()) ||
+              /^(--|choose\b|select\b|pick\b|chọn\b|\.\.\.|…)/i.test(rawComboVal) ||
+              /\.\.\.$|…$/.test(rawComboVal);
+
+            if (!isPlaceholderText && !overwriteFlag) {
+              hit.setAttribute('data-tbm-combo-claimed', '1');
+              return { skipped: true, label: describeCombo(hit).slice(0, 50) };
+            }
+
+            const marker = `c${fieldSpec._idx}`;
+            hit.setAttribute('data-tbm-combo', marker);
+            return { marker, label: describeCombo(hit).slice(0, 50) };
+          },
+          { fieldSpec: f, frameIdxArg: frameInfo.frameIdx, overwriteFlag: overwrite }
+        );
       } catch {
-        comboTag = null;
+        comboRes = null;
       }
-      if (!comboTag) continue;
+      if (!comboRes) continue;
+      if (comboRes.skipped) {
+        skipped.push({
+          idx: f._idx,
+          frameIdx: frameInfo.frameIdx,
+          reason: 'already-filled',
+          label: comboRes.label,
+        });
+        matchedFieldIndexes.add(f._idx);
+        if (!f.all) break;
+        continue;
+      }
 
       try {
-        const comboLoc = frameInfo.frame.locator(`[data-tbm-combo="${comboTag}"]`).first();
-        await comboLoc.click({ timeout: 2500 });
-        let optLoc = frameInfo.frame.getByRole('option', { name: f.value, exact: false }).first();
-        if ((await optLoc.count()) === 0) {
-          optLoc = frameInfo.frame.getByRole('option', { name: compileFilterRegex(f.value) }).first();
+        const comboLoc = frameInfo.frame.locator(`[data-tbm-combo="${comboRes.marker}"]`).first();
+        const optionScopes = frameInfo.isMain ? [frameInfo.frame] : [frameInfo.frame, page.mainFrame()];
+        const stopBeforeSubmit = spec.stopBeforeSubmit !== false;
+
+        const clickWidgetSafely = async (loc) => {
+          await withFrameSubmitGuard(frameInfo.frame, async () => {
+            if (stopBeforeSubmit) {
+              await loc
+                .evaluate((el) => {
+                  const win = el.ownerDocument?.defaultView || window;
+                  const btn = el.tagName === 'BUTTON' ? el : el.closest?.('button');
+                  const form = el.form || btn?.form || el.closest?.('form');
+                  const isSubmitBtn =
+                    btn && form && (btn.type || 'submit').toLowerCase() === 'submit';
+                  if (isSubmitBtn) {
+                    win.addEventListener('click', (e) => e.preventDefault(), { once: true });
+                  }
+                })
+                .catch(() => {});
+            }
+            await loc.click({ timeout: 2500 });
+          });
+        };
+
+        const tryPickEnabledOption = async () => {
+          let sawDisabledMatch = false;
+          let anyVisibleOption = false;
+          for (const scope of optionScopes) {
+            const anyOptCount = await scope.getByRole('option').count().catch(() => 0);
+            if (anyOptCount > 0) {
+              for (let k = 0; k < Math.min(anyOptCount, 12); k++) {
+                if (await scope.getByRole('option').nth(k).isVisible().catch(() => false)) {
+                  anyVisibleOption = true;
+                  break;
+                }
+              }
+            }
+            const candidates = [
+              scope.getByRole('option', { name: comboWanted, exact: true }),
+              scope.getByRole('option', { name: comboWanted, exact: false }),
+              scope.getByRole('option', { name: compileFilterRegex(comboWanted) }),
+            ];
+            for (const cand of candidates) {
+              const count = await cand.count().catch(() => 0);
+              if (count <= 0) continue;
+              const limit = Math.min(count, 12);
+              for (let i = 0; i < limit; i++) {
+                const nth = cand.nth(i);
+                const visible = await nth.isVisible().catch(() => false);
+                if (!visible) continue;
+                anyVisibleOption = true;
+                const isDisabledOpt = await nth
+                  .evaluate((el) =>
+                    Boolean(
+                      el.disabled ||
+                      el.getAttribute('aria-disabled') === 'true' ||
+                      el.closest('[aria-disabled="true"]')
+                    )
+                  )
+                  .catch(() => false);
+                if (isDisabledOpt) {
+                  sawDisabledMatch = true;
+                  continue;
+                }
+                await clickWidgetSafely(nth);
+                return { clicked: true, sawDisabledMatch, anyVisibleOption };
+              }
+            }
+          }
+          return { clicked: false, sawDisabledMatch, anyVisibleOption };
+        };
+
+        const wasLeftOpen = await comboLoc
+          .evaluate((el) => el.getAttribute('data-tbm-combo-open') === '1')
+          .catch(() => false);
+
+        let clickedOption = false;
+        if (wasLeftOpen) {
+          const preCheck = await tryPickEnabledOption();
+          if (preCheck.clicked) {
+            clickedOption = true;
+            await comboLoc.evaluate((el) => el.removeAttribute('data-tbm-combo-open')).catch(() => {});
+          } else if (preCheck.sawDisabledMatch) {
+            // Target option is still disabled in the already-open dropdown
+          } else if (!preCheck.anyVisibleOption) {
+            await clickWidgetSafely(comboLoc);
+          }
+        } else {
+          await clickWidgetSafely(comboLoc);
         }
-        if ((await optLoc.count()) > 0) {
-          await optLoc.click({ timeout: 2500 });
+
+        if (!clickedOption) {
+          for (let attempt = 0; attempt < 18; attempt++) {
+            const pollRes = await tryPickEnabledOption();
+            if (pollRes.clicked) {
+              clickedOption = true;
+              await comboLoc.evaluate((el) => el.removeAttribute('data-tbm-combo-open')).catch(() => {});
+              break;
+            }
+            if (pollRes.sawDisabledMatch) {
+              await comboLoc.evaluate((el) => el.setAttribute('data-tbm-combo-open', '1')).catch(() => {});
+              break;
+            }
+            await page.waitForTimeout(35);
+          }
+        }
+
+        if (clickedOption) {
+          await comboLoc.evaluate((el) => el.setAttribute('data-tbm-combo-claimed', '1')).catch(() => {});
           filled.push({
             idx: f._idx,
             frameIdx: frameInfo.frameIdx,
             tag: 'role:combobox',
-            value: f.value,
+            value: comboWanted,
           });
           matchedFieldIndexes.add(f._idx);
-          break;
+          if (!f.all) break;
         }
       } catch {
         // Ignore dropdown option lookup failures and move on.
@@ -1483,10 +3828,71 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
     }
   }
 
+  if (selectorHandlesToDispose.length > 0) {
+    for (const h of selectorHandlesToDispose) {
+      await h.dispose().catch(() => {});
+    }
+    for (const frameInfo of frames) {
+      await frameInfo.frame
+        .evaluate(() => {
+          const stack = [document];
+          while (stack.length > 0) {
+            const cur = stack.shift();
+            if (!cur || !cur.querySelectorAll) continue;
+            for (const el of cur.querySelectorAll('[data-tbm-sel-match]')) {
+              el.removeAttribute('data-tbm-sel-match');
+            }
+            for (const node of cur.querySelectorAll('*')) {
+              if (node.shadowRoot) stack.push(node.shadowRoot);
+            }
+          }
+        })
+        .catch(() => {});
+    }
+  }
+
   // Pass 2: Direct disk file uploads across frames via Playwright setInputFiles.
+  if (fileFields.length > 0) {
+    for (const frameInfo of frames) {
+      await frameInfo.frame
+        .evaluate(() => {
+          const stack = [document];
+          while (stack.length > 0) {
+            const cur = stack.shift();
+            if (!cur || !cur.querySelectorAll) continue;
+            for (const el of cur.querySelectorAll('input[type="file"][data-tbm-file-claimed]')) {
+              el.removeAttribute('data-tbm-file-claimed');
+            }
+            for (const node of cur.querySelectorAll('*')) {
+              if (node.shadowRoot) stack.push(node.shadowRoot);
+            }
+          }
+        })
+        .catch(() => {});
+    }
+  }
+
+  const setInputFilesSafely = async (loc, paths, frame) => {
+    const targetFrame = frame || loc.page?.()?.mainFrame?.() || page.mainFrame();
+    await loc.evaluate((el) => el.setAttribute('data-tbm-file-claimed', '1')).catch(() => {});
+    await withFrameSubmitGuard(targetFrame, async () => {
+      await loc.setInputFiles(paths);
+    });
+  };
+
   for (const ff of fileFields) {
-    const rawList = Array.isArray(ff.files) ? ff.files : [ff.file];
-    const resolvedPaths = rawList.map((p) => path.resolve(String(p)));
+    const rawList =
+      Array.isArray(ff.files) && ff.files.length > 0
+        ? ff.files
+        : ff.file
+          ? [ff.file]
+          : [];
+    const validList = rawList.filter((p) => p !== undefined && p !== null && String(p).trim() !== '');
+    if (validList.length === 0) {
+      skipped.push({ idx: ff._idx, reason: 'empty-file-list' });
+      continue;
+    }
+    const resolvedPaths = validList.map((p) => path.resolve(String(p)));
     for (const p of resolvedPaths) {
       if (!fs.existsSync(p)) {
         throw new Error(`Upload file does not exist on disk: ${p}`);
@@ -1495,16 +3901,54 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
 
     let uploaded = false;
     if (ff.ref || ff.selector) {
-      const target = await resolveTarget(page, {
-        ref: ff.ref,
-        selector: ff.selector,
-        frameIdx: ff.frameIdx,
-      });
+      const target = await resolveTarget(
+        page,
+        {
+          ref: ff.ref,
+          selector: ff.selector,
+          frameIdx: ff.frameIdx,
+        },
+        { allowHidden: true }
+      );
+      const isDisabledOrInertTarget = await target.locator
+        .evaluate((el) => {
+          const isDisabledByFieldset = (node) => {
+            let cur = node;
+            while (cur && cur.nodeType === 1) {
+              const parent = cur.parentElement;
+              if (parent && parent.tagName === 'FIELDSET' && parent.disabled) {
+                const firstLegend = [...parent.children].find((c) => c.tagName === 'LEGEND');
+                if (!firstLegend || cur !== firstLegend) return true;
+              }
+              const rn = cur.getRootNode?.();
+              cur = parent || (rn instanceof ShadowRoot ? rn.host : null);
+            }
+            return false;
+          };
+          let cur = el;
+          while (cur && cur.nodeType === 1) {
+            if (cur.hasAttribute('inert') || Boolean(cur.inert)) return true;
+            const rn = cur.getRootNode?.();
+            cur = cur.parentElement || (rn instanceof ShadowRoot ? rn.host : null);
+          }
+          return (
+            Boolean(el.disabled) ||
+            Boolean(el.matches?.(':disabled')) ||
+            isDisabledByFieldset(el) ||
+            el.getAttribute('aria-disabled') === 'true' ||
+            Boolean(el.closest('[aria-disabled="true"]'))
+          );
+        })
+        .catch(() => false);
+      if (isDisabledOrInertTarget) {
+        skipped.push({ idx: ff._idx, reason: 'file-input-disabled' });
+        continue;
+      }
       const isFileInput = await target.locator.evaluate(
         (el) => el.tagName === 'INPUT' && el.type === 'file'
       );
       if (isFileInput) {
-        await target.locator.setInputFiles(resolvedPaths);
+        await setInputFilesSafely(target.locator, resolvedPaths, target.frame);
         uploaded = true;
       } else {
         if (spec.stopBeforeSubmit !== false) {
@@ -1513,41 +3957,195 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             skipped.push({ idx: ff._idx, reason: 'blocked-submit-target', label: meta.label });
             continue;
           }
+          await target.locator.scrollIntoViewIfNeeded({ timeout: 2500 }).catch(() => {});
+          const box = await target.locator.boundingBox().catch(() => null);
+          if (box && box.width > 0 && box.height > 0) {
+            const ptMeta = await isSubmitAtPoint(page, box.x + box.width / 2, box.y + box.height / 2);
+            if (ptMeta.isSubmit) {
+              skipped.push({ idx: ff._idx, reason: 'blocked-submit-target', label: ptMeta.label });
+              continue;
+            }
+          }
         }
-        const [chooser] = await Promise.all([
-          page.waitForEvent('filechooser', { timeout: 4000 }),
-          target.locator.click(),
-        ]);
-        await chooser.setFiles(resolvedPaths);
+        await withFrameSubmitGuard(target.frame, async () => {
+          const [chooser] = await Promise.all([
+            page.waitForEvent('filechooser', { timeout: 4000 }),
+            target.locator.click(),
+          ]);
+          await chooser.setFiles(resolvedPaths);
+        });
         uploaded = true;
       }
     } else {
       const fileKeys = Array.isArray(ff.keys) ? ff.keys : ff.keys ? [ff.keys] : [];
+      const fileNots = Array.isArray(ff.not) ? ff.not : ff.not ? [ff.not] : [];
       for (const frameInfo of frames) {
+        if (ff.frameIdx !== undefined && ff.frameIdx !== null && Number(ff.frameIdx) !== frameInfo.frameIdx) {
+          continue;
+        }
         const fileInputs = frameInfo.frame.locator('input[type="file"]');
         const count = await fileInputs.count();
         for (let i = 0; i < count; i++) {
           const loc = fileInputs.nth(i);
-          if (fileKeys.length > 0) {
-            const label = await loc.evaluate((el) => {
-              const blk = el.closest('label, .form-group, .field, [role="listitem"], fieldset') || el.parentElement;
+          const isSkipOrClaimed = await loc
+            .evaluate((el, allowAll) => {
+              const isDisabledByFieldset = (node) => {
+                let cur = node;
+                while (cur && cur.nodeType === 1) {
+                  const parent = cur.parentElement;
+                  if (parent && parent.tagName === 'FIELDSET' && parent.disabled) {
+                    const firstLegend = [...parent.children].find((c) => c.tagName === 'LEGEND');
+                    if (!firstLegend || cur !== firstLegend) return true;
+                  }
+                  const rn = cur.getRootNode?.();
+                  cur = parent || (rn instanceof ShadowRoot ? rn.host : null);
+                }
+                return false;
+              };
+              let cur = el;
+              while (cur && cur.nodeType === 1) {
+                if (cur.hasAttribute('inert') || Boolean(cur.inert)) return true;
+                const rn = cur.getRootNode?.();
+                cur = cur.parentElement || (rn instanceof ShadowRoot ? rn.host : null);
+              }
               return (
-                (el.getAttribute('aria-label') || '') +
-                ' ' +
-                (el.name || '') +
-                ' ' +
-                (el.id || '') +
-                ' ' +
-                (blk?.innerText || '')
+                (!allowAll && el.getAttribute('data-tbm-file-claimed') === '1') ||
+                el.disabled ||
+                Boolean(el.matches?.(':disabled')) ||
+                isDisabledByFieldset(el) ||
+                el.getAttribute('aria-disabled') === 'true' ||
+                Boolean(el.closest('[aria-disabled="true"]'))
               );
+            }, Boolean(ff.all))
+            .catch(() => false);
+          if (isSkipOrClaimed) continue;
+
+          if (fileKeys.length > 0 || fileNots.length > 0) {
+            const label = await loc.evaluate((el) => {
+              const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+              const resolveById = (node, id) => {
+                const rn = node.getRootNode?.();
+                return (rn?.getElementById && rn.getElementById(id)) || document.getElementById(id);
+              };
+              const closestComposed = (node, sel) => {
+                let cur = node;
+                while (cur) {
+                  if (cur.nodeType === 1 && cur.matches?.(sel)) return cur;
+                  const rn = cur.getRootNode?.();
+                  cur = cur.assignedSlot || cur.parentElement || (rn instanceof ShadowRoot ? rn.host : null);
+                }
+                return null;
+              };
+              const BLOCK_TAGS = new Set([
+                'DIV', 'P', 'LI', 'UL', 'OL', 'TR', 'TD', 'TH',
+                'SECTION', 'ARTICLE', 'HEADER', 'FOOTER', 'ASIDE', 'NAV',
+                'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'BLOCKQUOTE', 'PRE', 'BR',
+              ]);
+              const getSR = (node) => node?.shadowRoot || window.__tbmGetShadowRoot?.(node) || null;
+              const composedText = (rootNode, allowHidden = false) => {
+                if (!rootNode) return '';
+                const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'TITLE', 'SELECT', 'OPTION']);
+                const walkChildren = (nodes) => {
+                  let out = '';
+                  for (const c of nodes || []) {
+                    const piece = walk(c);
+                    if (!piece) continue;
+                    const cTag = c.nodeType === 1 ? (c.tagName || '').toUpperCase() : '';
+                    if (BLOCK_TAGS.has(cTag)) {
+                      out += (out && !/\s$/.test(out) ? ' ' : '') + piece + ' ';
+                    } else {
+                      out += piece;
+                    }
+                  }
+                  return out;
+                };
+                const walk = (n) => {
+                  if (!n) return '';
+                  if (n.nodeType === 3) return n.textContent || '';
+                  if (n.nodeType !== 1 && n.nodeType !== 11) return '';
+                  if (n.nodeType === 1) {
+                    const t = (n.tagName || '').toUpperCase();
+                    if (SKIP.has(t)) return '';
+                    if (t === 'BR') return ' ';
+                    if (!allowHidden && n !== rootNode) {
+                      if (n.hasAttribute?.('hidden') || n.getAttribute?.('aria-hidden') === 'true') return '';
+                      try {
+                        const st = getComputedStyle(n);
+                        if (st.display === 'none' || st.visibility === 'hidden') return '';
+                      } catch {}
+                    }
+                    if (t === 'SLOT' && typeof n.assignedNodes === 'function') {
+                      const assigned = n.assignedNodes({ flatten: true });
+                      const list = assigned.length > 0 ? assigned : (n.childNodes || []);
+                      return walkChildren(list);
+                    }
+                    const sr = getSR(n);
+                    if (sr) {
+                      const srOut = walkChildren(sr.childNodes);
+                      if (clean(srOut)) return srOut;
+                    }
+                  }
+                  return walkChildren(n.childNodes);
+                };
+                return clean(walk(rootNode));
+              };
+              const lbyTxt = (el.getAttribute('aria-labelledby') || '')
+                .split(/\s+/)
+                .map((id) => {
+                  const refNode = resolveById(el, id);
+                  return composedText(refNode, true) || refNode?.innerText || '';
+                })
+                .join(' ');
+              const wrapLbl = closestComposed(el, 'label');
+              const blk = closestComposed(el, '.form-group, .field, [role="listitem"]');
+              const host = el.getRootNode?.()?.host;
+              const hostAttr = host ? (host.getAttribute('aria-label') || host.getAttribute('data-label') || '') : '';
+              const primary = [
+                el.getAttribute('aria-label'),
+                el.name,
+                el.id,
+                el.title,
+                lbyTxt,
+                hostAttr,
+                ...(el.labels ? [...el.labels].map((l) => composedText(l) || l.innerText) : []),
+                wrapLbl ? (composedText(wrapLbl) || wrapLbl.innerText) : '',
+                blk ? (composedText(blk) || blk.innerText) : '',
+              ]
+                .map(clean)
+                .filter(Boolean);
+
+              const ctx = [];
+              let curFs = closestComposed(el, 'fieldset');
+              while (curFs) {
+                const leg = curFs.querySelector('legend');
+                const legTxt = leg ? (composedText(leg) || clean(leg.innerText)) : '';
+                if (legTxt) ctx.unshift(legTxt);
+                const rnFs = curFs.getRootNode?.();
+                curFs = closestComposed(curFs.assignedSlot || curFs.parentElement || (rnFs instanceof ShadowRoot ? rnFs.host : null), 'fieldset');
+              }
+              const sec = closestComposed(el, 'section, [role="region"], [role="group"]');
+              if (sec && sec.tagName !== 'FIELDSET') {
+                const secAria = sec.getAttribute('aria-label');
+                const h = sec.querySelector(':scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > legend');
+                const secTxt = clean(secAria || (h ? (composedText(h) || h.innerText) : '') || '');
+                if (secTxt) ctx.push(secTxt);
+              }
+              const out = [...primary];
+              if (ctx.length > 0) {
+                const ctxStr = ctx.join(' ');
+                out.push(ctxStr);
+                for (const p of primary) out.push(`${ctxStr} ${p}`);
+              }
+              return out.join(' | ');
             });
-            if (!fileKeys.some((k) => matchesPattern(label, k))) continue;
+            if (fileNots.some((n) => matchesPattern(label, n))) continue;
+            if (fileKeys.length > 0 && !fileKeys.some((k) => matchesPattern(label, k))) continue;
           }
-          await loc.setInputFiles(resolvedPaths);
+          await setInputFilesSafely(loc, resolvedPaths, frameInfo.frame);
           uploaded = true;
-          break;
+          if (!ff.all) break;
         }
-        if (uploaded) break;
+        if (uploaded && !ff.all) break;
       }
     }
 
@@ -1609,27 +4207,59 @@ async function executeSingleAction(page, params = {}) {
       return { ok: true, action, loadState: params.loadState };
     }
     if (params.url) {
-      const urlRe = compileFilterRegex(params.url);
-      await page.waitForURL(urlRe, { timeout });
+      const urlPattern = String(params.url);
+      const urlRe = compileFilterRegex(urlPattern);
+      const isGlob =
+        urlPattern.includes('*') && !/\\[dwsbDWSB.?]|\.\*|\.\+|^\^|\$$/.test(urlPattern);
+      const globRe = isGlob
+        ? new RegExp(
+            urlPattern
+              .split(/\*+/)
+              .map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+              .join('.*'),
+            'i'
+          )
+        : null;
+      await page.waitForURL(
+        (u) => {
+          const href = String(u?.href ?? u);
+          if (href.toLowerCase().includes(urlPattern.toLowerCase())) return true;
+          if (globRe) return globRe.test(href);
+          return urlRe.test(href);
+        },
+        { timeout }
+      );
       return { ok: true, action, url: page.url() };
     }
     if (params.textGone) {
-      const frames = getAllFrames(page);
-      let foundLoc = null;
-      for (const f of frames) {
-        const loc = f.frame.getByText(params.textGone, { exact: false }).first();
-        if ((await loc.count().catch(() => 0)) > 0) {
-          foundLoc = loc;
-          break;
+      const deadline = Date.now() + timeout;
+      while (Date.now() <= deadline) {
+        const frames = getAllFrames(page);
+        let waitedOnVisible = false;
+        for (const f of frames) {
+          const list = f.frame.getByText(params.textGone, { exact: false });
+          const cnt = await list.count().catch(() => 0);
+          for (let i = 0; i < cnt; i++) {
+            const item = list.nth(i);
+            if (await item.isVisible().catch(() => false)) {
+              const rem = Math.max(1, deadline - Date.now());
+              await item.waitFor({ state: 'hidden', timeout: rem });
+              waitedOnVisible = true;
+              break;
+            }
+          }
+          if (waitedOnVisible) break;
+        }
+        if (!waitedOnVisible) {
+          return { ok: true, action, textGone: params.textGone };
         }
       }
-      if (foundLoc) {
-        await foundLoc.waitFor({ state: 'hidden', timeout });
-      }
-      return { ok: true, action, textGone: params.textGone };
+      throw new Error(`Timed out after ${timeout}ms waiting for "${params.textGone}" to disappear.`);
     }
     if (params.ref) {
-      const target = await resolveTarget(page, params);
+      const target = await resolveTarget(page, params, {
+        allowHidden: ['hidden', 'detached', 'attached'].includes(params.state),
+      });
       await target.locator.waitFor({ state: params.state || 'visible', timeout });
       return { ok: true, action, waitedFor: params.ref };
     }
@@ -1642,24 +4272,68 @@ async function executeSingleAction(page, params = {}) {
       if (scopedFrames.length === 0) {
         throw new Error(`No matching frames found for wait target (${params.selector || params.text}).`);
       }
-      const makeLoc = (f) =>
+      const makeListLoc = (f) =>
         params.selector
-          ? f.frame.locator(params.selector).first()
-          : f.frame.getByText(params.text, { exact: false }).first();
+          ? f.frame.locator(params.selector)
+          : f.frame.getByText(params.text, { exact: false });
 
       if (desiredState === 'hidden' || desiredState === 'detached') {
-        for (const f of scopedFrames) {
-          const loc = makeLoc(f);
-          if ((await loc.count().catch(() => 0)) > 0) {
-            await loc.waitFor({ state: desiredState, timeout });
+        const deadline = Date.now() + timeout;
+        while (Date.now() <= deadline) {
+          let waitedAny = false;
+          for (const f of scopedFrames) {
+            const list = makeListLoc(f);
+            const cnt = await list.count().catch(() => 0);
+            for (let i = 0; i < cnt; i++) {
+              const item = list.nth(i);
+              if (desiredState === 'detached') {
+                const rem = Math.max(1, deadline - Date.now());
+                await item.waitFor({ state: 'detached', timeout: rem });
+                waitedAny = true;
+                break;
+              } else if (await item.isVisible().catch(() => false)) {
+                const rem = Math.max(1, deadline - Date.now());
+                await item.waitFor({ state: 'hidden', timeout: rem });
+                waitedAny = true;
+                break;
+              }
+            }
+            if (waitedAny) break;
           }
+          if (!waitedAny) {
+            return { ok: true, action, waitedFor: params.selector || params.text };
+          }
+        }
+        throw new Error(`Timed out after ${timeout}ms waiting for "${params.selector || params.text}" to become ${desiredState}.`);
+      }
+
+      if (desiredState === 'attached') {
+        try {
+          await Promise.any(scopedFrames.map((f) => makeListLoc(f).first().waitFor({ state: 'attached', timeout })));
+        } catch {
+          throw new Error(`Timed out after ${timeout}ms waiting for "${params.selector || params.text}" to become ${desiredState}.`);
         }
         return { ok: true, action, waitedFor: params.selector || params.text };
       }
 
-      try {
-        await Promise.any(scopedFrames.map((f) => makeLoc(f).waitFor({ state: desiredState, timeout })));
-      } catch {
+      const deadline = Date.now() + timeout;
+      let foundVisible = false;
+      while (Date.now() <= deadline) {
+        for (const f of scopedFrames) {
+          const list = makeListLoc(f);
+          const cnt = await list.count().catch(() => 0);
+          for (let i = 0; i < cnt; i++) {
+            if (await list.nth(i).isVisible().catch(() => false)) {
+              foundVisible = true;
+              break;
+            }
+          }
+          if (foundVisible) break;
+        }
+        if (foundVisible) break;
+        await page.waitForTimeout(50);
+      }
+      if (!foundVisible) {
         throw new Error(`Timed out after ${timeout}ms waiting for "${params.selector || params.text}" to become ${desiredState}.`);
       }
       return { ok: true, action, waitedFor: params.selector || params.text };
@@ -1669,17 +4343,428 @@ async function executeSingleAction(page, params = {}) {
     return { ok: true, action, ms };
   }
 
+  let target = null;
+  const markSafeElementOwnForm = (el) => {
+    if (!el || el.nodeType !== 1) return;
+    const win = el.ownerDocument?.defaultView || window;
+    const getSR = (node) => node?.shadowRoot || win.__tbmGetShadowRoot?.(node) || null;
+    const isShadowRoot = (r) => Boolean(r && r.nodeType === 11 && 'host' in r);
+    const closestComposed = (node, sel) => {
+      let cur = node;
+      while (cur) {
+        if (cur.nodeType === 1 && cur.matches?.(sel)) return cur;
+        const root = cur.getRootNode?.();
+        cur = cur.assignedSlot || cur.parentElement || (isShadowRoot(root) ? root.host : null);
+      }
+      return null;
+    };
+    const findShadowDescendant = (rootHost, sel) => {
+      const firstSr = getSR(rootHost);
+      if (!firstSr) return null;
+      const queue = [firstSr];
+      const seen = new Set();
+      while (queue.length > 0) {
+        const sr = queue.shift();
+        if (!sr || seen.has(sr)) continue;
+        seen.add(sr);
+        const match = sr.querySelector?.(sel);
+        if (match) return match;
+        if (sr.querySelectorAll) {
+          for (const child of sr.querySelectorAll('*')) {
+            if (getSR(child)) queue.push(getSR(child));
+          }
+        }
+      }
+      return null;
+    };
+    const lbl = closestComposed(el, 'label');
+    const base = (lbl && lbl.control) || el;
+    const shadowInnerBtn = findShadowDescendant(
+      base,
+      'button, input[type="submit"], input[type="button"], input[type="image"], [role="button"]'
+    );
+    const ownForm =
+      base.form ||
+      shadowInnerBtn?.form ||
+      closestComposed(base, 'form') ||
+      (shadowInnerBtn ? closestComposed(shadowInnerBtn, 'form') : null) ||
+      findShadowDescendant(base, 'form') ||
+      null;
+    if (ownForm && typeof ownForm === 'object') {
+      Object.defineProperty(ownForm, '__tbmAllowedSubmit', {
+        value: true,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      });
+    }
+  };
+
+  const withActionSubmitGuard = async (fn, frameOverride = null, allowSafe = false, safeTargetInfo = null) => {
+    const allFrames = !allowSubmit ? getAllFrames(page).map((f) => f.frame) : [];
+    const targetFrames =
+      !allowSubmit && frameOverride && !allFrames.includes(frameOverride)
+        ? [...allFrames, frameOverride]
+        : allFrames;
+    for (const tf of targetFrames) {
+      await tf
+        .evaluate(
+          ({ isAllowSafe, useActiveEl, submitSrc, safeSrc, dangerSrc }) => {
+            const win = window;
+            if (win.__tbmCleanupActGuard) win.__tbmCleanupActGuard();
+            Object.defineProperty(win, '__tbmSubmitGuardActive', {
+              value: (win.__tbmSubmitGuardActive || 0) + 1,
+              writable: true,
+              enumerable: false,
+              configurable: true,
+            });
+            Object.defineProperty(win, '__tbmAllowSafeForm', {
+              value: Boolean(isAllowSafe),
+              writable: true,
+              enumerable: false,
+              configurable: true,
+            });
+            const submitRe = new RegExp(submitSrc, 'iu');
+            const safeRe = new RegExp(safeSrc, 'iu');
+            const dangerRe = new RegExp(dangerSrc, 'iu');
+            const getSR = (node) => node?.shadowRoot || win.__tbmGetShadowRoot?.(node) || null;
+            const isShadowRoot = (r) => Boolean(r && r.nodeType === 11 && 'host' in r);
+            const closestComposed = (node, sel) => {
+              let cur = node;
+              while (cur) {
+                if (cur.nodeType === 1 && cur.matches?.(sel)) return cur;
+                const root = cur.getRootNode?.();
+                cur = cur.assignedSlot || cur.parentElement || (isShadowRoot(root) ? root.host : null);
+              }
+              return null;
+            };
+            const BLOCK_TAGS = new Set([
+              'DIV', 'P', 'LI', 'UL', 'OL', 'TR', 'TD', 'TH',
+              'SECTION', 'ARTICLE', 'HEADER', 'FOOTER', 'ASIDE', 'NAV',
+              'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'BLOCKQUOTE', 'PRE', 'BR',
+            ]);
+            const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'TITLE']);
+            const normLbl = (s) => (s || '').replace(/\s+/g, ' ').trim().normalize('NFC');
+            const extractAccessibleText = (rootNode, allowHidden = false) => {
+              if (!rootNode) return '';
+              const walkChildren = (nodes) => {
+                let out = '';
+                for (const c of nodes || []) {
+                  const piece = walk(c);
+                  if (!piece) continue;
+                  const cTag = c.nodeType === 1 ? (c.tagName || '').toUpperCase() : '';
+                  if (BLOCK_TAGS.has(cTag)) {
+                    out += (out && !/\s$/.test(out) ? ' ' : '') + piece + ' ';
+                  } else {
+                    out += piece;
+                  }
+                }
+                return out;
+              };
+              const walk = (n) => {
+                if (!n) return '';
+                if (n.nodeType === 3) return n.textContent || '';
+                if (n.nodeType !== 1 && n.nodeType !== 11) return '';
+                if (n.nodeType === 1) {
+                  const t = (n.tagName || '').toUpperCase();
+                  if (SKIP_TAGS.has(t)) return '';
+                  if (t === 'BR') return ' ';
+                  if (!allowHidden && n !== rootNode) {
+                    if (n.hasAttribute?.('hidden') || n.getAttribute?.('aria-hidden') === 'true') return '';
+                    try {
+                      const st = win.getComputedStyle(n);
+                      if (st.display === 'none' || st.visibility === 'hidden') return '';
+                    } catch {}
+                  }
+                  if (t === 'SLOT' && typeof n.assignedNodes === 'function') {
+                    const assigned = n.assignedNodes({ flatten: true });
+                    const list = assigned.length > 0 ? assigned : (n.childNodes || []);
+                    return walkChildren(list);
+                  }
+                  if (getSR(n)) {
+                    const srOut = walkChildren(getSR(n).childNodes);
+                    if (normLbl(srOut)) return srOut;
+                  }
+                }
+                return walkChildren(n.childNodes);
+              };
+              return walk(rootNode);
+            };
+            const resolveAriaLabelledBy = (node) => {
+              const lby = node?.getAttribute?.('aria-labelledby');
+              if (!lby) return '';
+              const rn = node.getRootNode?.();
+              return lby
+                .split(/\s+/)
+                .map((id) => {
+                  const refEl = (rn?.getElementById && rn.getElementById(id)) || win.document.getElementById(id);
+                  return extractAccessibleText(refEl, true) || refEl?.textContent || '';
+                })
+                .join(' ');
+            };
+            const isSafeSubmitter = (subEl) => {
+              if (!subEl || subEl.nodeType !== 1) return false;
+              const nTag = (subEl.tagName || '').toLowerCase();
+              const nType = (subEl.type || subEl.getAttribute?.('type') || '').toLowerCase();
+              const nRoot = subEl.getRootNode?.();
+              const nHost = isShadowRoot(nRoot) ? nRoot.host : null;
+              const cands = [
+                resolveAriaLabelledBy(subEl),
+                subEl.getAttribute?.('aria-label'),
+                nHost ? resolveAriaLabelledBy(nHost) : '',
+                nHost ? nHost.getAttribute?.('aria-label') : '',
+                extractAccessibleText(subEl),
+                extractAccessibleText(getSR(subEl)),
+                nHost ? extractAccessibleText(nHost) : '',
+                nTag === 'input' && nType !== 'checkbox' && nType !== 'radio' ? subEl.value : '',
+                subEl.getAttribute?.('alt'),
+                subEl.querySelector?.('[alt]')?.getAttribute?.('alt'),
+                subEl.querySelector?.('[aria-label]')?.getAttribute?.('aria-label'),
+                subEl.querySelector?.('svg title')?.textContent,
+                subEl.getAttribute?.('title'),
+                nHost ? nHost.getAttribute?.('title') : '',
+                subEl.labels && subEl.labels.length > 0 ? [...subEl.labels].map((l) => extractAccessibleText(l)).join(' ') : '',
+                extractAccessibleText(closestComposed(subEl, 'label')),
+              ];
+              let raw = '';
+              for (const c of cands) {
+                const n = normLbl(c);
+                if (!n) continue;
+                if (!raw) raw = n;
+                if (/[\p{L}\p{N}]/u.test(n)) {
+                  raw = n;
+                  break;
+                }
+              }
+              const clean = raw.replace(/^[^\p{L}\p{N}]+/u, '').trim();
+              if (!clean) return false;
+              return safeRe.test(clean) && !dangerRe.test(clean) && !submitRe.test(clean);
+            };
+            Object.defineProperty(win, '__tbmIsSafeSubmitter', {
+              value: isSafeSubmitter,
+              writable: true,
+              enumerable: false,
+              configurable: true,
+            });
+            if (typeof win.__tbmInstallFormGuard === 'function') {
+              win.__tbmInstallFormGuard(win);
+            }
+            const origSub = win.HTMLFormElement?.prototype?.submit;
+            const origReqSub = win.HTMLFormElement?.prototype?.requestSubmit;
+            const hasProxySub = Boolean(origSub?.__tbmProxy);
+            const hasProxyReqSub = Boolean(origReqSub?.__tbmProxy);
+            const origAttachShadow = win.Element?.prototype?.attachShadow;
+            const guardSub = (e) => {
+              if (
+                win.__tbmAllowSafeForm &&
+                e.target &&
+                e.target.__tbmAllowedSubmit === true &&
+                (!e.submitter || isSafeSubmitter(e.submitter))
+              ) {
+                return;
+              }
+              e.preventDefault();
+              e.stopImmediatePropagation();
+            };
+            const guardedRoots = new Set();
+            const attachToRoot = (root) => {
+              if (!root || guardedRoots.has(root)) return;
+              guardedRoots.add(root);
+              root.addEventListener?.('submit', guardSub, true);
+              if (root.querySelectorAll) {
+                for (const f of root.querySelectorAll('form')) {
+                  delete f.__tbmAllowedSubmit;
+                }
+                for (const el of root.querySelectorAll('*')) {
+                  const sr = el.shadowRoot || win.__tbmGetShadowRoot?.(el);
+                  if (sr) attachToRoot(sr);
+                }
+              }
+            };
+            win.addEventListener('submit', guardSub, true);
+            attachToRoot(document);
+            for (const sr of win.__tbmGetAllShadowRoots?.() || []) {
+              attachToRoot(sr);
+            }
+            if (isAllowSafe && useActiveEl) {
+              const findShadowDescendant = (rootHost, sel) => {
+                const firstSr = getSR(rootHost);
+                if (!firstSr) return null;
+                const queue = [firstSr];
+                const seen = new Set();
+                while (queue.length > 0) {
+                  const sr = queue.shift();
+                  if (!sr || seen.has(sr)) continue;
+                  seen.add(sr);
+                  const match = sr.querySelector?.(sel);
+                  if (match) return match;
+                  if (sr.querySelectorAll) {
+                    for (const child of sr.querySelectorAll('*')) {
+                      if (getSR(child)) queue.push(getSR(child));
+                    }
+                  }
+                }
+                return null;
+              };
+              let active = document.activeElement;
+              while (active && getSR(active) && getSR(active).activeElement) {
+                active = getSR(active).activeElement;
+              }
+              if (active && active.nodeType === 1) {
+                const lbl = closestComposed(active, 'label');
+                const base = (lbl && lbl.control) || active;
+                const shadowInnerBtn = findShadowDescendant(
+                  base,
+                  'button, input[type="submit"], input[type="button"], input[type="image"], [role="button"]'
+                );
+                const ownForm =
+                  base.form ||
+                  shadowInnerBtn?.form ||
+                  closestComposed(base, 'form') ||
+                  (shadowInnerBtn ? closestComposed(shadowInnerBtn, 'form') : null) ||
+                  findShadowDescendant(base, 'form') ||
+                  null;
+                if (ownForm && typeof ownForm === 'object') {
+                  Object.defineProperty(ownForm, '__tbmAllowedSubmit', {
+                    value: true,
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                  });
+                }
+              }
+            }
+            if (win.HTMLFormElement?.prototype) {
+              if (!hasProxySub) {
+                win.HTMLFormElement.prototype.submit = function () {
+                  if (win.__tbmAllowSafeForm && this && this.__tbmAllowedSubmit === true && origSub) {
+                    return origSub.apply(this, arguments);
+                  }
+                };
+              }
+              if (typeof origReqSub === 'function' && !hasProxyReqSub) {
+                win.HTMLFormElement.prototype.requestSubmit = function () {
+                  if (win.__tbmAllowSafeForm && this && this.__tbmAllowedSubmit === true) {
+                    if (arguments.length > 0 && arguments[0] !== undefined && arguments[0] !== null) {
+                      if (!isSafeSubmitter(arguments[0])) return;
+                    }
+                    return origReqSub.apply(this, arguments);
+                  }
+                };
+              }
+            }
+            if (win.Element?.prototype && typeof origAttachShadow === 'function') {
+              win.Element.prototype.attachShadow = function (init) {
+                const sr = origAttachShadow.call(this, init);
+                attachToRoot(sr);
+                return sr;
+              };
+            }
+            Object.defineProperty(win, '__tbmCleanupActGuard', {
+              value: () => {
+                Object.defineProperty(win, '__tbmSubmitGuardActive', {
+                  value: Math.max(0, (win.__tbmSubmitGuardActive || 1) - 1),
+                  writable: true,
+                  enumerable: false,
+                  configurable: true,
+                });
+                Object.defineProperty(win, '__tbmAllowSafeForm', {
+                  value: false,
+                  writable: true,
+                  enumerable: false,
+                  configurable: true,
+                });
+                delete win.__tbmIsSafeSubmitter;
+                win.removeEventListener('submit', guardSub, true);
+                for (const r of guardedRoots) {
+                  r.removeEventListener?.('submit', guardSub, true);
+                  if (r.querySelectorAll) {
+                    for (const f of r.querySelectorAll('form')) {
+                      delete f.__tbmAllowedSubmit;
+                    }
+                  }
+                }
+                guardedRoots.clear();
+                if (win.HTMLFormElement?.prototype) {
+                  if (origSub && !hasProxySub) win.HTMLFormElement.prototype.submit = origSub;
+                  if (origReqSub && !hasProxyReqSub) win.HTMLFormElement.prototype.requestSubmit = origReqSub;
+                }
+                if (win.Element?.prototype && origAttachShadow) {
+                  win.Element.prototype.attachShadow = origAttachShadow;
+                }
+                delete win.__tbmCleanupActGuard;
+              },
+              writable: true,
+              enumerable: false,
+              configurable: true,
+            });
+          },
+          {
+            isAllowSafe: Boolean(allowSafe),
+            useActiveEl: Boolean(safeTargetInfo?.useActiveElement),
+            submitSrc: SUBMIT_LABEL_RE.source,
+            safeSrc: SAFE_SUBMIT_TYPE_RE.source,
+            dangerSrc: COMPOUND_DANGER_RE.source,
+          }
+        )
+        .catch(() => {});
+    }
+    if (!allowSubmit && allowSafe && safeTargetInfo) {
+      if (safeTargetInfo.locator) {
+        await safeTargetInfo.locator.evaluate(markSafeElementOwnForm).catch(() => {});
+      }
+      if (safeTargetInfo.coords) {
+        const h = await getDeepElementHandleAtPoint(page, safeTargetInfo.coords.x, safeTargetInfo.coords.y, true);
+        try {
+          await h.evaluate(markSafeElementOwnForm).catch(() => {});
+        } finally {
+          await h.dispose().catch(() => {});
+        }
+      }
+    }
+    try {
+      return await fn();
+    } finally {
+      for (const tf of targetFrames) {
+        await tf
+          .evaluate(async () => {
+            await Promise.resolve();
+            await new Promise((r) => setTimeout(r, 0));
+            if (window.__tbmCleanupActGuard) window.__tbmCleanupActGuard();
+          })
+          .catch(() => {});
+      }
+    }
+  };
+
   if (action === 'press') {
     if (!params.key) throw new Error('press action requires key.');
     const rawKey = String(params.key);
-    const keyStr = rawKey.trim() || rawKey;
-    const isEnter = /(^|\+)(numpad)?enter$/i.test(keyStr);
-    const isSpace = /^(space|spacebar| )$/i.test(keyStr) || rawKey === ' ';
+    const keyParts = rawKey.split('+');
+    const isEnterPart = (p) => {
+      const t = p.trim();
+      return /^(numpad)?enter$/i.test(t) || /^return$/i.test(t) || p === '\n' || p === '\r' || p === '\r\n';
+    };
+    const isSpacePart = (p) => {
+      const t = p.trim();
+      return /^(space|spacebar)$/i.test(t) || p === ' ';
+    };
+    const isEnter =
+      keyParts.some(isEnterPart) ||
+      rawKey === '\n' ||
+      rawKey === '\r' ||
+      rawKey === '\r\n';
+    const isSpace =
+      keyParts.some(isSpacePart) ||
+      rawKey === ' ';
+    const hasCtrlOrMeta = keyParts.some((p) => /^(control|ctrl|meta|command|cmd|controlormeta)$/i.test(p.trim()));
     if (params.ref || params.selector || params.text) {
-      const target = await resolveTarget(page, params);
+      target = await resolveTarget(page, params);
+      let isSafeTargetPress = false;
+      let isSafeActivePress = false;
       if ((isEnter || isSpace) && !allowSubmit) {
         const meta = isEnter
-          ? await isEnterSubmitTarget(page, target.locator)
+          ? await isEnterSubmitTarget(page, target.locator, { hasCtrlOrMeta })
           : await isSubmitLikeElement(target.locator);
         if (meta.isSubmit) {
           return {
@@ -1690,12 +4775,187 @@ async function executeSingleAction(page, params = {}) {
             reason: `Submit guard: allowSubmit=false blocks pressing ${params.key} (${meta.reason}).`,
           };
         }
+        isSafeTargetPress = Boolean(meta.isSafeSubmit);
+        const isNonFocusable = await target.locator
+          .evaluate((el) => {
+            if (!el) return true;
+            const isDisabledByFieldset = (node) => {
+              let cur = node;
+              while (cur && cur.nodeType === 1) {
+                const parent = cur.parentElement;
+                if (parent && parent.tagName === 'FIELDSET' && parent.disabled) {
+                  const firstLegend = [...parent.children].find((c) => c.tagName === 'LEGEND');
+                  if (!firstLegend || cur !== firstLegend) return true;
+                }
+                const rn = cur.getRootNode?.();
+                cur = parent || (rn instanceof ShadowRoot ? rn.host : null);
+              }
+              return false;
+            };
+            if (
+              el.disabled ||
+              Boolean(el.matches?.(':disabled')) ||
+              isDisabledByFieldset(el) ||
+              el.getAttribute?.('aria-disabled') === 'true'
+            ) {
+              return true;
+            }
+            if (
+              typeof el.checkVisibility === 'function' &&
+              el.checkVisibility({ visibilityProperty: true, opacityProperty: false }) === false
+            ) {
+              return true;
+            }
+            let cur = el;
+            while (cur && cur.nodeType === 1) {
+              if (cur.hasAttribute('hidden') || cur.hasAttribute('inert') || Boolean(cur.inert)) {
+                return true;
+              }
+              const parent = cur.parentElement;
+              if (parent && parent.tagName === 'DETAILS' && !parent.open) {
+                const firstSummary = [...parent.children].find((c) => c.tagName === 'SUMMARY');
+                if (!firstSummary || cur !== firstSummary) {
+                  return true;
+                }
+              }
+              try {
+                const st = getComputedStyle(cur);
+                if (
+                  st.display === 'none' ||
+                  st.visibility === 'hidden' ||
+                  st.visibility === 'collapse' ||
+                  st.contentVisibility === 'hidden'
+                ) {
+                  return true;
+                }
+              } catch {
+                // ignore
+              }
+              const rn = cur.getRootNode?.();
+              cur = parent || (rn instanceof ShadowRoot ? rn.host : null);
+            }
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return true;
+            if (el.isContentEditable) return false;
+            const isElementFocusableAndVisible = (node) => {
+              if (!node || node.nodeType !== 1) return false;
+              if (
+                node.disabled ||
+                Boolean(node.matches?.(':disabled')) ||
+                isDisabledByFieldset(node) ||
+                node.getAttribute?.('aria-disabled') === 'true'
+              ) {
+                return false;
+              }
+              if (
+                typeof node.checkVisibility === 'function' &&
+                node.checkVisibility({ visibilityProperty: true, opacityProperty: false }) === false
+              ) {
+                return false;
+              }
+              let c = node;
+              while (c && c.nodeType === 1) {
+                if (c.hasAttribute('hidden') || c.hasAttribute('inert') || Boolean(c.inert)) return false;
+                const p = c.parentElement;
+                if (p && p.tagName === 'DETAILS' && !p.open) {
+                  const firstSummary = [...p.children].find((ch) => ch.tagName === 'SUMMARY');
+                  if (!firstSummary || c !== firstSummary) return false;
+                }
+                try {
+                  const st = getComputedStyle(c);
+                  if (
+                    st.display === 'none' ||
+                    st.visibility === 'hidden' ||
+                    st.visibility === 'collapse' ||
+                    st.contentVisibility === 'hidden'
+                  ) {
+                    return false;
+                  }
+                } catch {}
+                const rn = c.getRootNode?.();
+                c = p || (rn instanceof ShadowRoot ? rn.host : null);
+              }
+              const nr = node.getBoundingClientRect();
+              return nr.width > 0 && nr.height > 0;
+            };
+            const getSR = (node) => node?.shadowRoot || window.__tbmGetShadowRoot?.(node) || null;
+            const resolveDelegatedFocus = (host) => {
+              let curHost = host;
+              const seen = new Set();
+              while (getSR(curHost)?.delegatesFocus && !seen.has(curHost)) {
+                seen.add(curHost);
+                const candidates = getSR(curHost).querySelectorAll('*');
+                let next = null;
+                for (const cand of candidates) {
+                  if (!isElementFocusableAndVisible(cand)) continue;
+                  if (getSR(cand)?.delegatesFocus) {
+                    const inner = resolveDelegatedFocus(cand);
+                    if (inner) {
+                      next = inner;
+                      break;
+                    }
+                    continue;
+                  }
+                  const rawCandTab = cand.getAttribute('tabindex');
+                  const hasCandTab = rawCandTab !== null && /^\s*[+-]?\d+\s*$/.test(rawCandTab) && Number(rawCandTab) >= 0;
+                  if (
+                    cand.isContentEditable ||
+                    hasCandTab ||
+                    (cand.matches?.('input:not([type="hidden"]), select, textarea, button, a[href], area[href], summary') && cand.tabIndex >= 0)
+                  ) {
+                    next = cand;
+                    break;
+                  }
+                }
+                if (!next) return null;
+                curHost = next;
+              }
+              return curHost !== host ? curHost : null;
+            };
+            if (getSR(el)?.delegatesFocus) {
+              if (resolveDelegatedFocus(el)) return false;
+              const rawHostTab = el.getAttribute('tabindex');
+              const hasHostTab = rawHostTab !== null && /^\s*[+-]?\d+\s*$/.test(rawHostTab) && Number(rawHostTab) >= 0;
+              return !hasHostTab;
+            }
+            const rawTab = el.getAttribute('tabindex');
+            const hasValidTab = rawTab !== null && /^\s*[+-]?\d+\s*$/.test(rawTab);
+            if (el.matches?.('input, select, textarea, button, a[href], area[href], summary, iframe')) {
+              return el.tabIndex < 0 && !hasValidTab;
+            }
+            if (hasValidTab) return false;
+            return el.tabIndex < 0;
+          })
+          .catch(() => true);
+        if (isNonFocusable) {
+          const activeMeta = await isEnterSubmitTarget(page, null, { hasCtrlOrMeta });
+          if (activeMeta.isSubmit && (isEnter || activeMeta.reason !== 'implicit-form-enter')) {
+            return {
+              ok: false,
+              blocked: true,
+              action,
+              label: activeMeta.label,
+              reason: `Submit guard: allowSubmit=false blocks pressing ${params.key} (${activeMeta.reason}).`,
+            };
+          }
+          if (activeMeta.isSafeSubmit) isSafeActivePress = true;
+        }
       }
-      await target.locator.press(params.key, { timeout });
+      const isSafePress = isSafeTargetPress || isSafeActivePress;
+      await withActionSubmitGuard(
+        () => target.locator.press(params.key, { timeout }),
+        target.frame,
+        isSafePress,
+        {
+          locator: isSafeTargetPress ? target.locator : null,
+          useActiveElement: isSafeActivePress,
+        },
+      );
       return { ok: true, action, key: params.key };
     }
+    let isSafePress = false;
     if ((isEnter || isSpace) && !allowSubmit) {
-      const meta = await isEnterSubmitTarget(page, null);
+      const meta = await isEnterSubmitTarget(page, null, { hasCtrlOrMeta });
       if (meta.isSubmit && (isEnter || meta.reason !== 'implicit-form-enter')) {
         return {
           ok: false,
@@ -1705,8 +4965,14 @@ async function executeSingleAction(page, params = {}) {
           reason: `Submit guard: allowSubmit=false blocks pressing ${params.key} (${meta.reason}).`,
         };
       }
+      isSafePress = Boolean(meta.isSafeSubmit);
     }
-    await page.keyboard.press(params.key);
+    await withActionSubmitGuard(
+      () => page.keyboard.press(params.key),
+      null,
+      isSafePress,
+      { useActiveElement: isSafePress },
+    );
     return { ok: true, action, key: params.key };
   }
 
@@ -1727,6 +4993,7 @@ async function executeSingleAction(page, params = {}) {
     const px = Number(params.x);
     const py = Number(params.y);
     if (action === 'click' || action === 'dblclick') {
+      let isSafeClick = false;
       if (!allowSubmit) {
         const meta = await isSubmitAtPoint(page, px, py);
         if (meta.isSubmit) {
@@ -1740,24 +5007,34 @@ async function executeSingleAction(page, params = {}) {
             reason: `Submit guard: blocked ${action} at (${px}, ${py}) on "${meta.label}" (${meta.reason}) because allowSubmit=false.`,
           };
         }
+        isSafeClick = Boolean(meta.isSafeSubmit);
       }
-      await withModifiers(page, modifiers, async () => {
-        await page.mouse.click(px, py, { button, clickCount: action === 'dblclick' ? 2 : 1 });
-      });
+      await withActionSubmitGuard(
+        () =>
+          withModifiers(page, modifiers, async () => {
+            await page.mouse.click(px, py, { button, clickCount: action === 'dblclick' ? 2 : 1 });
+          }),
+        null,
+        isSafeClick,
+        isSafeClick ? { coords: { x: px, y: py } } : null,
+      );
       return { ok: true, action, x: px, y: py, button, modifiers };
     }
     if (action === 'hover') {
-      await withModifiers(page, modifiers, async () => {
-        await page.mouse.move(px, py);
-      });
+      await withActionSubmitGuard(() =>
+        withModifiers(page, modifiers, async () => {
+          await page.mouse.move(px, py);
+        })
+      );
       return { ok: true, action, x: px, y: py, modifiers };
     }
     if (action === 'drop') {
-      const handle = await page.evaluateHandle(([cx, cy]) => document.elementFromPoint(cx, cy), [px, py]);
+      const handle = await getDeepElementHandleAtPoint(page, px, py, false);
       try {
         const empty = await handle.evaluate((el) => !el).catch(() => true);
         if (empty) throw new Error(`No element found at drop coordinates (${px}, ${py}).`);
-        const info = await performDropAction(handle, params);
+        const ownerFrame = (await handle.ownerFrame?.().catch(() => null)) || page.mainFrame();
+        const info = await withActionSubmitGuard(() => performDropAction(handle, params), ownerFrame);
         return { ok: true, action, x: px, y: py, ...info };
       } finally {
         await handle.dispose().catch(() => {});
@@ -1765,7 +5042,9 @@ async function executeSingleAction(page, params = {}) {
     }
   }
 
-  const target = await resolveTarget(page, params);
+  target = await resolveTarget(page, params, {
+    allowHidden: action === 'upload',
+  });
   const { locator, frameIdx } = target;
 
   if (action === 'drag') {
@@ -1775,16 +5054,49 @@ async function executeSingleAction(page, params = {}) {
       text: params.targetText,
       frameIdx: params.targetFrameIdx,
     });
-    await locator.dragTo(dest.locator, { timeout });
+    if (!allowSubmit) {
+      for (const [which, loc] of [['source', locator], ['target', dest.locator]]) {
+        const meta = await isSubmitLikeElement(loc);
+        if (meta.isSubmit) {
+          return {
+            ok: false,
+            blocked: true,
+            action,
+            frameIdx,
+            label: meta.label,
+            reason: `Submit guard: blocked drag (${which}) on "${meta.label}" (${meta.reason}) because allowSubmit=false.`,
+          };
+        }
+        await loc.scrollIntoViewIfNeeded({ timeout }).catch(() => {});
+        const box = await loc.boundingBox().catch(() => null);
+        if (box && box.width > 0 && box.height > 0) {
+          const ptMeta = await isSubmitAtPoint(page, box.x + box.width / 2, box.y + box.height / 2);
+          if (ptMeta.isSubmit) {
+            return {
+              ok: false,
+              blocked: true,
+              action,
+              frameIdx,
+              label: ptMeta.label,
+              reason: `Submit guard: blocked drag (${which}) on "${ptMeta.label}" (${ptMeta.reason}) because allowSubmit=false.`,
+            };
+          }
+        }
+      }
+    }
+    await withActionSubmitGuard(() => locator.dragTo(dest.locator, { timeout }));
     return { ok: true, action, frameIdx, targetFrameIdx: dest.frameIdx };
   }
 
   if (action === 'drop') {
-    const info = await performDropAction(locator, params);
+    const info = await withActionSubmitGuard(() => performDropAction(locator, params));
     return { ok: true, action, frameIdx, ...info };
   }
 
   if (action === 'click' || action === 'dblclick') {
+    let isSafeLocatorClick = false;
+    let isSafePointClick = false;
+    let safePointCoords = null;
     if (!allowSubmit) {
       const meta = await isSubmitLikeElement(locator);
       if (meta.isSubmit) {
@@ -1797,15 +5109,51 @@ async function executeSingleAction(page, params = {}) {
           reason: `Submit guard: blocked ${action} on "${meta.label}" (${meta.reason}) because allowSubmit=false.`,
         };
       }
+      isSafeLocatorClick = Boolean(meta.isSafeSubmit);
+      await locator.scrollIntoViewIfNeeded({ timeout }).catch(() => {});
+      const box = await locator.boundingBox().catch(() => null);
+      if (box && box.width > 0 && box.height > 0) {
+        const vpX = box.x + (hasCoords ? Number(params.x) : box.width / 2);
+        const vpY = box.y + (hasCoords ? Number(params.y) : box.height / 2);
+        const ptMeta = await isSubmitAtPoint(page, vpX, vpY);
+        if (ptMeta.isSubmit) {
+          return {
+            ok: false,
+            blocked: true,
+            action,
+            frameIdx,
+            ...(hasCoords ? { x: Number(params.x), y: Number(params.y) } : {}),
+            label: ptMeta.label,
+            reason: `Submit guard: blocked ${action} on "${ptMeta.label}" (${ptMeta.reason}) because allowSubmit=false.`,
+          };
+        }
+        if (ptMeta.isSafeSubmit) {
+          isSafePointClick = true;
+          safePointCoords = { x: vpX, y: vpY };
+        }
+      }
     }
+    const isSafeClick = isSafeLocatorClick || isSafePointClick;
     const clickOpts = {
       timeout,
       button,
       ...(modifiers.length ? { modifiers } : {}),
       ...(hasCoords ? { position: { x: Number(params.x), y: Number(params.y) } } : {}),
     };
-    if (action === 'dblclick') await locator.dblclick(clickOpts);
-    else await locator.click(clickOpts);
+    await withActionSubmitGuard(
+      async () => {
+        if (action === 'dblclick') await locator.dblclick(clickOpts);
+        else await locator.click(clickOpts);
+      },
+      target.frame,
+      isSafeClick,
+      isSafeClick
+        ? {
+            locator: isSafeLocatorClick ? locator : null,
+            coords: isSafePointClick ? safePointCoords : null,
+          }
+        : null,
+    );
     return { ok: true, action, frameIdx, button, ...(modifiers.length ? { modifiers } : {}) };
   }
 
@@ -1815,61 +5163,152 @@ async function executeSingleAction(page, params = {}) {
       ...(modifiers.length ? { modifiers } : {}),
       ...(hasCoords ? { position: { x: Number(params.x), y: Number(params.y) } } : {}),
     };
-    await locator.hover(hoverOpts);
+    await withActionSubmitGuard(() => locator.hover(hoverOpts), target.frame);
     return { ok: true, action, frameIdx, ...(modifiers.length ? { modifiers } : {}) };
   }
 
   if (action === 'focus') {
-    await locator.focus({ timeout });
+    await withActionSubmitGuard(() => locator.focus({ timeout }), target.frame);
     return { ok: true, action, frameIdx };
   }
 
   if (action === 'clear') {
-    await locator.fill('', { timeout });
+    await withActionSubmitGuard(() => locator.fill('', { timeout }));
     return { ok: true, action, frameIdx };
   }
 
   if (action === 'fill') {
     const val = String(params.value ?? '');
-    await locator.fill(val, { timeout });
+    await withActionSubmitGuard(() => locator.fill(val, { timeout }));
     return { ok: true, action, frameIdx, length: val.length };
   }
 
   if (action === 'type') {
     const val = String(params.value ?? '');
-    if (!allowSubmit && (params.submit || /[\r\n]/.test(val))) {
-      if (params.submit) {
+    if (!allowSubmit) {
+      const selfMeta = await isSubmitLikeElement(locator);
+      if (selfMeta.isSubmit) {
         return {
           ok: false,
           blocked: true,
           action,
           frameIdx,
-          reason: 'Submit guard: blocked type with submit=true because allowSubmit=false.',
+          label: selfMeta.label,
+          reason: `Submit guard: blocked type on "${selfMeta.label}" (${selfMeta.reason}) because allowSubmit=false.`,
         };
       }
-      const isMultiline = await locator
-        .evaluate((el) => el.tagName === 'TEXTAREA' || Boolean(el.isContentEditable))
-        .catch(() => false);
-      if (!isMultiline) {
-        const meta = await isEnterSubmitTarget(page, locator);
-        if (meta.isSubmit) {
+      if (params.submit || /[\r\n]/.test(val)) {
+        if (params.submit) {
           return {
             ok: false,
             blocked: true,
             action,
             frameIdx,
-            label: meta.label,
-            reason: `Submit guard: blocked type containing newline on "${meta.label}" (${meta.reason}) because allowSubmit=false.`,
+            reason: 'Submit guard: blocked type with submit=true because allowSubmit=false.',
           };
+        }
+        const isMultiline = await locator
+          .evaluate((el) => el.tagName === 'TEXTAREA' || Boolean(el.isContentEditable))
+          .catch(() => false);
+        if (!isMultiline) {
+          let meta = await isEnterSubmitTarget(page, locator);
+          if (!meta.isSubmit) {
+            const innerInput = locator
+              .locator('input:not([type="hidden"]):not([type="button"]):not([type="reset"]):not([type="file"])')
+              .first();
+            if ((await innerInput.count().catch(() => 0)) > 0) {
+              meta = await isEnterSubmitTarget(page, innerInput);
+            }
+          }
+          if (!meta.isSubmit) {
+            let ctrlHandle = null;
+            try {
+              ctrlHandle = await locator.evaluateHandle((el) => {
+                const lbl = el.tagName === 'LABEL' ? el : el.closest?.('label');
+                return lbl?.control || null;
+              });
+              const hasCtrl = await ctrlHandle.evaluate((c) => Boolean(c)).catch(() => false);
+              if (hasCtrl) {
+                meta = await ctrlHandle.evaluate(checkEnterSubmitInBrowser, {
+                  submit: SUBMIT_LABEL_RE.source,
+                  safe: SAFE_SUBMIT_TYPE_RE.source,
+                  danger: COMPOUND_DANGER_RE.source,
+                });
+              }
+            } catch {
+              // Ignore non-label or detached elements.
+            } finally {
+              await ctrlHandle?.dispose().catch(() => {});
+            }
+          }
+          if (meta.isSubmit) {
+            return {
+              ok: false,
+              blocked: true,
+              action,
+              frameIdx,
+              label: meta.label,
+              reason: `Submit guard: blocked type containing newline on "${meta.label}" (${meta.reason}) because allowSubmit=false.`,
+            };
+          }
         }
       }
     }
     if (params.slowly === false && !params.delayMs) {
-      await locator.fill(val, { timeout });
+      await withActionSubmitGuard(() => locator.fill(val, { timeout }));
     } else {
+      if (!allowSubmit) {
+        await locator.scrollIntoViewIfNeeded({ timeout }).catch(() => {});
+        const box = await locator.boundingBox().catch(() => null);
+        if (box && box.width > 0 && box.height > 0) {
+          const ptMeta = await isSubmitAtPoint(page, box.x + box.width / 2, box.y + box.height / 2);
+          if (ptMeta.isSubmit) {
+            return {
+              ok: false,
+              blocked: true,
+              action,
+              frameIdx,
+              label: ptMeta.label,
+              reason: `Submit guard: blocked type on "${ptMeta.label}" (${ptMeta.reason}) because allowSubmit=false.`,
+            };
+          }
+        }
+      }
       const delay = params.delayMs !== undefined ? Number(params.delayMs) || 0 : (params.slowly ? 35 : 0);
-      await locator.click({ timeout });
-      await page.keyboard.type(val, { delay });
+      await withActionSubmitGuard(() => locator.click({ timeout }), target.frame);
+      let isSafeTypeEnter = false;
+      if (!allowSubmit && /[\r\n]/.test(val)) {
+        const isActiveMultiline = await page
+          .evaluate(() => {
+            const getSR = (node) => node?.shadowRoot || window.__tbmGetShadowRoot?.(node) || null;
+            let active = document.activeElement;
+            while (active && getSR(active) && getSR(active).activeElement) {
+              active = getSR(active).activeElement;
+            }
+            return Boolean(active && (active.tagName === 'TEXTAREA' || active.isContentEditable));
+          })
+          .catch(() => false);
+        if (!isActiveMultiline) {
+          const activeMeta = await isEnterSubmitTarget(page, null);
+          if (activeMeta.isSubmit) {
+            return {
+              ok: false,
+              blocked: true,
+              action,
+              frameIdx,
+              label: activeMeta.label,
+              reason: `Submit guard: blocked type containing newline on "${activeMeta.label}" (${activeMeta.reason}) because allowSubmit=false.`,
+            };
+          }
+          isSafeTypeEnter = Boolean(activeMeta.isSafeSubmit);
+        }
+      }
+      await withActionSubmitGuard(
+        () => page.keyboard.type(val, { delay }),
+        target.frame,
+        isSafeTypeEnter,
+        isSafeTypeEnter ? { useActiveElement: true } : null,
+      );
     }
     if (params.submit) {
       await page.keyboard.press('Enter');
@@ -1886,31 +5325,66 @@ async function executeSingleAction(page, params = {}) {
     } else {
       spec = params.label ? { label: String(params.label) } : String(raw);
     }
-    const chosen = await locator.selectOption(spec, { timeout });
+    const chosen = await withActionSubmitGuard(() => locator.selectOption(spec, { timeout }));
     return { ok: true, action, frameIdx, chosen };
   }
 
   if (action === 'check' || action === 'uncheck') {
+    if (!allowSubmit) {
+      const meta = await isSubmitLikeElement(locator);
+      if (meta.isSubmit) {
+        return {
+          ok: false,
+          blocked: true,
+          action,
+          frameIdx,
+          label: meta.label,
+          reason: `Submit guard: blocked ${action} on "${meta.label}" (${meta.reason}) because allowSubmit=false.`,
+        };
+      }
+      await locator.scrollIntoViewIfNeeded({ timeout }).catch(() => {});
+      const box = await locator.boundingBox().catch(() => null);
+      if (box && box.width > 0 && box.height > 0) {
+        const ptMeta = await isSubmitAtPoint(page, box.x + box.width / 2, box.y + box.height / 2);
+        if (ptMeta.isSubmit) {
+          return {
+            ok: false,
+            blocked: true,
+            action,
+            frameIdx,
+            label: ptMeta.label,
+            reason: `Submit guard: blocked ${action} on "${ptMeta.label}" (${ptMeta.reason}) because allowSubmit=false.`,
+          };
+        }
+      }
+    }
     const wantChecked = action === 'check';
     const roleInfo = await locator.evaluate((el) => ({
       role: (el.getAttribute('role') || '').toLowerCase(),
       ariaChecked: el.getAttribute('aria-checked'),
     })).catch(() => ({ role: '', ariaChecked: null }));
 
-    if (roleInfo.role === 'switch' || roleInfo.role === 'checkbox' || roleInfo.role === 'radio') {
-      if ((roleInfo.ariaChecked === 'true') !== wantChecked) {
-        await locator.click({ timeout });
+    await withActionSubmitGuard(async () => {
+      if (roleInfo.role === 'switch' || roleInfo.role === 'checkbox' || roleInfo.role === 'radio') {
+        if ((roleInfo.ariaChecked === 'true') !== wantChecked) {
+          await locator.click({ timeout });
+        }
+      } else if (wantChecked) {
+        await locator.check({ timeout });
+      } else {
+        await locator.uncheck({ timeout });
       }
-    } else if (wantChecked) {
-      await locator.check({ timeout });
-    } else {
-      await locator.uncheck({ timeout });
-    }
+    });
     return { ok: true, action, frameIdx };
   }
 
   if (action === 'upload') {
-    const raw = params.files || (params.file ? [params.file] : null);
+    const raw =
+      Array.isArray(params.files) && params.files.length > 0
+        ? params.files
+        : params.file
+          ? [params.file]
+          : null;
     if (!raw || raw.length === 0) throw new Error('upload action requires file or files path.');
     const paths = raw.map((p) => path.resolve(String(p)));
     for (const p of paths) {
@@ -1918,7 +5392,7 @@ async function executeSingleAction(page, params = {}) {
     }
     const isFileInput = await locator.evaluate((el) => el.tagName === 'INPUT' && el.type === 'file');
     if (isFileInput) {
-      await locator.setInputFiles(paths);
+      await withActionSubmitGuard(() => locator.setInputFiles(paths));
     } else {
       if (!allowSubmit) {
         const meta = await isSubmitLikeElement(locator);
@@ -1932,12 +5406,29 @@ async function executeSingleAction(page, params = {}) {
             reason: `Submit guard: blocked upload click on "${meta.label}" (${meta.reason}) because allowSubmit=false.`,
           };
         }
+        await locator.scrollIntoViewIfNeeded({ timeout }).catch(() => {});
+        const box = await locator.boundingBox().catch(() => null);
+        if (box && box.width > 0 && box.height > 0) {
+          const ptMeta = await isSubmitAtPoint(page, box.x + box.width / 2, box.y + box.height / 2);
+          if (ptMeta.isSubmit) {
+            return {
+              ok: false,
+              blocked: true,
+              action,
+              frameIdx,
+              label: ptMeta.label,
+              reason: `Submit guard: blocked upload click on "${ptMeta.label}" (${ptMeta.reason}) because allowSubmit=false.`,
+            };
+          }
+        }
       }
-      const [chooser] = await Promise.all([
-        page.waitForEvent('filechooser', { timeout }),
-        locator.click({ timeout }),
-      ]);
-      await chooser.setFiles(paths);
+      await withActionSubmitGuard(async () => {
+        const [chooser] = await Promise.all([
+          page.waitForEvent('filechooser', { timeout }),
+          locator.click({ timeout }),
+        ]);
+        await chooser.setFiles(paths);
+      });
     }
     return { ok: true, action, frameIdx, files: paths.map((p) => path.basename(p)) };
   }
@@ -1969,19 +5460,30 @@ export async function actFast(page, params = {}, previousLinesSet = null) {
  */
 export async function batchActions(page, steps = [], options = {}, previousLinesSet = null) {
   const t0 = Date.now();
+  const stepList = Array.isArray(steps) ? steps : [];
   const continueOnError = Boolean(options.continueOnError);
   const defaultAllowSubmit = resolveAllowSubmit(options.allowSubmit);
   const results = [];
 
-  for (let i = 0; i < steps.length; i++) {
-    const step = steps[i];
+  for (let i = 0; i < stepList.length; i++) {
+    const step = stepList[i];
     try {
       if (!step || typeof step !== 'object') {
         throw new Error('Invalid batch step: expected an action object.');
       }
       let stepResult;
       if (step.action === 'smart_fill_form' || step.action === 'fill_form') {
-        stepResult = await smartFillForm(page, step, previousLinesSet);
+        const effectiveStopBeforeSubmit =
+          options.allowSubmit === false
+            ? true
+            : step.stopBeforeSubmit !== undefined
+              ? Boolean(step.stopBeforeSubmit)
+              : !defaultAllowSubmit;
+        stepResult = await smartFillForm(
+          page,
+          { ...step, stopBeforeSubmit: effectiveStopBeforeSubmit },
+          previousLinesSet
+        );
       } else {
         stepResult = await executeSingleAction(page, {
           ...step,
@@ -1992,7 +5494,7 @@ export async function batchActions(page, steps = [], options = {}, previousLines
       if (stepResult.blocked && !continueOnError) {
         return {
           completed: results.length,
-          total: steps.length,
+          total: stepList.length,
           blocked: true,
           elapsedMs: Date.now() - t0,
           results,
@@ -2003,7 +5505,7 @@ export async function batchActions(page, steps = [], options = {}, previousLines
       if (!continueOnError) {
         return {
           completed: i,
-          total: steps.length,
+          total: stepList.length,
           blocked: false,
           error: err.message,
           elapsedMs: Date.now() - t0,
@@ -2015,7 +5517,7 @@ export async function batchActions(page, steps = [], options = {}, previousLines
 
   const out = {
     completed: results.length,
-    total: steps.length,
+    total: stepList.length,
     blocked: false,
     results,
   };
@@ -2051,31 +5553,68 @@ export async function extractCleanText(page, options = {}) {
       part = await frameInfo.frame.evaluate(({ sel, fmt }) => {
         const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'SVG', 'TEMPLATE']);
         const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+        const getSR = (node) => node?.shadowRoot || window.__tbmGetShadowRoot?.(node) || null;
 
-        const findDeepFirst = (rootNode, query) => {
+        const findDeepAll = (rootNode, query) => {
+          const seen = new Set();
+          const out = [];
           const stack = [rootNode];
           while (stack.length > 0) {
             const cur = stack.shift();
-            if (!cur || !cur.querySelector) continue;
-            const match = cur.querySelector(query);
-            if (match) return match;
+            if (!cur) continue;
+            const sr = getSR(cur);
+            if (sr) stack.push(sr);
+            if (!cur.querySelectorAll) continue;
+            let matches;
+            try {
+              matches = cur.querySelectorAll(query);
+            } catch {
+              return out;
+            }
+            for (const m of matches) {
+              if (!seen.has(m)) {
+                seen.add(m);
+                out.push(m);
+              }
+            }
             for (const el of cur.querySelectorAll('*')) {
-              if (el.shadowRoot) stack.push(el.shadowRoot);
+              const elSr = getSR(el);
+              if (elSr) stack.push(elSr);
             }
           }
-          return null;
+          return out;
         };
 
-        const root = sel
-          ? findDeepFirst(document, sel)
-          : document.querySelector('main, article, [role="main"]') || document.body;
-        if (!root) return '';
-
-        const isHiddenEl = (el) => {
+        const isSubtreeHidden = (el) => {
           if (!el || el.nodeType !== 1) return false;
-          if (SKIP_TAGS.has(el.tagName) || el.hasAttribute('hidden')) return true;
+          let cur = el;
+          while (cur && cur.nodeType === 1) {
+            if (SKIP_TAGS.has((cur.tagName || '').toUpperCase()) || cur.hasAttribute('hidden')) return true;
+            if (cur.getAttribute('aria-hidden') === 'true') return true;
+            const parent = cur.parentElement;
+            if (parent && parent.tagName === 'DETAILS' && !parent.open) {
+              const firstSummary = [...parent.children].find((c) => c.tagName === 'SUMMARY');
+              if (!firstSummary || cur !== firstSummary) return true;
+            }
+            try {
+              const st = getComputedStyle(cur);
+              if (st.display === 'none' || Number(st.opacity) === 0 || st.contentVisibility === 'hidden') {
+                return true;
+              }
+            } catch {
+              // ignore
+            }
+            const rn = cur.getRootNode?.();
+            cur = parent || (rn instanceof ShadowRoot ? rn.host : null);
+          }
+          return false;
+        };
+
+        const isSelfVisibilityHidden = (el) => {
+          if (!el || el.nodeType !== 1) return false;
           try {
-            return getComputedStyle(el).display === 'none';
+            const st = getComputedStyle(el);
+            return st.visibility === 'hidden' || st.visibility === 'collapse';
           } catch {
             return false;
           }
@@ -2083,14 +5622,20 @@ export async function extractCleanText(page, options = {}) {
 
         const extractDeepPlain = (node) => {
           if (!node) return '';
-          if (node.nodeType === 3) return node.textContent || '';
+          if (node.nodeType === 3) {
+            const parentEl =
+              node.parentElement ||
+              (node.getRootNode?.() instanceof ShadowRoot ? node.getRootNode().host : null);
+            if (parentEl && isSelfVisibilityHidden(parentEl)) return '';
+            return node.textContent || '';
+          }
           if (node.nodeType !== 1 && node.nodeType !== 11) return '';
-          if (node.nodeType === 1 && isHiddenEl(node)) return '';
+          if (node.nodeType === 1 && isSubtreeHidden(node)) return '';
           if (node.nodeType === 1 && node.tagName === 'BR') return '\n';
 
           let pieces = [];
-          if (node.nodeType === 1 && node.shadowRoot) {
-            pieces.push(extractDeepPlain(node.shadowRoot));
+          if (node.nodeType === 1 && getSR(node)) {
+            pieces.push(extractDeepPlain(getSR(node)));
           } else if (node.nodeType === 1 && node.tagName === 'SLOT' && typeof node.assignedNodes === 'function') {
             const assigned = node.assignedNodes({ flatten: true });
             const list = assigned.length > 0 ? assigned : [...node.childNodes];
@@ -2100,57 +5645,85 @@ export async function extractCleanText(page, options = {}) {
           }
           const inner = pieces.join('');
           const BLOCK = new Set(['H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'P', 'LI', 'TR', 'DIV', 'SECTION', 'ARTICLE', 'HEADER', 'FOOTER', 'BLOCKQUOTE', 'PRE']);
+          if (node.nodeType === 1 && (node.tagName === 'TD' || node.tagName === 'TH')) {
+            return ` ${inner} `;
+          }
           if (node.nodeType === 1 && BLOCK.has(node.tagName)) {
             return `\n${inner}\n`;
           }
           return inner;
         };
 
+        const isCompletelyHiddenRoot = (el) => {
+          if (isSubtreeHidden(el)) return true;
+          if (!isSelfVisibilityHidden(el)) return false;
+          return extractDeepPlain(el).trim().length === 0;
+        };
+
+        let root = null;
+        if (sel) {
+          const matches = findDeepAll(document, sel);
+          root = matches.find((el) => !isCompletelyHiddenRoot(el)) || matches[0] || null;
+        } else {
+          const mainMatches = findDeepAll(document, 'main, article, [role="main"]');
+          root = mainMatches.find((el) => !isCompletelyHiddenRoot(el)) || document.body;
+        }
+        if (!root) return '';
+
         if (fmt === 'markdown') {
-          const queryBlocksDeep = (rootNode) => {
-            const out = [];
-            const visit = (node) => {
-              if (!node || (node.nodeType === 1 && isHiddenEl(node))) return;
-              if (node.nodeType === 1 && node.matches?.('h1, h2, h3, h4, p, li, tr, pre, blockquote')) {
-                out.push(node);
-              }
-              if (node.nodeType === 1 && node.shadowRoot) {
-                for (const c of node.shadowRoot.childNodes) visit(c);
-                return;
-              }
-              if (node.nodeType === 1 && node.tagName === 'SLOT' && typeof node.assignedNodes === 'function') {
-                const assigned = node.assignedNodes({ flatten: true });
-                const list = assigned.length > 0 ? assigned : [...node.childNodes];
-                for (const c of list) visit(c);
-                return;
-              }
-              for (const c of node.childNodes) visit(c);
-            };
-            visit(rootNode);
-            return out;
+          const childNodesOf = (node) => {
+            if (!node) return [];
+            if (node.nodeType === 1 && getSR(node)) {
+              return [...getSR(node).childNodes];
+            }
+            if (node.nodeType === 1 && node.tagName === 'SLOT' && typeof node.assignedNodes === 'function') {
+              const assigned = node.assignedNodes({ flatten: true });
+              return assigned.length > 0 ? [...assigned] : [...node.childNodes];
+            }
+            return [...(node.childNodes || [])];
           };
+
+          const SEMANTIC_BLOCKS = new Set(['H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'P', 'LI', 'TR', 'PRE', 'BLOCKQUOTE']);
+          const GENERIC_CONTAINERS = new Set([
+            'DIV', 'SECTION', 'ARTICLE', 'MAIN', 'HEADER', 'FOOTER', 'ASIDE', 'NAV',
+            'FORM', 'FIELDSET', 'DL', 'DT', 'DD', 'FIGURE', 'FIGCAPTION', 'DETAILS', 'SUMMARY',
+            'UL', 'OL', 'TABLE', 'THEAD', 'TBODY', 'TFOOT',
+          ]);
 
           const renderInline = (node, skipSubLists = false) => {
             if (!node) return '';
-            if (node.nodeType === 3) return node.textContent || '';
-            if (node.nodeType !== 1) return '';
-            if (isHiddenEl(node)) return '';
-            if (node.tagName === 'BR') return ' ';
-            if (skipSubLists && (node.tagName === 'UL' || node.tagName === 'OL')) return '';
-            if (node.tagName === 'A' && node.getAttribute('href')) {
+            if (node.nodeType === 3) {
+              const parentEl =
+                node.parentElement ||
+                (node.getRootNode?.() instanceof ShadowRoot ? node.getRootNode().host : null);
+              if (parentEl && isSelfVisibilityHidden(parentEl)) return '';
+              return node.textContent || '';
+            }
+            if (node.nodeType !== 1 && node.nodeType !== 11) return '';
+            if (node.nodeType === 1 && isSubtreeHidden(node)) return '';
+            if (node.nodeType === 1 && node.tagName === 'BR') return ' ';
+            if (skipSubLists && node.nodeType === 1 && (node.tagName === 'UL' || node.tagName === 'OL')) return '';
+            if (node.nodeType === 1 && node.tagName === 'A' && node.getAttribute('href')) {
               let inner = '';
-              for (const c of node.childNodes) inner += renderInline(c, skipSubLists);
+              for (const c of childNodesOf(node)) inner += renderInline(c, skipSubLists);
               const label = clean(inner);
               return label ? `[${label}](${node.getAttribute('href')})` : '';
             }
-            if (node.shadowRoot) {
-              let sOut = '';
-              for (const c of node.shadowRoot.childNodes) sOut += renderInline(c, skipSubLists);
-              return sOut;
-            }
             let outStr = '';
-            for (const c of node.childNodes) {
-              outStr += renderInline(c, skipSubLists);
+            for (const c of childNodesOf(node)) {
+              const isBlockChild =
+                c.nodeType === 1 && (SEMANTIC_BLOCKS.has(c.tagName) || GENERIC_CONTAINERS.has(c.tagName));
+              const piece = renderInline(c, skipSubLists);
+              if (!piece) continue;
+              if (isBlockChild) {
+                const trimmed = piece.trim();
+                if (trimmed) {
+                  if (outStr && !/\s$/.test(outStr)) outStr += ' ';
+                  outStr += `${trimmed} `;
+                }
+              } else {
+                outStr += piece;
+              }
             }
             return outStr;
           };
@@ -2166,44 +5739,123 @@ export async function extractCleanText(page, options = {}) {
           };
 
           const out = [];
-          const blocks = queryBlocksDeep(root);
-          if (blocks.length > 0) {
-            for (const node of blocks) {
-              const tag = node.tagName.toLowerCase();
-              if (tag === 'p' && node.closest('li, td, th, blockquote, pre')) continue;
-              if ((tag === 'h1' || tag === 'h2' || tag === 'h3' || tag === 'h4') && node.closest('pre')) continue;
 
-              if (tag === 'pre') {
-                const codeTxt = (node.innerText || node.textContent || '').replace(/^\n+|\n+$/g, '');
-                if (codeTxt) out.push(`\`\`\`\n${codeTxt}\n\`\`\``);
-              } else if (tag === 'blockquote') {
-                const txt = clean(renderInline(node));
-                if (txt) out.push(`> ${txt}`);
-              } else if (tag === 'h1' || tag === 'h2' || tag === 'h3' || tag === 'h4') {
-                const level = '#'.repeat(Number(tag[1]));
-                const txt = clean(renderInline(node));
-                if (txt) out.push(`${level} ${txt}`);
-              } else if (tag === 'li') {
-                const txt = clean(renderInline(node, true));
-                const indent = '  '.repeat(listDepthOf(node));
-                if (txt) out.push(`${indent}- ${txt}`);
-              } else if (tag === 'tr') {
-                const directCells = [...node.children].filter((c) => c.tagName === 'TH' || c.tagName === 'TD');
-                const cells = (directCells.length > 0 ? directCells : [...node.querySelectorAll('th, td')]);
-                const cellTexts = cells.map((c) => clean(renderInline(c)));
-                if (cellTexts.length > 0) {
-                  out.push(`| ${cellTexts.join(' | ')} |`);
-                  if (cells.every((c) => c.tagName === 'TH')) {
-                    out.push(`| ${cells.map(() => '---').join(' | ')} |`);
-                  }
+          const extractPreText = (n) => {
+            if (!n) return '';
+            if (n.nodeType === 3) {
+              const parentEl =
+                n.parentElement ||
+                (n.getRootNode?.() instanceof ShadowRoot ? n.getRootNode().host : null);
+              if (parentEl && isSelfVisibilityHidden(parentEl)) return '';
+              return n.textContent || '';
+            }
+            if (n.nodeType !== 1 && n.nodeType !== 11) return '';
+            if (n.nodeType === 1 && isSubtreeHidden(n)) return '';
+            if (n.nodeType === 1 && n.tagName === 'BR') return '\n';
+            let res = '';
+            for (const c of childNodesOf(n)) res += extractPreText(c);
+            return res;
+          };
+
+          const renderSemanticBlock = (node) => {
+            const tag = node.tagName.toLowerCase();
+            if (tag === 'pre') {
+              if (isCompletelyHiddenRoot(node)) return;
+              const codeTxt = extractPreText(node).replace(/^\n+|\n+$/g, '');
+              if (codeTxt) out.push(`\`\`\`\n${codeTxt}\n\`\`\``);
+            } else if (tag === 'blockquote') {
+              const txt = clean(renderInline(node));
+              if (txt) out.push(`> ${txt}`);
+            } else if (/^h[1-6]$/.test(tag)) {
+              const level = '#'.repeat(Number(tag[1]));
+              const txt = clean(renderInline(node));
+              if (txt) out.push(`${level} ${txt}`);
+            } else if (tag === 'li') {
+              const txt = clean(renderInline(node, true));
+              const indent = '  '.repeat(listDepthOf(node));
+              if (txt) out.push(`${indent}- ${txt}`);
+              for (const c of childNodesOf(node)) {
+                if (c.nodeType === 1 && !isSubtreeHidden(c) && (c.tagName === 'UL' || c.tagName === 'OL')) {
+                  walkContainer(c);
                 }
-              } else {
-                const txt = clean(renderInline(node));
-                if (txt) out.push(txt);
+              }
+            } else if (tag === 'tr') {
+              if (isCompletelyHiddenRoot(node)) return;
+              const directCells = [...node.children].filter((c) => c.tagName === 'TH' || c.tagName === 'TD');
+              const cells = (directCells.length > 0 ? directCells : [...node.querySelectorAll('th, td')]).filter(
+                (c) => !isSubtreeHidden(c) && !isCompletelyHiddenRoot(c)
+              );
+              const cellTexts = cells.map((c) => clean(renderInline(c)).replace(/\|/g, '\\|'));
+              if (cellTexts.length > 0) {
+                out.push(`| ${cellTexts.join(' | ')} |`);
+                if (cells.every((c) => c.tagName === 'TH')) {
+                  out.push(`| ${cells.map(() => '---').join(' | ')} |`);
+                }
+              }
+            } else {
+              const txt = clean(renderInline(node));
+              if (txt) out.push(txt);
+            }
+          };
+
+          const hasBlockDescendant = (node) => {
+            for (const c of childNodesOf(node)) {
+              if (c.nodeType === 1 && !isSubtreeHidden(c)) {
+                if (SEMANTIC_BLOCKS.has(c.tagName) || GENERIC_CONTAINERS.has(c.tagName) || Boolean(c.shadowRoot)) {
+                  return true;
+                }
+                if (hasBlockDescendant(c)) return true;
               }
             }
-            if (out.length > 0) return out.join('\n');
-          }
+            return false;
+          };
+
+          const walkContainer = (container) => {
+            if (!container) return;
+            if (container.nodeType === 1 && isSubtreeHidden(container)) return;
+            if (container.nodeType === 1 && SEMANTIC_BLOCKS.has(container.tagName)) {
+              renderSemanticBlock(container);
+              return;
+            }
+
+            let inlineBuf = '';
+            const flushInline = () => {
+              const txt = clean(inlineBuf);
+              if (txt) out.push(txt);
+              inlineBuf = '';
+            };
+
+            for (const child of childNodesOf(container)) {
+              if (child.nodeType === 3) {
+                if (container.nodeType !== 1 || !isSelfVisibilityHidden(container)) {
+                  inlineBuf += child.textContent || '';
+                }
+                continue;
+              }
+              if (child.nodeType !== 1 && child.nodeType !== 11) continue;
+              if (child.nodeType === 1 && isSubtreeHidden(child)) continue;
+
+              if (child.nodeType === 1 && SEMANTIC_BLOCKS.has(child.tagName)) {
+                flushInline();
+                renderSemanticBlock(child);
+              } else if (
+                child.nodeType === 11 ||
+                GENERIC_CONTAINERS.has(child.tagName) ||
+                Boolean(child.shadowRoot) ||
+                hasBlockDescendant(child)
+              ) {
+                flushInline();
+                walkContainer(child);
+              } else {
+                const piece = renderInline(child);
+                if (piece) inlineBuf += piece;
+              }
+            }
+            flushInline();
+          };
+
+          walkContainer(root);
+          if (out.length > 0) return out.join('\n');
         }
 
         return extractDeepPlain(root)
@@ -2211,7 +5863,7 @@ export async function extractCleanText(page, options = {}) {
           .map((line) => line.replace(/\s+/g, ' ').trim())
           .filter(Boolean)
           .join('\n');
-      }, { sel: frameInfo.isMain ? selector : null, fmt: format });
+      }, { sel: selector, fmt: format });
     } catch {
       part = '';
     }
@@ -2239,6 +5891,215 @@ export async function extractCleanText(page, options = {}) {
   };
 }
 
+function stripTrailingSemisAndComments(src) {
+  const REGEX_PRECEDING_KEYWORDS = new Set([
+    'return', 'typeof', 'void', 'delete', 'in', 'instanceof',
+    'case', 'throw', 'new', 'yield', 'await', 'else', 'do',
+  ]);
+  let lastCodeEnd = 0;
+  let i = 0;
+  const n = src.length;
+  let canStartRegex = true;
+  let afterMemberAccess = false;
+  let braceDepth = 0;
+  const templateBraceStack = [];
+
+  const scanTemplateChunk = () => {
+    afterMemberAccess = false;
+    while (i < n) {
+      if (src[i] === '\\') {
+        i = Math.min(n, i + 2);
+        continue;
+      }
+      if (src[i] === '`') {
+        i++;
+        lastCodeEnd = i;
+        canStartRegex = false;
+        return;
+      }
+      if (src[i] === '$' && src[i + 1] === '{') {
+        templateBraceStack.push(braceDepth);
+        braceDepth++;
+        i += 2;
+        lastCodeEnd = i;
+        canStartRegex = true;
+        return;
+      }
+      i++;
+    }
+    lastCodeEnd = i;
+    canStartRegex = false;
+  };
+
+  while (i < n) {
+    const ch = src[i];
+    const next = src[i + 1];
+
+    if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') {
+      i++;
+      continue;
+    }
+    if (ch === ';') {
+      canStartRegex = true;
+      afterMemberAccess = false;
+      i++;
+      continue;
+    }
+    if (ch === '/' && next === '/') {
+      i += 2;
+      while (i < n && src[i] !== '\n' && src[i] !== '\r') i++;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      i += 2;
+      while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i++;
+      if (i < n) i += 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      const quote = ch;
+      i++;
+      while (i < n) {
+        if (src[i] === '\\') {
+          i = Math.min(n, i + 2);
+          continue;
+        }
+        if (src[i] === quote) {
+          i++;
+          break;
+        }
+        i++;
+      }
+      lastCodeEnd = i;
+      canStartRegex = false;
+      afterMemberAccess = false;
+      continue;
+    }
+    if (ch === '`') {
+      i++;
+      scanTemplateChunk();
+      continue;
+    }
+    if (ch === '{') {
+      braceDepth++;
+      i++;
+      lastCodeEnd = i;
+      canStartRegex = true;
+      afterMemberAccess = false;
+      continue;
+    }
+    if (ch === '}') {
+      if (
+        templateBraceStack.length > 0 &&
+        braceDepth === templateBraceStack[templateBraceStack.length - 1] + 1
+      ) {
+        templateBraceStack.pop();
+        braceDepth--;
+        i++;
+        scanTemplateChunk();
+        continue;
+      }
+      if (braceDepth > 0) braceDepth--;
+      i++;
+      lastCodeEnd = i;
+      canStartRegex = false;
+      afterMemberAccess = false;
+      continue;
+    }
+    if (ch === '/' && canStartRegex) {
+      i++;
+      let inCharClass = false;
+      while (i < n) {
+        if (src[i] === '\\') {
+          i = Math.min(n, i + 2);
+          continue;
+        }
+        if (src[i] === '[') {
+          inCharClass = true;
+          i++;
+          continue;
+        }
+        if (src[i] === ']') {
+          inCharClass = false;
+          i++;
+          continue;
+        }
+        if (src[i] === '/' && !inCharClass) {
+          i++;
+          break;
+        }
+        if (src[i] === '\n' || src[i] === '\r') {
+          break;
+        }
+        i++;
+      }
+      while (i < n && /[a-z]/i.test(src[i])) i++;
+      lastCodeEnd = i;
+      canStartRegex = false;
+      afterMemberAccess = false;
+      continue;
+    }
+    if (ch === '.') {
+      if (next === '.' && src[i + 2] === '.') {
+        i += 3;
+        lastCodeEnd = i;
+        canStartRegex = true;
+        afterMemberAccess = false;
+        continue;
+      }
+      i++;
+      lastCodeEnd = i;
+      canStartRegex = false;
+      afterMemberAccess = true;
+      continue;
+    }
+    const cp = src.codePointAt(i);
+    const chStr = String.fromCodePoint(cp);
+    if (/[\p{ID_Start}$_]/u.test(chStr)) {
+      const start = i;
+      i += chStr.length;
+      while (i < n) {
+        const nextCp = src.codePointAt(i);
+        const nextStr = String.fromCodePoint(nextCp);
+        if (!/[\p{ID_Continue}$\u200C\u200D]/u.test(nextStr)) break;
+        i += nextStr.length;
+      }
+      const word = src.slice(start, i);
+      lastCodeEnd = i;
+      canStartRegex = !afterMemberAccess && REGEX_PRECEDING_KEYWORDS.has(word);
+      afterMemberAccess = false;
+      continue;
+    }
+    if (/[0-9]/.test(ch)) {
+      i++;
+      while (i < n && /[0-9a-zA-Z_.]/.test(src[i])) i++;
+      lastCodeEnd = i;
+      canStartRegex = false;
+      afterMemberAccess = false;
+      continue;
+    }
+    if ((ch === '+' && next === '+') || (ch === '-' && next === '-')) {
+      i += 2;
+      lastCodeEnd = i;
+      canStartRegex = false;
+      afterMemberAccess = false;
+      continue;
+    }
+    if (ch === ')' || ch === ']') {
+      i++;
+      lastCodeEnd = i;
+      canStartRegex = false;
+      afterMemberAccess = false;
+      continue;
+    }
+    i++;
+    lastCodeEnd = i;
+    canStartRegex = true;
+    afterMemberAccess = false;
+  }
+  return src.slice(0, lastCodeEnd).trim();
+}
+
 /**
  * Evaluate JavaScript expression/function inside a target frame or element (passing el, arg) and optionally save output.
  */
@@ -2247,6 +6108,7 @@ export async function evaluateJs(page, { expression, frameIdx = 0, arg, ref, sel
     throw new Error('evaluate_js requires an expression string.');
   }
 
+  const exprCandidate = stripTrailingSemisAndComments(expression);
   let resolvedFrameIdx = frameIdx;
   let result;
 
@@ -2254,20 +6116,23 @@ export async function evaluateJs(page, { expression, frameIdx = 0, arg, ref, sel
     const target = await resolveTarget(page, { ref, selector, text, frameIdx });
     resolvedFrameIdx = target.frameIdx;
     result = await target.locator.evaluate(
-      async (el, { code, payload }) => {
+      async (el, { code, exprCode, payload }) => {
+        const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
         let fn;
         try {
-          fn = new Function('el', 'arg', `return (${code});`);
-        } catch {
-          fn = new Function('el', 'arg', code);
+          fn = new AsyncFunction('el', 'arg', `return (\n${exprCode}\n);`);
+        } catch (err) {
+          if (err instanceof SyntaxError) {
+            fn = new AsyncFunction('el', 'arg', code);
+          } else {
+            throw err;
+          }
         }
         const val = await fn(el, payload);
-        if (typeof val === 'function') {
-          return await val(el, payload);
-        }
-        return val;
+        const finalVal = typeof val === 'function' ? await val(el, payload) : val;
+        return finalVal === undefined ? null : finalVal;
       },
-      { code: expression, payload: arg }
+      { code: expression, exprCode: exprCandidate, payload: arg }
     );
   } else {
     const frames = getAllFrames(page);
@@ -2275,26 +6140,30 @@ export async function evaluateJs(page, { expression, frameIdx = 0, arg, ref, sel
     if (!target) throw new Error(`Frame ${frameIdx} not found.`);
     resolvedFrameIdx = target.frameIdx;
     result = await target.frame.evaluate(
-      async ({ code, payload }) => {
+      async ({ code, exprCode, payload }) => {
+        const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
         let fn;
         try {
-          fn = new Function('arg', `return (${code});`);
-        } catch {
-          fn = new Function('arg', code);
+          fn = new AsyncFunction('arg', `return (\n${exprCode}\n);`);
+        } catch (err) {
+          if (err instanceof SyntaxError) {
+            fn = new AsyncFunction('arg', code);
+          } else {
+            throw err;
+          }
         }
         const val = await fn(payload);
-        if (typeof val === 'function') {
-          return await val(payload);
-        }
-        return val;
+        const finalVal = typeof val === 'function' ? await val(payload) : val;
+        return finalVal === undefined ? null : finalVal;
       },
-      { code: expression, payload: arg }
+      { code: expression, exprCode: exprCandidate, payload: arg }
     );
   }
 
-  const serialized = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+  const normalizedResult = result === undefined ? null : result;
+  const serialized = typeof normalizedResult === 'string' ? normalizedResult : JSON.stringify(normalizedResult, null, 2);
   const savedPath = writeSaveFile(savePath, serialized ?? 'null');
-  return { frameIdx: resolvedFrameIdx, result, savePath: savedPath };
+  return { frameIdx: resolvedFrameIdx, result: normalizedResult, savePath: savedPath };
 }
 
 /**

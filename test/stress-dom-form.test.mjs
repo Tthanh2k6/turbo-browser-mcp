@@ -359,7 +359,7 @@ describe('DOM & Form Engine Stress Suite (stress-dom-form)', () => {
   });
 
   it('1. pierces 2+ level nested iframes and nested open Shadow DOM (shadow inside shadow) across inspectCompact, smartFillForm, actFast, and extractCleanText', async () => {
-    await manager.tabsBatch([{ action: 'open', url: `${baseUrl}/deep` }]);
+    await manager.tabsBatch([{ action: 'open', url: `${baseUrl}/deep`, waitUntil: 'load' }]);
     const { page } = await manager.getPage();
 
     const snap = await inspectCompact(page, { mode: 'interactive', maxChars: 4000 });
