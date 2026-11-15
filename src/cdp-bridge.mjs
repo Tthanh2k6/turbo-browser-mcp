@@ -1,0 +1,598 @@
+import crypto from 'node:crypto';
+import { spawn, execSync } from 'node:child_process';
+import fs from 'node:fs';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+export const DEFAULT_BRIDGE_PORT = Number(process.env.TURBO_BROWSER_BRIDGE_PORT) || 9224;
+
+/**
+ * Encode a UTF-8 string or Buffer into an unmasked server-to-client RFC 6455 WebSocket frame.
+ */
+function encodeWsFrame(payload, opcode = 0x01) {
+  const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : Buffer.from(payload);
+  const len = data.length;
+  let header;
+  if (len < 126) {
+    header = Buffer.allocUnsafe(2);
+    header[0] = 0x80 | (opcode & 0x0f);
+    header[1] = len;
+  } else if (len < 65536) {
+    header = Buffer.allocUnsafe(4);
+    header[0] = 0x80 | (opcode & 0x0f);
+    header[1] = 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.allocUnsafe(10);
+    header[0] = 0x80 | (opcode & 0x0f);
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(len), 2);
+  }
+  return Buffer.concat([header, data]);
+}
+
+/**
+ * Minimal RFC 6455 WebSocket connection wrapper for accepted HTTP upgrade sockets.
+ */
+class ServerWsClient {
+  constructor(socket) {
+    this.socket = socket;
+    this.buffer = Buffer.alloc(0);
+    this.fragments = [];
+    this.fragmentOpcode = 0;
+    this.closed = false;
+    this.onMessage = null;
+    this.onClose = null;
+
+    socket.setNoDelay(true);
+    socket.on('data', (chunk) => this._onData(chunk));
+    socket.on('close', () => this._handleClose());
+    socket.on('end', () => this._handleClose());
+    socket.on('error', () => this._handleClose());
+  }
+
+  _onData(chunk) {
+    this.buffer = this.buffer.length === 0 ? chunk : Buffer.concat([this.buffer, chunk]);
+    while (this.buffer.length >= 2) {
+      const b0 = this.buffer[0];
+      const b1 = this.buffer[1];
+      const fin = (b0 & 0x80) !== 0;
+      const opcode = b0 & 0x0f;
+      const masked = (b1 & 0x80) !== 0;
+      let payloadLen = b1 & 0x7f;
+      let offset = 2;
+
+      if (payloadLen === 126) {
+        if (this.buffer.length < 4) return;
+        payloadLen = this.buffer.readUInt16BE(2);
+        offset = 4;
+      } else if (payloadLen === 127) {
+        if (this.buffer.length < 10) return;
+        payloadLen = Number(this.buffer.readBigUInt64BE(2));
+        offset = 10;
+      }
+
+      const maskLen = masked ? 4 : 0;
+      const totalFrameLen = offset + maskLen + payloadLen;
+      if (this.buffer.length < totalFrameLen) return;
+
+      const payload = Buffer.from(this.buffer.subarray(offset + maskLen, totalFrameLen));
+      if (masked) {
+        const maskKey = this.buffer.subarray(offset, offset + 4);
+        for (let i = 0; i < payload.length; i++) {
+          payload[i] ^= maskKey[i & 3];
+        }
+      }
+      this.buffer = this.buffer.subarray(totalFrameLen);
+
+      if (opcode === 0x08) {
+        // Close frame
+        this.close();
+        return;
+      }
+      if (opcode === 0x09) {
+        // Ping -> Pong
+        if (!this.closed) {
+          this.socket.write(encodeWsFrame(payload, 0x0a));
+        }
+        continue;
+      }
+      if (opcode === 0x0a) {
+        continue;
+      }
+
+      if (opcode === 0x01 || opcode === 0x02) {
+        this.fragmentOpcode = opcode;
+        this.fragments = [payload];
+      } else if (opcode === 0x00) {
+        this.fragments.push(payload);
+      }
+
+      if (fin && (this.fragmentOpcode === 0x01 || this.fragmentOpcode === 0x02)) {
+        const full = this.fragments.length === 1 ? this.fragments[0] : Buffer.concat(this.fragments);
+        this.fragments = [];
+        this.fragmentOpcode = 0;
+        if (this.onMessage) {
+          this.onMessage(full.toString('utf8'));
+        }
+      }
+    }
+  }
+
+  send(text) {
+    if (this.closed || !this.socket.writable) return;
+    try {
+      this.socket.write(encodeWsFrame(text, 0x01));
+    } catch {
+      this._handleClose();
+    }
+  }
+
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    try {
+      this.socket.end(encodeWsFrame(Buffer.alloc(0), 0x08));
+    } catch {
+      this.socket.destroy();
+    }
+    this._handleClose();
+  }
+
+  _handleClose() {
+    if (this.closed && !this.onClose) return;
+    this.closed = true;
+    const cb = this.onClose;
+    this.onClose = null;
+    if (cb) cb();
+  }
+}
+
+/**
+ * Start a persistent CDP Keep-Alive Multiplexer Bridge server.
+ * Holds a single upstream WebSocket connection to Chrome's `DevToolsActivePort`
+ * so Chrome only prompts "Allow remote debugging?" ONCE, while allowing unlimited
+ * sequential or concurrent Playwright / MCP connections without re-prompting.
+ */
+export async function createCdpBridgeServer({
+  upstreamUrl,
+  port = DEFAULT_BRIDGE_PORT,
+  host = '127.0.0.1',
+  connectTimeoutMs = 60000,
+} = {}) {
+  if (!upstreamUrl || (!upstreamUrl.startsWith('ws://') && !upstreamUrl.startsWith('wss://'))) {
+    throw new Error(`createCdpBridgeServer requires a ws:// or wss:// upstreamUrl (got ${upstreamUrl})`);
+  }
+
+  let upstreamWs = null;
+  let upstreamConnected = false;
+  let browserVersionInfo = {
+    Browser: 'Chrome/TurboBridge',
+    'Protocol-Version': '1.3',
+    'User-Agent': 'Mozilla/5.0 Chrome/TurboBridge',
+  };
+
+  let nextUpstreamId = 100000;
+  const pendingCalls = new Map(); // upstreamId -> { client, clientMsgId, internalResolve }
+  const clients = new Set(); // Set<ServerWsClient>
+  const attachedTargets = new Map(); // sessionId -> Target.attachedToTarget params
+  const discoveredTargets = new Map(); // targetId -> targetInfo
+  let autoAttachEnabledUpstream = false;
+  let discoverEnabledUpstream = false;
+
+  function sendUpstreamRaw(obj) {
+    if (!upstreamWs || upstreamWs.readyState !== WebSocket.OPEN) return false;
+    upstreamWs.send(JSON.stringify(obj));
+    return true;
+  }
+
+  function callUpstreamInternal(method, params = {}) {
+    return new Promise((resolve) => {
+      if (!upstreamWs || upstreamWs.readyState !== WebSocket.OPEN) {
+        resolve(null);
+        return;
+      }
+      const id = nextUpstreamId++;
+      pendingCalls.set(id, { client: null, clientMsgId: null, internalResolve: resolve });
+      sendUpstreamRaw({ id, method, params });
+    });
+  }
+
+  async function connectUpstream() {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(upstreamUrl);
+      const timer = setTimeout(() => {
+        try {
+          ws.close();
+        } catch {}
+        reject(new Error(`Timed out connecting to upstream CDP WebSocket: ${upstreamUrl}`));
+      }, connectTimeoutMs);
+
+      ws.addEventListener('open', async () => {
+        clearTimeout(timer);
+        upstreamWs = ws;
+        upstreamConnected = true;
+        try {
+          const ver = await callUpstreamInternal('Browser.getVersion', {});
+          if (ver && ver.product) {
+            browserVersionInfo = {
+              Browser: ver.product,
+              'Protocol-Version': ver.protocolVersion || '1.3',
+              'User-Agent': ver.userAgent || browserVersionInfo['User-Agent'],
+              'V8-Version': ver.jsVersion || '',
+              'WebKit-Version': ver.revision || '',
+            };
+          }
+        } catch {}
+        resolve(ws);
+      });
+
+      ws.addEventListener('message', (ev) => {
+        const rawText = typeof ev.data === 'string' ? ev.data : Buffer.from(ev.data).toString('utf8');
+        let msg;
+        try {
+          msg = JSON.parse(rawText);
+        } catch {
+          return;
+        }
+
+        // Track target attachment state on root browser session so concurrent/subsequent clients stay in sync
+        if (!msg.id && msg.method && !msg.sessionId) {
+          if (msg.method === 'Target.attachedToTarget' && msg.params?.sessionId) {
+            attachedTargets.set(msg.params.sessionId, msg.params);
+          } else if (msg.method === 'Target.detachedFromTarget' && msg.params?.sessionId) {
+            attachedTargets.delete(msg.params.sessionId);
+          } else if (msg.method === 'Target.targetCreated' && msg.params?.targetInfo?.targetId) {
+            discoveredTargets.set(msg.params.targetInfo.targetId, msg.params.targetInfo);
+          } else if (msg.method === 'Target.targetDestroyed' && msg.params?.targetId) {
+            discoveredTargets.delete(msg.params.targetId);
+          } else if (msg.method === 'Target.targetInfoChanged' && msg.params?.targetInfo?.targetId) {
+            const tInfo = msg.params.targetInfo;
+            discoveredTargets.set(tInfo.targetId, tInfo);
+            for (const [sid, entry] of attachedTargets.entries()) {
+              if (entry.targetInfo?.targetId === tInfo.targetId) {
+                attachedTargets.set(sid, { ...entry, targetInfo: tInfo });
+              }
+            }
+          }
+        }
+
+        if (msg.id !== undefined) {
+          const pending = pendingCalls.get(msg.id);
+          if (pending) {
+            pendingCalls.delete(msg.id);
+            if (pending.internalResolve) {
+              pending.internalResolve(msg.result ?? null);
+              return;
+            }
+            if (pending.client && !pending.client.closed) {
+              const reply = { ...msg, id: pending.clientMsgId };
+              pending.client.send(JSON.stringify(reply));
+            }
+          }
+          return;
+        }
+
+        // Broadcast CDP events to all active downstream clients
+        for (const c of clients) {
+          if (!c.closed) {
+            c.send(rawText);
+          }
+        }
+      });
+
+      ws.addEventListener('close', () => {
+        upstreamConnected = false;
+        upstreamWs = null;
+        for (const c of clients) {
+          c.close();
+        }
+        clients.clear();
+      });
+
+      ws.addEventListener('error', (err) => {
+        if (!upstreamConnected) {
+          clearTimeout(timer);
+          reject(new Error(`Upstream CDP WebSocket error on ${upstreamUrl}: ${err?.message || 'connection failed'}`));
+        }
+      });
+    });
+  }
+
+  await connectUpstream();
+
+  const server = http.createServer((req, res) => {
+    const addr = server.address();
+    const actualPort = typeof addr === 'object' && addr ? addr.port : port;
+    const wsEndpoint = `ws://${host}:${actualPort}/devtools/browser/turbo-bridge`;
+
+    if (req.url?.startsWith('/json/version')) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          ...browserVersionInfo,
+          webSocketDebuggerUrl: wsEndpoint,
+          turboBridge: true,
+          upstreamUrl,
+          upstreamConnected,
+        })
+      );
+      return;
+    }
+
+    if (req.url === '/json' || req.url === '/json/list') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify([...discoveredTargets.values()]));
+      return;
+    }
+
+    if (req.url === '/healthz') {
+      res.writeHead(upstreamConnected ? 200 : 503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: upstreamConnected, upstreamUrl, activeClients: clients.size }));
+      return;
+    }
+
+    res.writeHead(404);
+    res.end();
+  });
+
+  server.on('upgrade', (req, socket) => {
+    const key = req.headers['sec-websocket-key'];
+    if (!key || !upstreamConnected) {
+      socket.destroy();
+      return;
+    }
+    const accept = crypto.createHash('sha1').update(key + WS_GUID).digest('base64');
+    socket.write(
+      [
+        'HTTP/1.1 101 Switching Protocols',
+        'Upgrade: websocket',
+        'Connection: Upgrade',
+        `Sec-WebSocket-Accept: ${accept}`,
+        '\r\n',
+      ].join('\r\n')
+    );
+
+    const client = new ServerWsClient(socket);
+    clients.add(client);
+
+    client.onMessage = (rawMsg) => {
+      let parsed;
+      try {
+        parsed = JSON.parse(rawMsg);
+      } catch {
+        return;
+      }
+      if (!parsed || typeof parsed !== 'object') return;
+
+      const clientMsgId = parsed.id;
+      if (!parsed.sessionId && parsed.method === 'Browser.close') {
+        client.send(JSON.stringify({ id: clientMsgId, result: {} }));
+        client.close();
+        return;
+      }
+
+      const isRootTargetAutoAttach =
+        !parsed.sessionId &&
+        parsed.method === 'Target.setAutoAttach' &&
+        parsed.params?.autoAttach === true;
+      const isRootDiscover =
+        !parsed.sessionId &&
+        parsed.method === 'Target.setDiscoverTargets' &&
+        parsed.params?.discover === true;
+
+      // If another client already enabled autoAttach/discover on the upstream socket,
+      // replay cached target events so the new client immediately sees all open tabs!
+      if (isRootTargetAutoAttach && autoAttachEnabledUpstream && attachedTargets.size > 0) {
+        for (const params of attachedTargets.values()) {
+          client.send(JSON.stringify({ method: 'Target.attachedToTarget', params }));
+        }
+      }
+      if (isRootDiscover && discoverEnabledUpstream && discoveredTargets.size > 0) {
+        for (const targetInfo of discoveredTargets.values()) {
+          client.send(JSON.stringify({ method: 'Target.targetCreated', params: { targetInfo } }));
+        }
+      }
+
+      if (isRootTargetAutoAttach) autoAttachEnabledUpstream = true;
+      if (isRootDiscover) discoverEnabledUpstream = true;
+
+      const upstreamId = nextUpstreamId++;
+      pendingCalls.set(upstreamId, { client, clientMsgId, internalResolve: null });
+      sendUpstreamRaw({ ...parsed, id: upstreamId });
+    };
+
+    client.onClose = () => {
+      clients.delete(client);
+      // When all downstream clients disconnect, reset autoAttach/discover on the upstream
+      // socket so the next sequential client gets fresh Target.attachedToTarget events
+      // from Chrome without closing the upstream WebSocket!
+      if (clients.size === 0 && upstreamConnected) {
+        autoAttachEnabledUpstream = false;
+        discoverEnabledUpstream = false;
+        attachedTargets.clear();
+        discoveredTargets.clear();
+        callUpstreamInternal('Target.setAutoAttach', {
+          autoAttach: false,
+          waitForDebuggerOnStart: false,
+          flatten: true,
+        }).catch(() => {});
+        callUpstreamInternal('Target.setDiscoverTargets', {
+          discover: false,
+        }).catch(() => {});
+      }
+    };
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, host, () => resolve());
+  });
+
+  const addr = server.address();
+  const actualPort = typeof addr === 'object' && addr ? addr.port : port;
+  const bridgeHttpUrl = `http://${host}:${actualPort}`;
+  const bridgeWsUrl = `ws://${host}:${actualPort}/devtools/browser/turbo-bridge`;
+
+  return {
+    server,
+    port: actualPort,
+    bridgeHttpUrl,
+    bridgeWsUrl,
+    close: async () => {
+      for (const c of clients) c.close();
+      clients.clear();
+      try {
+        upstreamWs?.close();
+      } catch {}
+      await new Promise((r) => server.close(() => r()));
+    },
+  };
+}
+
+/**
+ * Check if a persistent CDP Bridge is already running and connected to the given upstreamUrl.
+ */
+export async function getRunningBridgeInfo(bridgePort = DEFAULT_BRIDGE_PORT, host = '127.0.0.1') {
+  try {
+    const res = await fetch(`http://${host}:${bridgePort}/json/version`, {
+      signal: AbortSignal.timeout(600),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data && data.turboBridge && data.upstreamConnected) {
+      return {
+        bridgeHttpUrl: `http://${host}:${bridgePort}`,
+        bridgeWsUrl: data.webSocketDebuggerUrl,
+        upstreamUrl: data.upstreamUrl,
+      };
+    }
+  } catch {
+    // Bridge not running
+  }
+  return null;
+}
+
+/**
+ * Spawn a background detached CDP Bridge process so the single approved Chrome WebSocket
+ * persists across process exits and AFK overnight runs.
+ */
+export async function ensureCdpBridgeDaemon(
+  upstreamUrl,
+  { bridgePort = DEFAULT_BRIDGE_PORT, host = '127.0.0.1', timeoutMs = 45000 } = {}
+) {
+  const existing = await getRunningBridgeInfo(bridgePort, host);
+  if (existing && existing.upstreamUrl === upstreamUrl) {
+    return existing.bridgeHttpUrl;
+  }
+
+  const selfPath = fileURLToPath(import.meta.url);
+  if (process.platform === 'win32') {
+    try {
+      // Spawn outside any temporary Job Object on Windows via Win32_Process.Create
+      const cmdLine = `"${process.execPath}" "${selfPath}" --daemon --upstream "${upstreamUrl}" --port ${bridgePort} --host ${host}`;
+      const escaped = cmdLine.replace(/"/g, '\\"');
+      execSync(
+        `powershell -NoProfile -Command "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${escaped}' }"`,
+        { stdio: 'ignore', timeout: 5000 }
+      );
+    } catch {
+      const child = spawn(
+        process.execPath,
+        [selfPath, '--daemon', '--upstream', upstreamUrl, '--port', String(bridgePort), '--host', host],
+        { detached: true, stdio: 'ignore', windowsHide: true }
+      );
+      child.unref();
+    }
+  } else {
+    const child = spawn(
+      process.execPath,
+      [selfPath, '--daemon', '--upstream', upstreamUrl, '--port', String(bridgePort), '--host', host],
+      { detached: true, stdio: 'ignore' }
+    );
+    child.unref();
+  }
+
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const info = await getRunningBridgeInfo(bridgePort, host);
+    if (info) return info.bridgeHttpUrl;
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  return null;
+}
+
+/**
+ * Launch Chrome with a dedicated non-default `--user-data-dir` and `--remote-debugging-port`
+ * so Chrome 136+/144+/157 exposes standard HTTP/WS CDP with ZERO "Allow remote debugging?" prompts.
+ */
+export async function launchUnattendedChrome({
+   executablePath,
+  port = 9222,
+  userDataDir = path.join(os.homedir(), '.turbo-browser-mcp', 'chrome-profile'),
+  headless = false,
+} = {}) {
+  fs.mkdirSync(userDataDir, { recursive: true });
+  const args = [
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${userDataDir}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+  ];
+  if (headless) args.push('--headless=new');
+
+  if (process.platform === 'win32') {
+    try {
+      const quotedArgs = args.map((a) => `"${a}"`).join(' ');
+      const cmdLine = `"${executablePath}" ${quotedArgs}`;
+      const escaped = cmdLine.replace(/"/g, '\\"');
+      execSync(
+        `powershell -NoProfile -Command "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${escaped}' }"`,
+        { stdio: 'ignore', timeout: 5000 }
+      );
+    } catch {
+      const child = spawn(executablePath, args, { detached: true, stdio: 'ignore', windowsHide: headless });
+      child.unref();
+    }
+  } else {
+    const child = spawn(executablePath, args, { detached: true, stdio: 'ignore' });
+    child.unref();
+  }
+
+  const endpoint = `http://127.0.0.1:${port}`;
+  const start = Date.now();
+  while (Date.now() - start < 15000) {
+    try {
+      const res = await fetch(`${endpoint}/json/version`, { signal: AbortSignal.timeout(600) });
+      if (res.ok) return endpoint;
+    } catch {}
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  throw new Error(`Timed out waiting for unattended Chrome on ${endpoint}`);
+}
+
+// CLI daemon entrypoint: node src/cdp-bridge.mjs --daemon --upstream ws://... --port 9224
+const isDirectRun =
+  process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+if (isDirectRun && process.argv.includes('--daemon')) {
+  const getArg = (flag, fallback) => {
+    const idx = process.argv.indexOf(flag);
+    return idx >= 0 && process.argv[idx + 1] ? process.argv[idx + 1] : fallback;
+  };
+  const upstreamUrl = getArg('--upstream', '');
+  const port = Number(getArg('--port', DEFAULT_BRIDGE_PORT)) || DEFAULT_BRIDGE_PORT;
+  const host = getArg('--host', '127.0.0.1');
+
+  createCdpBridgeServer({ upstreamUrl, port, host })
+    .then(({ server, bridgeHttpUrl }) => {
+      console.log(`[turbo-browser-mcp] CDP Keep-Alive Bridge listening at ${bridgeHttpUrl} -> ${upstreamUrl}`);
+      server.on('close', () => process.exit(0));
+    })
+    .catch((err) => {
+      console.error(`[turbo-browser-mcp] Bridge daemon failed: ${err.message}`);
+      process.exit(1);
+    });
+}

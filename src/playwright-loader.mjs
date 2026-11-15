@@ -1,7 +1,9 @@
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { getRunningBridgeInfo } from './cdp-bridge.mjs';
 
 let cachedPw = null;
 
@@ -164,6 +166,125 @@ export function resolveChromiumExecutable(chromium, headless = true) {
   return {};
 }
 
+function isTcpPortOpen(host, port, timeoutMs = 500) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+    socket.connect(port, host);
+  });
+}
+
+function getDefaultUserDataDirs() {
+  if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA || '';
+    if (!localAppData) return [];
+    return [
+      path.join(localAppData, 'Google', 'Chrome', 'User Data'),
+      path.join(localAppData, 'Microsoft', 'Edge', 'User Data'),
+      path.join(localAppData, 'BraveSoftware', 'Brave-Browser', 'User Data'),
+    ];
+  }
+  if (process.platform === 'darwin') {
+    const appSupport = path.join(os.homedir(), 'Library', 'Application Support');
+    return [
+      path.join(appSupport, 'Google', 'Chrome'),
+      path.join(appSupport, 'Microsoft Edge'),
+      path.join(appSupport, 'BraveSoftware', 'Brave-Browser'),
+      path.join(appSupport, 'Chromium'),
+    ];
+  }
+  const cfg = path.join(os.homedir(), '.config');
+  return [
+    path.join(cfg, 'google-chrome'),
+    path.join(cfg, 'chromium'),
+    path.join(cfg, 'microsoft-edge'),
+    path.join(cfg, 'BraveSoftware', 'Brave-Browser'),
+  ];
+}
+
+/**
+ * Resolve an active CDP HTTP or WebSocket endpoint. Supports both classic
+ * `--remote-debugging-port` (`/json/version`) and Chrome 144+
+ * `chrome://inspect/#remote-debugging` (`DevToolsActivePort` -> `ws://127.0.0.1:<port>/devtools/browser/<id>`).
+ */
+export async function resolveActiveCdpEndpoint(
+  cdpUrl = process.env.TURBO_BROWSER_CDP_URL || 'http://127.0.0.1:9222',
+  userDataDir = process.env.TURBO_BROWSER_USER_DATA_DIR || ''
+) {
+  const raw = String(cdpUrl || 'http://127.0.0.1:9222').trim();
+  if (raw.startsWith('ws://') || raw.startsWith('wss://')) {
+    try {
+      const parsed = new URL(raw);
+      const port = Number(parsed.port) || (parsed.protocol === 'wss:' ? 443 : 80);
+      if (await isTcpPortOpen(parsed.hostname || '127.0.0.1', port)) {
+        return raw;
+      }
+    } catch {
+      // Fall through
+    }
+    return null;
+  }
+
+  try {
+    const res = await fetch(new URL('/json/version', raw).href, {
+      signal: AbortSignal.timeout(800),
+    });
+    if (res.ok) return raw;
+  } catch {
+    // Fall through to DevToolsActivePort inspection when /json/version is disabled or unreachable.
+  }
+
+  const isDefaultLocalCdp = /^https?:\/\/(127\.0\.0\.1|localhost):9222\/?$/i.test(raw);
+  const inNodeTest = Boolean(process.env.NODE_TEST_CONTEXT) || process.execArgv.includes('--test');
+
+  if (!inNodeTest && isDefaultLocalCdp && process.env.TURBO_BROWSER_DISABLE_BRIDGE !== 'true') {
+    const runningBridge = await getRunningBridgeInfo();
+    if (runningBridge) {
+      return runningBridge.bridgeHttpUrl;
+    }
+  }
+
+  const candidateDirs = [
+    userDataDir ? path.resolve(userDataDir) : '',
+    ...(!inNodeTest && isDefaultLocalCdp ? getDefaultUserDataDirs() : []),
+  ].filter(Boolean);
+
+  for (const dir of candidateDirs) {
+    const portFile = path.join(dir, 'DevToolsActivePort');
+    if (!fs.existsSync(portFile)) continue;
+    try {
+      const lines = fs
+        .readFileSync(portFile, 'utf8')
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+      if (lines.length < 2) continue;
+      const port = Number.parseInt(lines[0], 10);
+      const wsPath = lines[1];
+      if (!Number.isInteger(port) || port <= 0 || port > 65535 || !wsPath.startsWith('/')) {
+        continue;
+      }
+      if (await isTcpPortOpen('127.0.0.1', port)) {
+        return `ws://127.0.0.1:${port}${wsPath}`;
+      }
+    } catch {
+      // Ignore unreadable DevToolsActivePort candidate.
+    }
+  }
+
+  return null;
+}
+
 /**
  * Inspect local Node, Playwright, Chromium binary, and CDP reachability for `--doctor`.
  */
@@ -183,15 +304,8 @@ export async function diagnoseEnvironment(
     playwrightError = String(err?.message || err);
   }
 
-  let cdpReachable = false;
-  try {
-    const res = await fetch(new URL('/json/version', cdpUrl).href, {
-      signal: AbortSignal.timeout(800),
-    });
-    cdpReachable = res.ok;
-  } catch {
-    cdpReachable = false;
-  }
+  const resolvedEndpoint = await resolveActiveCdpEndpoint(cdpUrl);
+  const cdpReachable = Boolean(resolvedEndpoint);
 
   return {
     nodeVersion: process.version,
@@ -200,7 +314,7 @@ export async function diagnoseEnvironment(
     playwrightLoaded,
     ...(playwrightError ? { playwrightError } : {}),
     executablePath,
-    cdpUrl,
+    cdpUrl: resolvedEndpoint || cdpUrl,
     cdpReachable,
   };
 }

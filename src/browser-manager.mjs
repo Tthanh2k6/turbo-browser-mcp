@@ -1,8 +1,13 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { ensureCdpBridgeDaemon } from './cdp-bridge.mjs';
 import { resolveSafePath } from './dom-engine.mjs';
-import { loadPlaywright, resolveChromiumExecutable } from './playwright-loader.mjs';
+import {
+  loadPlaywright,
+  resolveActiveCdpEndpoint,
+  resolveChromiumExecutable,
+} from './playwright-loader.mjs';
 
 const CONSOLE_RING_LIMIT = 80;
 const REQUEST_RING_LIMIT = 100;
@@ -133,13 +138,8 @@ export class BrowserManager {
   }
 
   async _canReachCdp() {
-    try {
-      const url = new URL('/json/version', this.cdpUrl).href;
-      const res = await fetch(url, { signal: AbortSignal.timeout(800) });
-      return res.ok;
-    } catch {
-      return false;
-    }
+    const endpoint = await resolveActiveCdpEndpoint(this.cdpUrl, this.userDataDir);
+    return Boolean(endpoint);
   }
 
   async _launchFallback(chromium) {
@@ -164,15 +164,36 @@ export class BrowserManager {
   async _init() {
     const { chromium } = await loadPlaywright();
 
-    if (this.mode === 'cdp' || (this.mode === 'auto' && (await this._canReachCdp()))) {
+    const activeCdpEndpoint =
+      this.mode === 'cdp' || this.mode === 'auto'
+        ? await resolveActiveCdpEndpoint(this.cdpUrl, this.userDataDir)
+        : null;
+
+    if (this.mode === 'cdp' || (this.mode === 'auto' && activeCdpEndpoint)) {
+      let targetEndpoint = activeCdpEndpoint || this.cdpUrl;
+      const inNodeTest = Boolean(process.env.NODE_TEST_CONTEXT) || process.execArgv.includes('--test');
+      if (
+        !inNodeTest &&
+        process.env.TURBO_BROWSER_DISABLE_BRIDGE !== 'true' &&
+        (targetEndpoint.startsWith('ws://') || targetEndpoint.startsWith('wss://'))
+      ) {
+        const bridged = await ensureCdpBridgeDaemon(targetEndpoint, {
+          timeoutMs: Math.max(this.defaultTimeoutMs, 30000),
+        });
+        if (bridged) {
+          targetEndpoint = bridged;
+        }
+      }
       try {
-        this.browser = await chromium.connectOverCDP(this.cdpUrl);
+        this.browser = await chromium.connectOverCDP(targetEndpoint, {
+          timeout: Math.max(this.defaultTimeoutMs, 20000),
+        });
         this.context = this.browser.contexts()[0] ?? (await this.browser.newContext());
         this.connectionType = 'cdp';
       } catch (err) {
         if (this.mode === 'cdp') {
           throw new Error(
-            `Failed to attach via CDP at ${this.cdpUrl}. Start Chrome with --remote-debugging-port=9222. (${err.message})`
+            `Failed to attach via CDP at ${targetEndpoint}. Enable chrome://inspect/#remote-debugging (and click Allow on the prompt) or start Chrome with --remote-debugging-port=9222. (${err.message})`
           );
         }
       }

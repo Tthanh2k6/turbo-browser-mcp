@@ -3,7 +3,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BrowserManager } from './browser-manager.mjs';
-import { diagnoseEnvironment } from './playwright-loader.mjs';
+import {
+  ensureCdpBridgeDaemon,
+  getRunningBridgeInfo,
+  launchUnattendedChrome,
+} from './cdp-bridge.mjs';
+import {
+  diagnoseEnvironment,
+  loadPlaywright,
+  resolveActiveCdpEndpoint,
+  resolveChromiumExecutable,
+} from './playwright-loader.mjs';
 import {
   actFast,
   batchActions,
@@ -938,6 +948,8 @@ Options:
   -h, --help                 Show this help message
   -v, --version              Print version (${SERVER_INFO.version})
   --doctor                   Check Node, Playwright, Chromium, and CDP availability (JSON)
+  --bridge                   Start/verify the persistent CDP Keep-Alive Bridge daemon (1 approval total)
+  --launch-chrome            Launch Chrome with a dedicated profile & --remote-debugging-port=9222 (0 prompts)
   --mode <auto|cdp|persistent|launch>  Browser connection mode (default: auto)
   --cdp <url>                CDP endpoint URL (default: http://127.0.0.1:9222)
   --user-data-dir <path>     Persistent browser profile directory
@@ -959,7 +971,15 @@ Example MCP config:
 `;
 
 export function parseCliArgs(argv = process.argv.slice(2)) {
-  const out = { version: false, help: false, doctor: false, envOverrides: {}, unknown: null };
+  const out = {
+    version: false,
+    help: false,
+    doctor: false,
+    bridge: false,
+    launchChrome: false,
+    envOverrides: {},
+    unknown: null,
+  };
   for (let i = 0; i < argv.length; i++) {
     const raw = String(argv[i]);
     const eqIdx = raw.indexOf('=');
@@ -972,6 +992,10 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
       out.help = true;
     } else if (flag === '--doctor') {
       out.doctor = true;
+    } else if (flag === '--bridge') {
+      out.bridge = true;
+    } else if (flag === '--launch-chrome') {
+      out.launchChrome = true;
     } else if (flag === '--headless') {
       out.envOverrides.TURBO_BROWSER_HEADLESS = 'true';
     } else if (flag === '--headed') {
@@ -1013,6 +1037,51 @@ async function runCli() {
     const report = await diagnoseEnvironment(process.env.TURBO_BROWSER_CDP_URL || 'http://127.0.0.1:9222');
     process.stdout.write(`${JSON.stringify({ version: SERVER_INFO.version, ...report }, null, 2)}\n`);
     process.exit(report.playwrightLoaded ? 0 : 1);
+  }
+  if (parsed.launchChrome) {
+    const pw = await loadPlaywright();
+    const { executablePath } = resolveChromiumExecutable(pw.chromium, false);
+    if (!executablePath) {
+      process.stderr.write('No Chrome/Chromium executable found.\n');
+      process.exit(1);
+    }
+    const endpoint = await launchUnattendedChrome({
+      executablePath,
+      userDataDir: process.env.TURBO_BROWSER_USER_DATA_DIR || undefined,
+      headless: process.env.TURBO_BROWSER_HEADLESS === 'true',
+    });
+    process.stdout.write(
+      `${JSON.stringify({ ok: true, mode: 'unattended-cdp', endpoint, executablePath }, null, 2)}\n`
+    );
+    process.exit(0);
+  }
+  if (parsed.bridge) {
+    const existing = await getRunningBridgeInfo();
+    if (existing) {
+      process.stdout.write(`${JSON.stringify({ ok: true, reused: true, ...existing }, null, 2)}\n`);
+      process.exit(0);
+    }
+    const prevDisable = process.env.TURBO_BROWSER_DISABLE_BRIDGE;
+    process.env.TURBO_BROWSER_DISABLE_BRIDGE = 'true';
+    const rawEndpoint = await resolveActiveCdpEndpoint(
+      process.env.TURBO_BROWSER_CDP_URL || 'http://127.0.0.1:9222',
+      process.env.TURBO_BROWSER_USER_DATA_DIR || ''
+    );
+    if (prevDisable === undefined) delete process.env.TURBO_BROWSER_DISABLE_BRIDGE;
+    else process.env.TURBO_BROWSER_DISABLE_BRIDGE = prevDisable;
+
+    if (!rawEndpoint || (!rawEndpoint.startsWith('ws://') && !rawEndpoint.startsWith('wss://'))) {
+      process.stdout.write(
+        `${JSON.stringify({ ok: Boolean(rawEndpoint), bridgeNeeded: false, endpoint: rawEndpoint }, null, 2)}\n`
+      );
+      process.exit(rawEndpoint ? 0 : 1);
+    }
+    const bridgeHttpUrl = await ensureCdpBridgeDaemon(rawEndpoint, { timeoutMs: 60000 });
+    const info = await getRunningBridgeInfo();
+    process.stdout.write(
+      `${JSON.stringify({ ok: Boolean(bridgeHttpUrl), reused: false, ...(info || { bridgeHttpUrl }) }, null, 2)}\n`
+    );
+    process.exit(bridgeHttpUrl ? 0 : 1);
   }
 
   startStdioServer();

@@ -18,6 +18,8 @@
     "start": "node ./src/index.mjs",
     "test": "node --test --test-concurrency=4 test/*.test.mjs",
     "doctor": "node ./src/index.mjs --doctor",
+    "bridge": "node ./src/index.mjs --bridge",
+    "launch-chrome": "node ./src/index.mjs --launch-chrome",
     "benchmark": "node ./benchmarks/benchmark.mjs"
   },
   "keywords": [

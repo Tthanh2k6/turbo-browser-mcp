@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Tthanh2k6/turbo-browser-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Tthanh2k6/turbo-browser-mcp/actions/workflows/ci.yml)
 ![Version](https://img.shields.io/badge/version-0.4.0-blue)
-![Tests](https://img.shields.io/badge/tests-405%20passing%20(85%20suites)-brightgreen)
+![Tests](https://img.shields.io/badge/tests-407%20passing%20(86%20suites)-brightgreen)
 ![Node](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
@@ -306,20 +306,31 @@ Using `npx` / binary entrypoint:
 | `--headless` / `--headed` | `TURBO_BROWSER_HEADLESS` | `true` (headless) | Run headless or visible browser window (`"false"` for headed) |
 | `--allow-submit` | - | `false` | Disable default Submit/Publish confirmation guard |
 | `--doctor` | - | - | Print Node, Playwright, Chromium, and CDP diagnostics as JSON |
+| `--bridge` | `TURBO_BROWSER_BRIDGE_PORT` | `9224` | Start/verify the persistent CDP Keep-Alive Bridge daemon for Chrome 144+ `DevToolsActivePort` (approve once, reconnect unlimited times AFK) |
+| `--launch-chrome` | - | `~/.turbo-browser-mcp/chrome-profile` | Launch Chrome with a dedicated profile & `--remote-debugging-port=9222` (`0` approval prompts ever) |
 | `--version` / `-v` | - | - | Print server version (`0.4.0`) |
 | `--help` / `-h` | - | - | Print CLI usage summary |
 | - | `TURBO_BROWSER_SAVE_ROOT` | `process.cwd()` | Root directory confining `savePath` and `storageState` files |
 | - | `PLAYWRIGHT_CORE_PATH` | auto-resolved | Explicit path to `playwright-core/index.mjs` |
 
-> **Tip - Reusing your logged-in Chrome tabs:** Enable remote debugging on port `9222` (via `chrome://inspect/#remote-debugging` or launching Chrome with `--remote-debugging-port=9222`). In default `--mode auto`, `turbo-browser-mcp` attaches to your open tabs directly instead of launching a fresh unauthenticated browser.
+### Unattended Overnight / AFK Automation (Eliminating Chrome 144+ Approval Prompts)
+
+In Chrome 136+/144+, enabling `chrome://inspect/#remote-debugging` on the default `User Data` directory exposes a WebSocket in `DevToolsActivePort` that displays an **"Allow remote debugging?"** prompt whenever a new WebSocket client connects. `turbo-browser-mcp` provides two built-in solutions so overnight AFK multi-agent runs never hang on a prompt:
+
+1. **Automatic CDP Keep-Alive Bridge Daemon (`npm run bridge` / `--bridge`, enabled automatically on `DevToolsActivePort`)**:
+   - Spawns a detached background multiplexer (`src/cdp-bridge.mjs` on `http://127.0.0.1:9224`) that holds **one persistent upstream WebSocket** to Chrome open indefinitely and intercepts `Browser.close` so downstream scripts never terminate your browser.
+   - You click **Allow** once when starting your session; afterwards, any number of MCP servers, CLI scripts, or subagents can connect and disconnect all night with **0 additional prompts**.
+2. **Zero-Prompt Dedicated Profile Launcher (`npm run launch-chrome` / `--launch-chrome`)**:
+   - Launches Chrome with `--remote-debugging-port=9222` and a dedicated `--user-data-dir` (`~/.turbo-browser-mcp/chrome-profile`), where Chrome exposes standard HTTP/WS CDP with **0 confirmation dialogs even on the very first connection**.
 
 ---
 
 ## Verification
 
 ```bash
-npm test            # 405 passing tests across 85 suites (25 test files under test/*.test.mjs)
+npm test            # 407 passing tests across 86 suites (26 test files under test/*.test.mjs)
 npm run doctor      # Environment check for Node, Playwright, Chromium, and CDP
+npm run bridge      # Start/verify persistent CDP Keep-Alive Bridge daemon
 npm run benchmark   # Local Chromium speed & exact o200k_base token benchmark
 ```
 
