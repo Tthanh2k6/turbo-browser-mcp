@@ -5186,9 +5186,19 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
       const needleOrig = String(params.textNew).split('|').map((x) => x.trim()).filter(Boolean);
       const needles = needleOrig.map((x) => x.toLowerCase());
       const key = '__tbmTN' + Math.random().toString(36).slice(2);
-      const scan = ([ns, k, init]) => {
+      const scan = ([ns, k, init, fresh]) => {
+        // fresh: the document was just loaded by a navigation in this batch, so an empty baseline is the right one
+        // (this also covers a baseline write that was lost to a process swap).
+        if (fresh && !window[k]) { window[k] = new WeakSet(); window[k + 't'] = ''; }
         const seen = init ? (window[k] = new WeakSet()) : window[k];
         if (!seen) return '';
+        if (init) window[k + 't'] = document.title;
+        // The page title counts too: text such as "Example Domain" can live only in <title>.
+        const title = (document.title || '').toLowerCase();
+        if (title && document.title !== window[k + 't']) {
+          const th = ns.find((x) => title.includes(x));
+          if (th) return th;
+        }
         for (const el of document.querySelectorAll('body *')) {
           let own = '';
           for (const n of el.childNodes) if (n.nodeType === 3) own += n.nodeValue + ' ';
@@ -5205,21 +5215,21 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
       const frames = getAllFrames(page);
       if (params._freshDocument) {
         // Right after navigate/reload/back/forward in the same batch: everything on the new document is new.
-        await Promise.all(frames.map((f) => f.frame.evaluate((k) => { window[k] = new WeakSet(); }, key).catch(() => '')));
+        await Promise.all(frames.map((f) => f.frame.evaluate((k) => { window[k] = new WeakSet(); window[k + 't'] = ''; }, key).catch(() => '')));
       } else {
-        await Promise.all(frames.map((f) => f.frame.evaluate(scan, [needles, key, true]).catch(() => '')));
+        await Promise.all(frames.map((f) => f.frame.evaluate(scan, [needles, key, true, false]).catch(() => '')));
       }
       const deadline = Date.now() + timeout;
       try {
         while (Date.now() <= deadline) {
           for (const f of getAllFrames(page)) {
-            const hit = await f.frame.evaluate(scan, [needles, key, false]).catch(() => '');
+            const hit = await f.frame.evaluate(scan, [needles, key, false, Boolean(params._freshDocument)]).catch(() => '');
             if (hit) return { ok: true, action, waitedFor: params.textNew, ...(needles.length > 1 ? { matched: needleOrig[needles.indexOf(hit)] } : {}) };
           }
           await page.waitForTimeout(80);
         }
       } finally {
-        for (const f of getAllFrames(page)) f.frame.evaluate((k) => { delete window[k]; }, key).catch(() => {});
+        for (const f of getAllFrames(page)) f.frame.evaluate((k) => { delete window[k]; delete window[k + 't']; }, key).catch(() => {});
       }
       throw new Error(`Timed out after ${timeout}ms waiting for new "${params.textNew}".`);
     }

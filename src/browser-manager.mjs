@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ensureCdpBridgeDaemon } from './cdp-bridge.mjs';
+import { cdpRawCall } from './cdp-raw.mjs';
 import { resolveSafePath } from './dom-engine.mjs';
 import { gotoRetry, navHealth } from './navinfo.mjs';
 import { redactText } from './secrets.mjs';
@@ -111,6 +112,7 @@ export class BrowserManager {
     this.tabs = new Map();
     this.isolatedContexts = new Map();
     this._foreignPages = new WeakSet();
+    this._unknownContextPages = new WeakSet();
     this.tabContextName = new Map();
     this.pageToId = new WeakMap();
     this.attachedPages = new WeakSet();
@@ -224,6 +226,7 @@ export class BrowserManager {
           timeout: this.mode === 'auto' ? (bridgeTimedOut ? 3000 : Math.min(waitMs, 60000)) : Math.max(this.defaultTimeoutMs, 20000),
         });
         this.connectionNote = '';
+        this._cdpEndpoint = targetEndpoint;
         this.context = this.browser.contexts()[0] ?? (await this.browser.newContext());
         this.connectionType = 'cdp';
       } catch (err) {
@@ -869,21 +872,27 @@ export class BrowserManager {
     try { pages = this.context.pages().filter((p) => !p.isClosed() && !this._ctxChecked.has(p)); } catch { return; }
     if (pages.length > 0) {
       const work = (async () => {
-        const root = await this.browser.newBrowserCDPSession();
+        let viaSession = false;
         try {
-          const res = await root.send('Target.getBrowserContexts');
-          const nonDefault = new Set(res?.browserContextIds || []);
-          if (nonDefault.size === 0) { for (const p of pages) this._ctxChecked.add(p); return; }
-          await Promise.all(pages.map(async (p) => {
-            let s;
-            try {
-              s = await this.context.newCDPSession(p);
-              const info = (await s.send('Target.getTargetInfo'))?.targetInfo;
-              this._ctxChecked.add(p);
-              if (info?.browserContextId && nonDefault.has(info.browserContextId)) this._foreignPages.add(p);
-            } catch { /* leave unchecked, retried next listing */ } finally { await s?.detach().catch(() => {}); }
-          }));
-        } finally { await root.detach().catch(() => {}); }
+          const root = await this.browser.newBrowserCDPSession();
+          try {
+            const res = await root.send('Target.getBrowserContexts');
+            const nonDefault = new Set(res?.browserContextIds || []);
+            if (nonDefault.size === 0) { for (const p of pages) this._ctxChecked.add(p); viaSession = true; return; }
+            await Promise.all(pages.map(async (p) => {
+              let s;
+              try {
+                s = await this.context.newCDPSession(p);
+                const info = (await s.send('Target.getTargetInfo'))?.targetInfo;
+                this._ctxChecked.add(p);
+                if (info?.browserContextId && nonDefault.has(info.browserContextId)) this._foreignPages.add(p);
+              } catch { /* leave unchecked, retried next listing */ } finally { await s?.detach().catch(() => {}); }
+            }));
+            viaSession = pages.every((p) => this._ctxChecked.has(p));
+          } finally { await root.detach().catch(() => {}); }
+        } catch { /* fall through to the bridge route */ }
+        if (viaSession) return;
+        await this._labelPagesViaBridge(pages);
       })().catch(() => {});
       let timer;
       await Promise.race([work, new Promise((r) => { timer = setTimeout(r, 2000); })]);
@@ -891,6 +900,33 @@ export class BrowserManager {
     }
     for (const [tabId, p] of this.tabs) {
       if (this._foreignPages.has(p) && (this.tabContextName.get(tabId) || 'default') === 'default') this.tabContextName.set(tabId, 'other');
+      else if (this._unknownContextPages.has(p) && (this.tabContextName.get(tabId) || 'default') === 'default') this.tabContextName.set(tabId, 'unknown');
+    }
+  }
+
+  // An older bridge build never tracked Target.attachToBrowserTarget sessions, so Playwright's browser-level session
+  // (and every newCDPSession built on it) fails with "Session with given id not found". A sessionless Target.getTargets
+  // is forwarded by every bridge build and returns each page's browserContextId. Playwright does not expose a page's
+  // targetId, so pages are matched by url and title; a page that matches targets of both kinds is marked "unknown".
+  async _labelPagesViaBridge(pages) {
+    if (!this._cdpEndpoint) return;
+    let info, version;
+    try {
+      info = (await cdpRawCall(this._cdpEndpoint, 'Target.getTargets', {}, 2000, { onlyBridge: true }))?.targetInfos;
+      version = await cdpRawCall(this._cdpEndpoint, 'Target.getBrowserContexts', {}, 2000, { onlyBridge: true });
+    } catch { return; }
+    const nonDefault = new Set(version?.browserContextIds || []);
+    const targets = (info || []).filter((t) => t.type === 'page');
+    for (const p of pages) {
+      let url = '', title = '';
+      try { url = p.url(); title = await p.title(); } catch { continue; }
+      let cands = targets.filter((t) => t.url === url);
+      if (cands.length > 1) { const byTitle = cands.filter((t) => t.title === title); if (byTitle.length) cands = byTitle; }
+      if (cands.length === 0) continue; // not listed yet: retried next listing
+      const foreign = cands.filter((t) => nonDefault.has(t.browserContextId)).length;
+      if (foreign === cands.length) { this._ctxChecked.add(p); this._foreignPages.add(p); }
+      else if (foreign === 0) this._ctxChecked.add(p);
+      else { this._ctxChecked.add(p); this._unknownContextPages.add(p); }
     }
   }
 

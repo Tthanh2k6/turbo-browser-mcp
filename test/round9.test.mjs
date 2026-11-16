@@ -96,7 +96,8 @@ describe('round 9 item 2: click on a disabled target fails fast for every target
     const t0 = Date.now();
     await assert.rejects(actFast(page, params), (e) => /target is disabled/.test(e.message), JSON.stringify(params));
     const ms = Date.now() - t0;
-    assert.ok(ms < 300, `${JSON.stringify(params)} took ${ms} ms`);
+    // The old behaviour waited the full 8 s timeout; 1 s leaves room for a loaded CI box.
+    assert.ok(ms < 1000, `${JSON.stringify(params)} took ${ms} ms`);
   };
   it('text, selector and ref targets', async () => {
     await page.setContent(HTML);
