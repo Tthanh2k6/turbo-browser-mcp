@@ -1,6 +1,6 @@
 {
   "name": "turbo-browser-mcp",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Fast, token-efficient MCP server for Playwright browser automation with batched DOM actions, React/Shadow DOM/contenteditable form prefill, isolated contexts, download/network diagnostics, and direct disk file uploads.",
   "type": "module",
   "main": "./src/index.mjs",
@@ -9,7 +9,6 @@
   },
   "files": [
     "src/",
-    "benchmarks/",
     "README.md",
     "LICENSE",
     "server.json"

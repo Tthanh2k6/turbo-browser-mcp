@@ -27,9 +27,14 @@ import {
 } from './dom-engine.mjs';
 import { waitForHuman } from './guards.mjs';
 
+// Read from package.json so --version, --doctor and serverInfo never drift from the published version.
+const PACKAGE_VERSION = JSON.parse(
+  fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+).version;
+
 const SERVER_INFO = {
   name: 'turbo-browser-mcp',
-  version: '0.5.0',
+  version: PACKAGE_VERSION,
 };
 
 // Kept short on purpose: every byte here is sent to the model on every turn.

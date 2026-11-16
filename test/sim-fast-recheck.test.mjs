@@ -58,7 +58,7 @@ describe('Fast Recheck Audit (#170 diff)', { concurrency: 1 }, () => {
     if (bm) await bm.close().catch(() => {});
     if (server1) await new Promise((r) => server1.close(r));
     if (server2) await new Promise((r) => server2.close(r));
-    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   });
 
   it('1. Cross-origin iframe contentWindow/contentDocument, detached iframe, descriptor toString, and child form.submit()', async () => {
