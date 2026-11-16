@@ -388,7 +388,7 @@ In Chrome 136+/144+, enabling `chrome://inspect/#remote-debugging` on the defaul
 ## Verification
 
 ```bash
-npm test            # 424 passing tests across 87 suites (27 test files under test/*.test.mjs)
+npm test            # 437 tests across 87 suites (29 test files under test/*.test.mjs)
 npm run doctor      # Environment check for Node, Playwright, Chromium, and CDP
 npm run bridge      # Start/verify persistent CDP Keep-Alive Bridge daemon
 npm run benchmark   # Local Chromium speed & exact o200k_base token benchmark
@@ -396,6 +396,41 @@ npm run benchmark:e2e  # End-to-end wizard task + commit-safety cases (see bench
 ```
 
 Tested automatically on GitHub Actions (`ubuntu-latest`) across **Node 20** and **Node 22**.
+
+## Click aftermath reporting
+
+Set `observeAftermath: true` on `act_fast` or `batch_actions` (or set
+`TURBO_BROWSER_OBSERVE_AFTERMATH=true`) to observe navigation and mutating
+fetch/XHR requests for one second after each click. It is off by default.
+The result includes `aftermath: { beforeUrl, afterUrl, navigated,
+mutatingRequests, unexpectedSubmit }`. Requests include their method, URL,
+and a `finalSubmit` classification. Main-frame origin/path changes or
+commit-like requests produce a warning when `allowSubmit` is false.
+
+This reports an action that has already occurred. It cannot prevent a commit
+or prove that a submission succeeded. Wizard navigation can trigger a warning,
+and opaque endpoints or requests outside the observation window can be missed.
+Use the network guard for prevention and `expect` for receipt verification.
+See [fixture and classification details](test/COMMUNITY_FIXTURES.md).
+
+## Known limits / roadmap
+
+- Portaled comboboxes have click and keyboard paths. The keyboard fallback
+  searches up to 100 active options and checks the committed value. Virtualized
+  selects beyond the included behavioral fixtures still need broader testing
+  against real react-select, Radix, and Headless UI applications.
+- Sites with bot detection may require `wait_for_human` and a human to complete
+  the check in the same browser session. Automation does not bypass those checks.
+- End-to-end comparisons with other browser stacks are pending. The
+  [comparison plan](benchmarks/E2E_PLAN.md) defines three tasks, success checks,
+  and model-token, turn, and wall-time measurements. Existing local benchmarks
+  do not establish comparative agent performance.
+
+Community suggestions: johnnylemonny and alexcodebytes on portaled and
+virtualized selects; eye_java_420f1faa10ae8b86 on keyboard selection and submit
+aftermath; amintacccp on safe submit labels; snake_doc and lukevp on end-to-end
+comparison and abstraction levels; vidarh on human handoff; harrysong138759
+on receipt verification and duplicate submissions.
 
 ## License
 
