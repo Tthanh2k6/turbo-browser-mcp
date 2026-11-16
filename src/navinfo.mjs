@@ -10,6 +10,16 @@ const BLOCK_BODY_RES = [
   [/complete the security check|unusual traffic|select all (squares|images)|are you a robot|i'?m not a robot|verify you are not a robot/i, 'captcha'],
 ];
 
+const LOGIN_PATH_RE = /(^|\/)(log-?in|sign-?in|signin|auth|sso|account\/login|accounts\/login)(\/|$)/i;
+
+function isLoginUrl(u) {
+  try {
+    return LOGIN_PATH_RE.test(new URL(u).pathname);
+  } catch {
+    return false;
+  }
+}
+
 function sameUrl(a, b) {
   try {
     const x = new URL(a);
@@ -71,6 +81,16 @@ export async function navHealth(page, response, requestedUrl, title, opts = {}) 
     for (const [re, tag] of BLOCK_TITLE_RES) {
       if (re.test(title || '')) { blocked = tag; break; }
     }
+  }
+  // Redirected onto a login path that was not requested: the content sits behind a login.
+  if (!blocked && out.finalUrl && requestedUrl && isLoginUrl(finalUrl) && !isLoginUrl(requestedUrl)) blocked = 'authwall';
+  // 401/403 whose page is a login form (visible password field).
+  if (!blocked && (status === 401 || status === 403)) {
+    const hasForm = await Promise.race([
+      page.evaluate(() => [...document.querySelectorAll('input[type=password]')].some((i) => i.getBoundingClientRect().width > 0)),
+      new Promise((r) => setTimeout(() => r(false), 400)),
+    ]).catch(() => false);
+    if (hasForm) blocked = 'authwall';
   }
   if (!blocked && (!title || title.length < 80)) {
     let snippet = '';
