@@ -16,10 +16,10 @@ before(async () => {
     res.setHeader('content-type', 'text/html');
     if (req.url === '/') {
       res.end(`<!doctype html><title>Old page</title>
-        <a id="link" href="/receipt" onclick="event.preventDefault(); setTimeout(() => location.href=this.href, 100)">Review</a>
+        <a id="link" href="/receipt" onclick="event.preventDefault(); setTimeout(() => location.href=this.href, 50)">Review</a>
         <form action="/receipt"><input id="enter" name="name" value="Ada"><button id="submit">Submit</button></form>
         <button id="spa" onclick="history.pushState({}, '', '/spa'); document.querySelector('#link').textContent='Updated'">Next</button>
-        <button id="reload" onclick="setTimeout(() => location.reload(), 100)">Reload</button>`);
+        <button id="reload" onclick="setTimeout(() => location.reload(), 50)">Reload</button>`);
     } else if (req.url.startsWith('/receipt')) {
       // Delay the response so a request has started while page.url() is still the old URL.
       setTimeout(() => res.end('<!doctype html><title>Receipt</title><button>New document</button>'), 450);

@@ -3944,8 +3944,45 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
               await comboLoc.evaluate((el) => el.setAttribute('data-tbm-combo-open', '1')).catch(() => {});
               break;
             }
+            // The list is open but the option is not rendered (paged, windowed or filtered list):
+            // stop polling and go to the search box / keyboard steps below.
+            if (pollRes.anyVisibleOption && attempt >= 2) break;
             await page.waitForTimeout(35);
           }
+        }
+
+        if (!clickedOption) {
+          // Portaled lists with their own search box: the box is focused on open, or sits next to
+          // the listbox named by aria-controls. Type the wanted text there, then pick the option.
+          const searchHandle = await comboLoc.evaluateHandle((el) => {
+            const isText = (n) => Boolean(n && n !== el && n.matches?.(
+              'input:not([type]), input[type="text"], input[type="search"], textarea') && !n.readOnly && !n.disabled);
+            const doc = el.ownerDocument;
+            if (isText(doc.activeElement)) return doc.activeElement;
+            const id = el.getAttribute('aria-controls') || el.getAttribute('aria-owns');
+            let box = id ? doc.getElementById(id) : null;
+            for (let up = 0; box && up < 3; up++, box = box.parentElement) {
+              const input = [...box.querySelectorAll('input, textarea')].find(isText);
+              if (input) return input;
+            }
+            return null;
+          }).catch(() => null);
+          const searchEl = searchHandle?.asElement?.() || null;
+          if (searchEl) {
+            await searchEl.fill(comboWanted).catch(() => {});
+            for (let attempt = 0; attempt < 18 && !clickedOption; attempt++) {
+              const pollRes = await tryPickEnabledOption();
+              if (pollRes.clicked) {
+                clickedOption = true;
+                await comboLoc.evaluate((el) => el.removeAttribute('data-tbm-combo-open')).catch(() => {});
+              } else if (pollRes.sawDisabledMatch) {
+                break;
+              } else {
+                await page.waitForTimeout(35);
+              }
+            }
+          }
+          await searchHandle?.dispose?.().catch(() => {});
         }
 
         if (!clickedOption) {
@@ -3985,6 +4022,19 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             }
             break;
           }
+        }
+
+        if (!clickedOption) {
+          const seen = [];
+          for (const scope of optionScopes) {
+            const texts = await scope.getByRole('option').allTextContents().catch(() => []);
+            for (const t of texts) if (t.trim() && seen.length < 5) seen.push(t.trim().slice(0, 60));
+          }
+          skipped.push({ idx: f._idx, reason: 'combobox-option-not-found', wanted: comboWanted,
+            ...(seen.length ? { visibleOptions: seen } : {}) });
+          await page.keyboard.press('Escape').catch(() => {});
+          matchedFieldIndexes.add(f._idx);
+          break;
         }
 
         if (clickedOption) {
@@ -4403,7 +4453,9 @@ function watchActionNavigation(page, timeout) {
   return {
     async finish() {
       if (!requested && page.url() === beforeUrl) {
-        await wait(Math.max(0, Math.min(NAV_START_WINDOW_MS, deadline - Date.now())));
+        // Always give a navigation the start window, even when the action itself used up the
+        // timeout; otherwise a slow click hides a navigation that is about to begin.
+        await wait(NAV_START_WINDOW_MS);
       }
       // pushState/hash changes have no document request and need no load wait.
       while (requested && !loaded) {
