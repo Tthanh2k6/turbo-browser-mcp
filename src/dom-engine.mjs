@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { observeClickAftermath } from './aftermath.mjs';
 import path from 'node:path';
 import {
   appendLedger,
@@ -2635,7 +2636,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             Boolean(
               el &&
               (el.getAttribute('role') || '').toLowerCase() === 'combobox' &&
-              !['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) &&
+              !['SELECT'].includes(el.tagName) &&
               !el.isContentEditable
             );
 
@@ -3855,6 +3856,45 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
           }
         }
 
+        if (!clickedOption) {
+          // Windowed lists may have no matching DOM option until keyboard navigation.
+          const inner = comboLoc.locator('input:not([type="hidden"]), textarea').first();
+          const keyboard = await comboLoc.evaluate((el) => el.matches('input, textarea'))
+            ? comboLoc : await inner.count() ? inner : comboLoc;
+          await keyboard.focus();
+          if (await keyboard.evaluate((el) => el.matches('input, textarea') && !el.readOnly)) {
+            await keyboard.fill(comboWanted);
+          }
+          for (let step = 0; step < 100; step++) {
+            await page.keyboard.press('ArrowDown');
+            const activeMatches = await keyboard.evaluate((el, wanted) => {
+              const root = el.getRootNode();
+              const id = el.getAttribute('aria-activedescendant') ||
+                el.closest('[role="combobox"]')?.getAttribute('aria-activedescendant');
+              const active = (id && (root.getElementById?.(id) || el.ownerDocument.getElementById(id))) ||
+                root.activeElement;
+              return active?.getAttribute('role') === 'option' &&
+                active.getAttribute('aria-disabled') !== 'true' &&
+                (active.textContent || '').trim().toLowerCase() === wanted.trim().toLowerCase();
+            }, comboWanted);
+            if (!activeMatches) continue;
+            await withFrameSubmitGuard(frameInfo.frame, () => page.keyboard.press('Enter'));
+            // A search input containing the query is not evidence of a selection.
+            for (let attempt = 0; attempt < 10; attempt++) {
+              clickedOption = await comboLoc.evaluate((el, wanted) => {
+                const clean = (v) => String(v || '').trim().toLowerCase();
+                const values = [el.getAttribute('data-value'), el.getAttribute('data-selected'),
+                  el.getAttribute('aria-valuetext'), el.textContent];
+                if (el.getAttribute('aria-expanded') === 'false') values.push(el.value);
+                return values.some((v) => clean(v) === clean(wanted));
+              }, comboWanted);
+              if (clickedOption) break;
+              await page.waitForTimeout(35);
+            }
+            break;
+          }
+        }
+
         if (clickedOption) {
           await comboLoc.evaluate((el) => el.setAttribute('data-tbm-combo-claimed', '1')).catch(() => {});
           filled.push({
@@ -4234,7 +4274,15 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
  */
 async function executeSingleAction(page, params = {}) {
   const silentState = { count: 0 };
-  const res = await executeSingleActionInner(page, params, silentState);
+  const enabled = params.observeAftermath ?? (process.env.TURBO_BROWSER_OBSERVE_AFTERMATH === 'true');
+  const observer = enabled && ['click', 'dblclick'].includes(params.action) ? observeClickAftermath(page) : null;
+  let res;
+  try {
+    res = await executeSingleActionInner(page, params, silentState);
+    await observer?.finish(res, resolveAllowSubmit(params.allowSubmit));
+  } finally {
+    observer?.remove();
+  }
   if (silentState.count > 0 && res && typeof res === 'object' && !res.blocked) {
     res.submitSuppressed = silentState.count;
     res.note =
@@ -5732,6 +5780,7 @@ async function batchActionsCore(page, stepList, options, previousLinesSet, guard
       } else {
         stepResult = await executeSingleAction(page, {
           ...step,
+          observeAftermath: step.observeAftermath ?? options.observeAftermath,
           allowSubmit: options.allowSubmit === false ? false : (step.allowSubmit ?? defaultAllowSubmit),
         });
       }

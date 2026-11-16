@@ -347,6 +347,7 @@ export const TOOL_DEFINITIONS = [
         loadState: { type: 'string', enum: ['load', 'domcontentloaded', 'networkidle'] },
         state: { type: 'string', enum: ['visible', 'hidden', 'attached', 'detached'] },
         timeoutMs: { type: 'integer' },
+        observeAftermath: { type: 'boolean', description: 'Observe click navigation and mutating requests for 1 second; report possible submits.' },
         allowSubmit: { type: 'boolean', default: false },
         returnSnapshot: { type: 'boolean', default: false },
         snapshotMode: { type: 'string', enum: ['interactive', 'forms', 'article', 'all'] },
@@ -375,6 +376,7 @@ export const TOOL_DEFINITIONS = [
           items: { type: 'object' },
         },
         continueOnError: { type: 'boolean', default: false },
+        observeAftermath: { type: 'boolean', description: 'Observe click aftermath for each action (adds 1 second per click).' },
         allowSubmit: { type: 'boolean', default: false },
         returnSnapshot: { type: 'boolean', default: false },
         snapshotMode: { type: 'string', enum: ['interactive', 'forms', 'article', 'all'] },
@@ -616,6 +618,7 @@ export async function dispatchToolCall(manager, name, rawArgs = {}) {
         {
           continueOnError: args.continueOnError,
           allowSubmit: args.allowSubmit,
+          observeAftermath: args.observeAftermath,
           returnSnapshot: args.returnSnapshot,
           snapshotMode: args.snapshotMode,
           snapshotMaxChars: args.snapshotMaxChars,
