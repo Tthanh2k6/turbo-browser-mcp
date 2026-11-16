@@ -1352,6 +1352,8 @@ async function isEnterSubmitTarget(page, locator, extra = {}) {
  * Build a token-efficient snapshot across frames & open Shadow DOM (capped at maxChars),
  * assigning deterministic data-tbm-ref IDs and supporting query, onlyChanged delta, boxes, and savePath.
  */
+const snapshotBaselines = new WeakMap();
+
 export async function inspectCompact(page, options = {}, previousLinesSet = null) {
   const t0 = Date.now();
   const mode = options.mode || 'interactive';
@@ -1366,6 +1368,8 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
   const allFrames = getAllFrames(page);
   const urlKey = `__url__:${page.url()}`;
   const sameUrlAsBaseline = Boolean(previousLinesSet && previousLinesSet.has(urlKey));
+  const baseline = sameUrlAsBaseline ? snapshotBaselines.get(previousLinesSet) : null;
+  const sameScope = baseline?.mode === mode && baseline?.includeFrames === includeFrames;
   const preserveRefs = Boolean(onlyChanged ? sameUrlAsBaseline : (query || rootSelector));
 
   if (!preserveRefs && !includeFrames && allFrames.length > 1) {
@@ -1390,6 +1394,11 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
   const frames = includeFrames ? allFrames : allFrames.slice(0, 1);
   let nextRefNum = 1;
   if (preserveRefs) {
+    nextRefNum = baseline?.nextRefNum || 1;
+    // Do not recycle a removed ref, including the highest ref in the old document.
+    for (const ref of baseline?.refs.keys() || []) {
+      nextRefNum = Math.max(nextRefNum, Number(ref.split(':e')[1]) + 1);
+    }
     for (const frameInfo of allFrames) {
       const maxInFrame = await frameInfo.frame
         .evaluate(() => {
@@ -1419,6 +1428,8 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
   }
   const entries = [];
   const nextSignatures = new Set();
+  const nextRefs = new Map();
+  const scannedFrames = new Set();
   let totalMatched = 0;
 
   for (const frameInfo of frames) {
@@ -1696,7 +1707,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
               const txt = (composedText(el) || clean(el.innerText || el.textContent)).slice(0, 220);
               if (txt) {
                 const line = `[${fullRef}] <${tag}> ${txt}`;
-                items.push({ line, sig: `f${frameIdxArg}:<${tag}>:${txt}` });
+                items.push({ ref: fullRef, line, sig: `f${frameIdxArg}:<${tag}>:${txt}` });
               }
               continue;
             }
@@ -1750,7 +1761,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
 
             const line = `[${fullRef}] <${kind}> "${lbl}"${extra}${shadowTag}${boxTag}`;
             const sig = `f${frameIdxArg}:<${kind}> "${lbl}"${extra}${shadowTag}`;
-            items.push({ line, sig });
+            items.push({ ref: fullRef, line, sig });
           }
           return { items, nextRef: refCounter, total: items.length };
         },
@@ -1768,14 +1779,16 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
     }
 
     if (!chunk) continue;
+    scannedFrames.add(`f${frameInfo.frameIdx}`);
     nextRefNum = chunk.nextRef;
     totalMatched += chunk.total;
 
     const frameItems = [];
     for (const item of chunk.items) {
       nextSignatures.add(item.sig);
+      nextRefs.set(item.ref, item.sig);
       if (queryRe && !queryRe.test(item.line)) continue;
-      if (onlyChanged && sameUrlAsBaseline && previousLinesSet.has(item.sig)) {
+      if (onlyChanged && sameScope && baseline.refs.get(item.ref) === item.sig) {
         continue;
       }
       frameItems.push(item.line);
@@ -1789,10 +1802,21 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
     }
   }
 
+  let removedLine = '';
+  if (onlyChanged && sameScope && !query && !rootSelector) {
+    const removed = [...baseline.refs.keys()].filter((ref) =>
+      !nextRefs.has(ref) && (scannedFrames.has(ref.split(':')[0]) ||
+        !frames.some((f) => `f${f.frameIdx}` === ref.split(':')[0])));
+    if (removed.length) {
+      removedLine = `Removed: ${removed.slice(0, 30).join(', ')}${removed.length > 30 ? ` +${removed.length - 30} more` : ''}`;
+    }
+  }
+
   if (previousLinesSet && !query && !rootSelector) {
     previousLinesSet.clear();
     previousLinesSet.add(urlKey);
     for (const s of nextSignatures) previousLinesSet.add(s);
+    snapshotBaselines.set(previousLinesSet, { refs: nextRefs, mode, includeFrames, nextRefNum });
   }
 
   let title = '';
@@ -1811,7 +1835,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
 
   for (const line of entries) {
     const candidate = body ? `${body}\n${line}` : line;
-    if (header.length + candidate.length + trailerReserve > maxChars) {
+    if (header.length + candidate.length + trailerReserve + (removedLine ? removedLine.length + 1 : 0) > maxChars) {
       truncated = true;
       break;
     }
@@ -1819,7 +1843,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
     if (line.startsWith('[f')) shownCount++;
   }
 
-  let text = `${header}${body}`;
+  let text = `${header}${body}${removedLine ? `\n${removedLine}` : ''}`;
   if (truncated) {
     text += `\n... [truncated: ${shownCount}/${totalMatched} elements]`;
   }
@@ -4272,16 +4296,76 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
  * (submit event, form.submit(), requestSubmit()), say so in the result. The action itself still
  * succeeded (e.g. a select changed its value), so ok stays true and batches keep going.
  */
+// Listen before the action: waitForLoadState alone can resolve against the old document.
+function watchActionNavigation(page, timeout) {
+  const deadline = Date.now() + timeout;
+  const beforeUrl = page.url();
+  let requested = false, loaded = false;
+  let wake = () => {};
+  const onRequest = (request) => {
+    if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
+      requested = true;
+      loaded = false;
+      wake();
+    }
+  };
+  const onLoaded = () => { loaded = true; wake(); };
+  const onNavigated = (frame) => { if (frame === page.mainFrame()) wake(); };
+  const onCancelled = (request) => {
+    if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
+      requested = false;
+      wake();
+    }
+  };
+  const onResponse = (response) => {
+    // The network guard uses 204 to keep the current document when blocking a POST.
+    if ([204, 205].includes(response.status())) onCancelled(response.request());
+  };
+  page.on('request', onRequest);
+  page.on('requestfailed', onCancelled);
+  page.on('response', onResponse);
+  page.on('domcontentloaded', onLoaded);
+  page.on('framenavigated', onNavigated);
+  const wait = (ms) => new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    wake = () => { clearTimeout(timer); resolve(); };
+  });
+  return {
+    async finish() {
+      if (!requested && page.url() === beforeUrl) {
+        await wait(Math.max(0, Math.min(300, deadline - Date.now())));
+      }
+      // pushState/hash changes have no document request and need no load wait.
+      while (requested && !loaded) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new Error('Navigation did not reach domcontentloaded within the action timeout.');
+        await wait(remaining);
+      }
+    },
+    remove() {
+      page.off('request', onRequest);
+      page.off('requestfailed', onCancelled);
+      page.off('response', onResponse);
+      page.off('domcontentloaded', onLoaded);
+      page.off('framenavigated', onNavigated);
+    },
+  };
+}
+
 async function executeSingleAction(page, params = {}) {
   const silentState = { count: 0 };
   const enabled = params.observeAftermath ?? (process.env.TURBO_BROWSER_OBSERVE_AFTERMATH === 'true');
   const observer = enabled && ['click', 'dblclick'].includes(params.action) ? observeClickAftermath(page) : null;
+  const navigation = params.returnSnapshot && ['click', 'dblclick', 'press'].includes(params.action)
+    ? watchActionNavigation(page, Number(params.timeoutMs) || DEFAULT_TIMEOUT_MS) : null;
   let res;
   try {
     res = await executeSingleActionInner(page, params, silentState);
+    if (!res.blocked) await navigation?.finish();
     await observer?.finish(res, resolveAllowSubmit(params.allowSubmit));
   } finally {
     observer?.remove();
+    navigation?.remove();
   }
   if (silentState.count > 0 && res && typeof res === 'object' && !res.blocked) {
     res.submitSuppressed = silentState.count;
@@ -5777,9 +5861,26 @@ async function batchActionsCore(page, stepList, options, previousLinesSet, guard
           { ...step, stopBeforeSubmit: effectiveStopBeforeSubmit },
           previousLinesSet
         );
+      } else if (step.action === 'navigate') {
+        if (!step.url) throw new Error('navigate requires url.');
+        const url = new URL(String(step.url), page.url());
+        if (!['http:', 'https:'].includes(url.protocol)) {
+          throw new Error('navigate requires an HTTP(S) URL.');
+        }
+        if ((step.method !== undefined && String(step.method).toUpperCase() !== 'GET') ||
+            step.body !== undefined || step.postData !== undefined) {
+          throw new Error('navigate supports GET only, without a request body.');
+        }
+        await page.goto(url.href, {
+          waitUntil: 'domcontentloaded', timeout: Number(step.timeoutMs) || DEFAULT_TIMEOUT_MS,
+        });
+        stepResult = { ok: true, action: 'navigate', url: page.url() };
+      } else if (step.action === 'extract') {
+        stepResult = await extractCleanText(page, step);
       } else {
         stepResult = await executeSingleAction(page, {
           ...step,
+          returnSnapshot: options.returnSnapshot || step.returnSnapshot,
           observeAftermath: step.observeAftermath ?? options.observeAftermath,
           allowSubmit: options.allowSubmit === false ? false : (step.allowSubmit ?? defaultAllowSubmit),
         });

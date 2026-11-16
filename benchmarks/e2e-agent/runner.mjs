@@ -122,7 +122,7 @@ try {
           if (stack === 'browser-harness') mcpServers['browser-harness'] = { command: browserUse, args: ['--cli-mcp'] };
           const mcpFile = path.join(workspace, 'mcp.json');
           fs.writeFileSync(mcpFile, JSON.stringify({ mcpServers }));
-          const cargs = ['-p', '--setting-sources', 'project', '--disable-slash-commands', '--strict-mcp-config', '--mcp-config', mcpFile, '--model', options['--model'], '--output-format', 'json', '--no-session-persistence', '--dangerously-skip-permissions', '--disallowedTools', 'WebFetch,WebSearch'];
+          const cargs = ['-p', '--setting-sources', 'project', '--disable-slash-commands', '--strict-mcp-config', '--mcp-config', mcpFile, '--model', options['--model'], '--output-format', process.env.BENCH_TRANSCRIPT ? 'stream-json' : 'json', ...(process.env.BENCH_TRANSCRIPT ? ['--verbose'] : []), '--no-session-persistence', '--dangerously-skip-permissions', '--disallowedTools', 'WebFetch,WebSearch'];
           delete env.CODEX_HOME; env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = '1';
           execution = await execute(options['--claude'], cargs, { cwd: workspace, env, input: prompt, log, timeout: 600000 });
           try {

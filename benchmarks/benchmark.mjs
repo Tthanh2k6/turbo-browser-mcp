@@ -607,6 +607,8 @@ async function runBenchmark() {
     // S7: MCP Tool Schema Footprint
     const toolSchemaStr = JSON.stringify(TOOL_DEFINITIONS);
     tokenPayloads.s7_toolSchema = toolSchemaStr;
+    const compactToolSchemaStr = JSON.stringify(TOOL_DEFINITIONS.map(({ annotations, ...tool }) => tool));
+    tokenPayloads.s7_toolSchemaCompact = compactToolSchemaStr;
 
     const { tokenizer, counts } = countTokensBatch(tokenPayloads);
 
@@ -723,6 +725,8 @@ async function runBenchmark() {
         toolCount: TOOL_DEFINITIONS.length,
         schemaChars: toolSchemaStr.length,
         schemaTokens: counts.s7_toolSchema,
+        compactSchemaChars: compactToolSchemaStr.length,
+        compactSchemaTokens: counts.s7_toolSchemaCompact,
       },
     };
 
@@ -757,7 +761,7 @@ async function runBenchmark() {
       `| S6c. Diagnostics error filter | ${results.s6c_diagnosticsFilter.unfilteredTokens} tok unfiltered (${diagAll.requests.length} reqs) | ${results.s6c_diagnosticsFilter.filteredTokens} tok errors-only (${diagFiltered.requests.length} reqs) | ${results.s6c_diagnosticsFilter.tokenSavedPct}% tokens saved |`
     );
     console.log(
-      `| S7. Static MCP tool schema | — | ${results.s7_toolSchema.toolCount} tools (${results.s7_toolSchema.schemaTokens} tok) | Compact consolidated schema |`
+      `| S7. Static MCP tool schema | — | ${results.s7_toolSchema.toolCount} tools (${results.s7_toolSchema.schemaTokens} full / ${results.s7_toolSchema.compactSchemaTokens} compact tok) | Compact excludes annotations |`
     );
     console.log('\nRaw JSON:\n' + JSON.stringify(results, null, 2));
   } finally {

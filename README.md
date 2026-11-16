@@ -70,7 +70,7 @@ node src/index.mjs --doctor
 | `inspect_compact` | Token-capped element/form/article snapshot | `mode` (`interactive`, `forms`, `article`, `all`), `onlyChanged`, `query`, `boxes`, `maxChars`, `includeFrames`, `savePath` |
 | `smart_fill_form` | Batch form, editor & disk file prefill | `fields[]` (`ref`, `selector`, `value`, `option`, `values`, `check`, `not`, `keys`, `file`, `files`, `frameIdx`, `all`), `gmail`, `overwrite`, `stopBeforeSubmit`, `returnSnapshot` |
 | `act_fast` | Single targeted page action | `action` (`16` actions), `ref`/`selector`/`text`/`label`/`(x, y)`, `modifiers`, `dropData`, `allowSubmit`, `observeAftermath`, `returnSnapshot` |
-| `batch_actions` | Ordered chain of actions + form steps | `steps[]`, `continueOnError`, `allowSubmit`, `expect`, `submissionKey`, `allowDuplicate`, `observeAftermath`, `returnSnapshot`, `snapshotMaxChars` |
+| `batch_actions` | Ordered actions, form steps and multi-page navigate/extract | `steps[]` (including `navigate` with `url`, `extract` with `format`, `selector`, `maxChars`), `continueOnError`, `allowSubmit`, `expect`, `submissionKey`, `allowDuplicate`, `observeAftermath`, `returnSnapshot`, `snapshotMaxChars` |
 | `extract_clean_text` | Clean text or compact Markdown reader | `format` (`text`, `markdown`), `selector`, `includeFrames`, `maxChars`, `savePath` |
 | `evaluate_js` | Scoped JS expression or `(el, arg)` call | `expression`, `arg`, `frameIdx`, `ref`/`selector`/`text`, `savePath` |
 | `page_diagnostics` | Console, network, downloads & dialogs | `level` (`errors`, `all`), `statusFilter` (`errors`, `all`), `includeStatic`, `urlFilter`, `reqId`, `part`, `dialogPolicy`, `clear`, `savePath` |
@@ -145,6 +145,24 @@ node src/index.mjs --doctor
 }
 ```
 
+#### Extract several pages in one call
+
+```json
+{
+  "name": "batch_actions",
+  "arguments": {
+    "steps": [
+      { "action": "navigate", "url": "https://example.com/catalog?page=2" },
+      { "action": "extract", "format": "text", "selector": "main", "maxChars": 3000 },
+      { "action": "navigate", "url": "https://example.com/catalog?page=3" },
+      { "action": "extract", "format": "markdown", "selector": "main", "maxChars": 3000 }
+    ]
+  }
+}
+```
+
+Navigation uses GET in the same tab and waits for `domcontentloaded`. Each extract step returns the same output as `extract_clean_text` in its step result.
+
 ## What each tool does
 
 ### Connection and sessions (`tabs_batch`)
@@ -172,7 +190,7 @@ Prefills an entire form in one MCP call while flushing microtasks and macrotasks
 ### Actions and chains (`act_fast`, `batch_actions`)
 - `act_fast` actions: `click`, `dblclick`, `hover`, `focus`, `clear`, `fill`, `type` (`slowly`, `delayMs`, `submit`), `select`, `check`, `uncheck`, `drag`, `drop` (`file`, `files`, or custom MIME `dropData`), `press` (`key` + `modifiers`: `Alt`, `Control`, `ControlOrMeta`, `Meta`, `Shift`), `scroll` (`dx`, `dy`), `wait` (`ms`, `state`, `loadState`, `text`, `textGone`, `url`), and `upload`.
 - Targeting options: compact `[eN]` `ref`, CSS `selector`, visible `text`, `label`, or viewport `(x, y)` coordinates, with `button` (`left`, `right`, `middle`) and `frameIdx`.
-- `batch_actions`: runs an ordered list of DOM actions and nested `smart_fill_form` steps in one MCP call, stopping safely if blocked by the Submit guard or optionally continuing on step errors (`continueOnError`).
+- `batch_actions`: runs an ordered list of DOM actions, nested `smart_fill_form` steps, and `navigate`/`extract` steps for multi-page reading in one MCP call, stopping safely if blocked by the Submit guard or optionally continuing on step errors (`continueOnError`).
 
 ### Text, JavaScript and screenshots (`extract_clean_text`, `evaluate_js`, `capture_page`)
 - `extract_clean_text`: extracts readable plain text or compact Markdown (`format: "text" | "markdown"`) from main/article containers and iframes, stripped of script and style noise.

@@ -193,7 +193,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'smart_fill_form',
     description:
-      'Fill React-controlled inputs, contenteditable editors, single/multi selects, range sliders, ARIA comboboxes, radios/checkboxes, open Shadow DOM fields, Gmail compose dialogs, iframe fields, and local disk file uploads in one batch. Stops before Submit by default.',
+      'Fill several fields at once, including React inputs, editors, comboboxes/portaled selects, checkboxes, Shadow DOM/iframe fields and disk file uploads. Use act_fast for single actions. Stops before Submit by default.',
     annotations: {
       title: 'Smart Form Prefill',
       readOnlyHint: false,
@@ -267,7 +267,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'act_fast',
     description:
-      'Run a single DOM action (click, dblclick, hover, drag, drop files/data, fill, type, select single/multi, check, upload from disk, press, scroll, wait) targeting a compact ref, selector, text, or viewport coordinates (x, y). Supports mouse button/modifiers, 1-turn returnSnapshot=true, and blocks submit/publish/send actions unless allowSubmit=true.',
+      'For one action; to fill several fields use smart_fill_form; for several steps use batch_actions. Target a ref, selector, text or coordinates (x, y). Supports returnSnapshot; blocks submit/publish/send unless allowSubmit=true.',
     annotations: {
       title: 'Fast Page Action',
       readOnlyHint: false,
@@ -363,7 +363,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'batch_actions',
     description:
-      'Execute an array of page actions and/or smart_fill_form steps sequentially in one MCP turn, stopping safely if blocked by the Submit guard, with optional post-batch compact snapshot.',
+      'Run actions or smart_fill_form steps in order, including navigate/extract for multi-page reading. Stops on Submit guard blocks; optional post-batch snapshot.',
     annotations: {
       title: 'Batch Sequential Actions',
       readOnlyHint: false,
@@ -378,6 +378,7 @@ export const TOOL_DEFINITIONS = [
         tabId: { type: 'integer' },
         steps: {
           type: 'array',
+          description: 'act_fast or smart_fill_form steps; also {action:"navigate",url} (GET only), {action:"extract",format:"text"|"markdown",selector?,maxChars?}.',
           items: { type: 'object' },
         },
         continueOnError: { type: 'boolean', default: false },
