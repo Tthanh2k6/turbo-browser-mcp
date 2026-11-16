@@ -176,7 +176,7 @@ describe('field fixes round 3 (field report round 4 + Facebook)', () => {
     assert.deepEqual(viaSelector.outboundLinks, ['https://boards.greenhouse.io/acme/jobs/1'], JSON.stringify(viaSelector));
   });
 
-  it('7: a full re-inspect after an input was inserted above says refs shifted; unchanged page does not', async () => {
+  it('7: a full re-inspect after an input was inserted above keeps refs stable, so no refs-shifted notice', async () => {
     await page.setContent('<input id="a" placeholder="Link"><input id="b" placeholder="Name"><button>Save</button>');
     const state = new Set();
     const first = await inspectCompact(page, { mode: 'forms' }, state);
@@ -189,7 +189,12 @@ describe('field fixes round 3 (field report round 4 + Facebook)', () => {
       document.body.prepend(n);
     });
     const after2 = await inspectCompact(page, { mode: 'forms' }, state);
-    assert.match(after2.text, /refs shifted/, after2.text);
+    // Refs never recycle within a document: the old refs stay on their elements and the new input gets a fresh number,
+    // so the stopgap notice is obsolete.
+    assert.doesNotMatch(after2.text, /refs shifted/, after2.text);
+    const linkRef = (t) => /\[(f0:e\d+)\] <input:text> "Link"/.exec(t)?.[1];
+    assert.equal(linkRef(after2.text), linkRef(first.text), after2.text);
+    assert.ok(Number(/\[f0:e(\d+)\] <input:text> "New link"/.exec(after2.text)?.[1]) > 3, after2.text);
   });
 
   it('8: tabs_batch includeTabs forces the list on or off; default unchanged', async () => {

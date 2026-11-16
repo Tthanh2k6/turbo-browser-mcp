@@ -1307,12 +1307,13 @@ describe('turbo-browser-mcp integration', () => {
       </form>
     </body></html>`);
 
-    // 1. Switching inspect_compact modes must clear stale [data-tbm-ref] attributes.
+    // 1. Switching inspect_compact modes keeps refs stable per document (no recycling); use the ref the forms snapshot lists.
     await inspectCompact(page, { mode: 'interactive' });
     const formsSnap = await inspectCompact(page, { mode: 'forms' });
-    assert.ok(formsSnap.text.includes('[f0:e1] <input:text> "Search (optional)"'));
-    await actFast(page, { action: 'click', ref: 'f0:e1' });
-    await actFast(page, { action: 'fill', ref: 'f0:e1', value: 'hello' });
+    const searchRef = /\[(f0:e\d+)\] <input:text> "Search \(optional\)"/.exec(formsSnap.text)?.[1];
+    assert.ok(searchRef, formsSnap.text);
+    await actFast(page, { action: 'click', ref: searchRef });
+    await actFast(page, { action: 'fill', ref: searchRef, value: 'hello' });
     const afterRefState = await evaluateJs(page, {
       expression: '({ val: document.getElementById("first").value, topClicked: Boolean(window.__topClicked) })',
     });

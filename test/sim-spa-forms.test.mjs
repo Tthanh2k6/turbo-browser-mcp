@@ -722,7 +722,7 @@ describe('SPA & Messy DOM Simulation Suite (sim-spa-forms)', () => {
       files: ['candidate-cv.pdf'],
     });
 
-    // 9c. Stale [data-tbm-ref] inside iframe is cleared when inspectCompact({ includeFrames: false }) runs next
+    // 9c. [data-tbm-ref] inside iframe survives inspectCompact({ includeFrames: false }) (refs are stable per document)
     const snapWithFrames = await inspectCompact(page, { includeFrames: true });
     const match = /\[f1:(e\d+)\]\s+<button>\s+"Iframe Action"/.exec(snapWithFrames.text);
     assert.ok(match, `Expected Iframe Action ref in snapshot: ${snapWithFrames.text}`);
@@ -730,12 +730,10 @@ describe('SPA & Messy DOM Simulation Suite (sim-spa-forms)', () => {
 
     await inspectCompact(page, { includeFrames: false });
 
-    await assert.rejects(
-      () => actFast(page, { action: 'click', ref: staleBareRef, timeoutMs: 1000 }),
-      /not found/i,
-      'Stale bare ref from iframe must be cleared when inspectCompact({ includeFrames: false }) runs'
-    );
-    assert.equal(await childFrame.evaluate(() => Boolean(window.__iframeBtnClicked)), false);
+    // Refs are never recycled within a document, so the ref is no longer wiped: it still resolves to the very
+    // same iframe button (never to another element), and a new full snapshot hands out only numbers above it.
+    await actFast(page, { action: 'click', ref: staleBareRef, timeoutMs: 1000 });
+    assert.equal(await childFrame.evaluate(() => Boolean(window.__iframeBtnClicked)), true);
   });
 
   it('10. Additional SPA Scenario A: { option } works on <select> and [role="combobox"], and <select> respects overwrite: false', async () => {

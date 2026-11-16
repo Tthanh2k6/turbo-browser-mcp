@@ -1517,49 +1517,24 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
   const sameUrlAsBaseline = Boolean(previousLinesSet && previousLinesSet.has(urlKey));
   const baseline = sameUrlAsBaseline ? snapshotBaselines.get(previousLinesSet) : null;
   const sameScope = baseline?.mode === mode && baseline?.includeFrames === includeFrames;
-  const preserveRefs = Boolean(onlyChanged ? sameUrlAsBaseline : (query || rootSelector));
-
-  if (!preserveRefs && !includeFrames && allFrames.length > 1) {
-    for (const skippedFrame of allFrames.slice(1)) {
-      await skippedFrame.frame
-        .evaluate(() => {
-          const stack = [document];
-          while (stack.length > 0) {
-            const cur = stack.shift();
-            if (!cur || !cur.querySelectorAll) continue;
-            for (const el of cur.querySelectorAll('[data-tbm-ref]')) {
-              el.removeAttribute('data-tbm-ref');
-            }
-            for (const node of cur.querySelectorAll('*')) {
-              if (node.shadowRoot) stack.push(node.shadowRoot);
-            }
-          }
-        })
-        .catch(() => {});
-    }
-  }
+  // Refs are never recycled within a document: attributes persist on live elements and new refs start above
+  // the per-document high-water mark (window.__tbmRefHigh), so a stale ref can only fail, never hit another element.
+  const preserveRefs = true;
   const frames = includeFrames ? allFrames : allFrames.slice(0, 1);
-  let nextRefNum = 1;
-  if (preserveRefs) {
-    nextRefNum = baseline?.nextRefNum || 1;
-    // Do not recycle a removed ref, including the highest ref in the old document.
-    for (const ref of baseline?.refs.keys() || []) {
-      nextRefNum = Math.max(nextRefNum, Number(ref.split(':e')[1]) + 1);
-    }
+  let nextRefNum = baseline?.nextRefNum || 1;
+  if (allFrames.length > 1) {
+    // Keep bare eN unique across frames: start above the highest ref any frame already holds.
     for (const frameInfo of allFrames) {
-      const maxInFrame = await frameInfo.frame
+      const high = await frameInfo.frame
         .evaluate(() => {
-          let max = 0;
+          let max = Number(window.__tbmRefHigh) || 0;
           const stack = [document];
           while (stack.length > 0) {
             const cur = stack.shift();
             if (!cur || !cur.querySelectorAll) continue;
             for (const el of cur.querySelectorAll('[data-tbm-ref]')) {
               const m = /^e(\d+)$/i.exec(el.getAttribute('data-tbm-ref') || '');
-              if (m) {
-                const n = Number(m[1]);
-                if (n > max) max = n;
-              }
+              if (m && Number(m[1]) > max) max = Number(m[1]);
             }
             for (const node of cur.querySelectorAll('*')) {
               if (node.shadowRoot) stack.push(node.shadowRoot);
@@ -1568,9 +1543,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
           return max;
         })
         .catch(() => 0);
-      if (maxInFrame >= nextRefNum) {
-        nextRefNum = maxInFrame + 1;
-      }
+      if (high >= nextRefNum) nextRefNum = high + 1;
     }
   }
   const entries = [];
@@ -1618,18 +1591,12 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
             return out;
           };
 
-          let refCounter = startRef;
-          if (!preserveRefsArg) {
-            for (const oldRefEl of queryAllDeep(document, '[data-tbm-ref]')) {
-              oldRefEl.removeAttribute('data-tbm-ref');
-            }
-          } else {
-            for (const oldRefEl of queryAllDeep(document, '[data-tbm-ref]')) {
-              const m = /^e(\d+)$/i.exec(oldRefEl.getAttribute('data-tbm-ref') || '');
-              if (m) {
-                const num = Number(m[1]);
-                if (num >= refCounter) refCounter = num + 1;
-              }
+          let refCounter = Math.max(startRef, (Number(window.__tbmRefHigh) || 0) + 1);
+          for (const oldRefEl of queryAllDeep(document, '[data-tbm-ref]')) {
+            const m = /^e(\d+)$/i.exec(oldRefEl.getAttribute('data-tbm-ref') || '');
+            if (m) {
+              const num = Number(m[1]);
+              if (num >= refCounter) refCounter = num + 1;
             }
           }
 
@@ -2006,6 +1973,9 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
             const sig = `f${frameIdxArg}:<${kind}> "${lbl}"${extra}${shadowTag}`;
             items.push({ ref: fullRef, line, sig });
           }
+          try {
+            Object.defineProperty(window, '__tbmRefHigh', { value: refCounter - 1, writable: true, configurable: true, enumerable: false });
+          } catch {}
           return { items, nextRef: refCounter, total: items.length };
         },
         {
@@ -2060,21 +2030,6 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
     }
   }
 
-  // A full snapshot renumbers refs from e1. If a ref now points at a different element than in the previous
-  // snapshot of the same page (an input was inserted above), earlier refs are stale: say so once.
-  let shiftedNote = '';
-  if (!preserveRefs && baseline && sameScope && baseline.refs.size > 0) {
-    const sigToRef = new Map();
-    for (const [r, sg] of nextRefs) if (!sigToRef.has(sg)) sigToRef.set(sg, r);
-    let moved = 0;
-    for (const [r, sg] of baseline.refs) {
-      const now = nextRefs.get(r);
-      if (now !== undefined && now !== sg && sigToRef.has(sg) && sigToRef.get(sg) !== r) moved++;
-    }
-    if (moved > 0) shiftedNote = `refs shifted (${moved} moved since the last snapshot): use only refs from this snapshot
-`;
-  }
-
   if (previousLinesSet && !query && !rootSelector) {
     previousLinesSet.clear();
     previousLinesSet.add(urlKey);
@@ -2093,7 +2048,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
   const urlChangedNote = onlyChanged && hadBaseline && !sameUrlAsBaseline
     ? 'URL changed: full snapshot\n'
     : '';
-  const header = `URL: ${page.url()}\nTitle: ${title}\nMode: ${mode} | Frames: ${frames.length} | Elements: ${totalMatched}${filterNote}\n${urlChangedNote}${shiftedNote}`;
+  const header = `URL: ${page.url()}\nTitle: ${title}\nMode: ${mode} | Frames: ${frames.length} | Elements: ${totalMatched}${filterNote}\n${urlChangedNote}`;
   let body = '';
   let shownCount = 0;
   let truncated = false;
