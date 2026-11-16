@@ -2194,6 +2194,91 @@ async function retypeField(page, locator, val) {
     return false;
   }
 }
+// Date pickers and masked inputs often clear or reformat a value only when the field loses focus, after the fill
+// already looked fine. Blur the focused field, wait one beat and compare. Returns a flag object or null.
+const BLUR_SETTLE_MS = 60;
+const norm = (v) => String(v ?? '').replace(/\s+/g, ' ').trim();
+function blurFlag(want, now) {
+  if (norm(want) === '' || norm(now) === norm(want)) return null;
+  return norm(now) === '' ? { clearedAfterBlur: true } : { changedAfterBlur: String(now).slice(0, 60) };
+}
+async function blurAndRead(frame, idxs) {
+  return frame
+    .evaluate(
+      async ({ idxs: ids, settle }) => {
+        const ae = document.activeElement;
+        const leave = (el, ae) => {
+          if (ae && ae !== document.body && typeof ae.blur === 'function') ae.blur();
+          const hay = [el.name, el.id, el.className, el.getAttribute('placeholder'), el.getAttribute('aria-label'), el.getAttribute('data-provide'), el.parentElement && el.parentElement.className, el.closest('[class*=date],[class*=picker],[class*=calendar]') ? 'date' : '']
+            .map((x) => (typeof x === 'string' ? x : '')).join(' ');
+          // Date pickers commit or clear on an outside mousedown, not on blur: send one to the body.
+          if (/date|picker|calendar|ngày/i.test(hay)) {
+            for (const t of ['mousedown', 'mouseup', 'click']) document.body.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window, clientX: 1, clientY: 1 }));
+          }
+        };
+        const els = {};
+        for (const id of ids) els[id] = document.querySelector('[data-tbm-fill="' + id + '"]');
+        for (const id of ids) if (els[id]) leave(els[id], els[id] === ae ? ae : null);
+        if (ae && !ids.some((id) => els[id] === ae) && ae !== document.body && typeof ae.blur === 'function') ae.blur();
+        await new Promise((r) => setTimeout(r, settle));
+        const out = {};
+        for (const id of ids) {
+          const el = els[id];
+          if (el) out[id] = String(el.isContentEditable ? el.textContent : el.value ?? '');
+        }
+        return out;
+      },
+      { idxs, settle: BLUR_SETTLE_MS }
+    )
+    .catch(() => null);
+}
+// One retry: type slowly with real key presses, then leave the field with Tab (Escape first on the second try).
+async function retypeSlowly(page, locator, val) {
+  for (const extra of [[], ['Escape']]) {
+    try {
+      await locator.focus({ timeout: 1500 });
+      await page.keyboard.press('ControlOrMeta+a');
+      await page.keyboard.type(val, { delay: 25 });
+      for (const k of extra) await page.keyboard.press(k);
+      await page.keyboard.press('Tab');
+      await new Promise((r) => setTimeout(r, BLUR_SETTLE_MS));
+      const back = await locator.evaluate((el) => String(el.isContentEditable ? el.textContent : el.value ?? '')).catch(() => '');
+      if (norm(back) !== '') return back;
+    } catch {
+      return '';
+    }
+  }
+  return '';
+}
+async function verifyAfterBlur(page, filled) {
+  const fills = filled.filter((e) => e && e.value !== undefined && e.value !== '' && ['input', 'textarea', 'contenteditable'].includes(e.tag));
+  if (fills.length === 0) return;
+  const frames = getAllFrames(page);
+  for (const fi of new Set(fills.map((e) => e.frameIdx))) {
+    const frame = frames.find((f) => f.frameIdx === fi)?.frame;
+    if (!frame) continue;
+    const group = fills.filter((e) => e.frameIdx === fi);
+    const vals = await blurAndRead(frame, group.map((e) => String(e.idx)));
+    if (!vals) continue;
+    for (const e of group) {
+      const now = vals[String(e.idx)];
+      if (now === undefined) continue;
+      const flag = blurFlag(e.value, now);
+      if (!flag) continue;
+      if (flag.clearedAfterBlur && !/[\r\n]/.test(e.value)) {
+        const loc = frame.locator('[data-tbm-fill="' + e.idx + '"]').first();
+        const back = await retypeSlowly(page, loc, e.value);
+        if (norm(back) !== '') {
+          e.retyped = true;
+          e.value = back.slice(0, 60);
+          if (norm(back) !== norm(e.value)) Object.assign(e, { value: back.slice(0, 60) });
+          continue;
+        }
+      }
+      Object.assign(e, flag);
+    }
+  }
+}
 async function recheckFilled(page, spec, filled) {
   const textFills = filled.filter((e) => e && e.value !== undefined && ['input', 'textarea', 'contenteditable'].includes(e.tag));
   if (textFills.length === 0) return 0;
@@ -3377,16 +3462,34 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             for (const el of targets) {
               if (el.tagName === 'SELECT') {
                 const selOpt = !el.multiple && el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
+                const PROMPT_RE = /^\s*(?:--|[-–—]\s*\S.*[-–—]\s*$|(?:please\s+)?(?:select|choose|pick)\b|open (?:this )?(?:select )?menu|chọn\b|vui lòng chọn|\.\.\.|…)/i;
+                const isPlaceholderOpt = (o) => {
+                  if (!o) return false;
+                  if (o.value === '') return true;
+                  if (o !== el.options[0]) return false;
+                  const txt = clean(o.text || '');
+                  return Boolean(o.disabled || o.hidden || PROMPT_RE.test(txt) || /(\.\.\.|…)\s*$/.test(txt));
+                };
+                const selPlaceholder = isPlaceholderOpt(selOpt);
                 const isSelectAlreadyFilled = Boolean(
-                  el.dataset.tbmSelectFilled === '1' ||
-                  (selOpt && selOpt.value !== '' && !selOpt.disabled && (el.selectedIndex > 0 || selOpt.hasAttribute('selected')))
+                  !selPlaceholder &&
+                  (el.dataset.tbmSelectFilled === '1' ||
+                  (selOpt && selOpt.value !== '' && !selOpt.disabled && (el.selectedIndex > 0 || selOpt.hasAttribute('selected'))))
                 );
                 if (isSelectAlreadyFilled && !overwriteFlag) {
                   claimed.add(el);
+                  const reqRaw = f.values !== undefined ? f.values : (f.value ?? f.option);
+                  const req = Array.isArray(reqRaw) ? (reqRaw.length === 1 ? reqRaw[0] : undefined) : reqRaw;
+                  const curText = selOpt ? clean(selOpt.text || '') : '';
+                  const same =
+                    req === undefined ||
+                    String(req) === '' ||
+                    clean(String(req)).toLowerCase() === curText.toLowerCase() ||
+                    (selOpt && String(req) === selOpt.value);
                   frameSkipped.push({
                     idx: f._idx,
                     frameIdx: frameIdxArg,
-                    reason: 'already-filled',
+                    reason: same || !curText ? 'already-filled' : `already-filled (has ${curText.slice(0, 40)})`,
                     label: describe(el).slice(0, 50),
                   });
                   matchedIndexes.push(f._idx);
@@ -3537,7 +3640,16 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
 
               const strVal = String(f.value ?? '');
               setNativeValue(el, strVal);
-              const afterVal = currentValue(el);
+              let afterVal = currentValue(el);
+              // A widget that empties the value on blur (date pickers) also empties it on our synthetic blur. If the
+              // value sticks when set again without events, the input accepts it: keep it so the post-blur check can
+              // report and retry instead of calling the value rejected.
+              if (strVal !== '' && afterVal === '' && !el.isContentEditable && (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) {
+                const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                if (setter) setter.call(el, strVal);
+                afterVal = currentValue(el);
+              }
               if (
                 (strVal !== '' && afterVal === '') ||
                 (overwriteFlag && cur !== '' && clean(afterVal) === clean(cur) && clean(strVal) !== clean(cur))
@@ -4822,6 +4934,8 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
     for (const e of filled) if (e && e._sh) delete e._sh;
   }
 
+  if (!spec._noRecheck) await verifyAfterBlur(page, filled);
+
   const output = {
     filledCount: filled.length,
     filled,
@@ -4948,7 +5062,7 @@ export async function collectItems(page, step = {}) {
           if (!tEl) continue;
           const text = (tEl.innerText || '').replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n').trim().slice(0, 1500);
           if (!text) continue;
-          const key = hash(text);
+          const key = hash(text.replace(/\s+/g, ' ').trim());
           if (seen.has(key)) continue;
           seen.add(key);
           let item = text;
@@ -6284,6 +6398,32 @@ ${el.value || ''}`.toLowerCase();
     if (back && back.v !== val) out.mismatch = mismatchText(back);
     else if (back?.sh && await locator.evaluate(commitStaleProbe).catch(() => false) && await retypeField(page, locator, val)) {
       out.retyped = true;
+    }
+    if (back && !back.secret && !back.sh && val !== '' && !out.mismatch && !out.retyped && !/[\r\n]/.test(val)) {
+      const now = await locator
+        .evaluate(async (el) => {
+          const leave = (el, ae) => {
+          if (ae && ae !== document.body && typeof ae.blur === 'function') ae.blur();
+          const hay = [el.name, el.id, el.className, el.getAttribute('placeholder'), el.getAttribute('aria-label'), el.getAttribute('data-provide'), el.parentElement && el.parentElement.className, el.closest('[class*=date],[class*=picker],[class*=calendar]') ? 'date' : '']
+            .map((x) => (typeof x === 'string' ? x : '')).join(' ');
+          // Date pickers commit or clear on an outside mousedown, not on blur: send one to the body.
+          if (/date|picker|calendar|ngày/i.test(hay)) {
+            for (const t of ['mousedown', 'mouseup', 'click']) document.body.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window, clientX: 1, clientY: 1 }));
+          }
+        };
+          leave(el, document.activeElement === el ? el : null);
+          await new Promise((r) => setTimeout(r, 60));
+          return String(el.value ?? '');
+        })
+        .catch(() => null);
+      const flag = now === null ? null : blurFlag(val, now);
+      if (flag) {
+        if (flag.clearedAfterBlur) {
+          const again = await retypeSlowly(page, locator, val);
+          if (norm(again) !== '') out.retyped = true;
+          else Object.assign(out, flag);
+        } else Object.assign(out, flag);
+      }
     }
     return out;
   }
