@@ -1,6 +1,10 @@
 # End-to-end comparison plan
 
-Status: planned, not measured. No competing tools were installed for this plan.
+Status: stage-one harness implemented, agent comparison not measured. See
+[e2e-agent/README.md](e2e-agent/README.md) for runnable fixtures, evaluation,
+installation and coordinator run instructions. Stage one uses one trial per
+stack/task and a six-minute timeout; the full protocol below remains planned.
+No competing tools were installed during harness implementation.
 The existing `npm.cmd run benchmark:e2e` is a scripted local wizard/safety
 benchmark, not an agent comparison. Its results in [E2E_COMPARISON.md](E2E_COMPARISON.md)
 must not be presented as measurements of the stacks below.
@@ -13,9 +17,8 @@ usage, and elapsed time, rather than claiming one tool call equals one command.
 
 ## Tasks and independent success checks
 
-Build a shared local HTTP fixture server with these routes before collecting
-results. These routes are proposed, not yet available in `e2e-tasks.mjs`.
-Reuse its wizard/server pattern and the inline community select fixtures.
+The shared local HTTP fixture server in `e2e-agent/server.mjs` implements these
+routes. They are separate from the scripted `e2e-tasks.mjs` benchmark.
 The agent sees only the task, browser and attachment path; the evaluator owns
 the server state, expected rows, and submission counters.
 
@@ -118,10 +121,11 @@ and usage capture remain unverified locally.
 
 ## Before publishing numbers
 
-Implement the shared fixture server and evaluator, then add a server-only
-entry point that prints its base URL and attachment path. The existing
-`e2e-tasks.mjs` does not expose that interface, so there is no runnable
-three-task benchmark command yet. Wire the same agent logging adapter to all
-stacks, smoke-test each task, pin versions, and run the protocol above. Report
+The stage-one `e2e-agent/server.mjs` entry point prints its base URL and
+attachment path; `evaluate.mjs` independently checks outcomes. Its fixture
+self-test drives all three tasks directly through Playwright. Before measuring,
+configure and smoke-test each actual stack, pin versions, and run the
+coordinator's `e2e-agent/run.ps1`. Extend that stage-one adapter for the full
+randomized protocol and provider usage accounting above. Report
 differences that cannot be controlled, such as extension-only browser modes.
 Do not infer a winner from the existing per-tool measurements.

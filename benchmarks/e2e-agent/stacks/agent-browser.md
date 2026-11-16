@@ -1,0 +1,3 @@
+Use ONLY the agent-browser CLI for browser interaction. In PowerShell invoke the local launcher with & '{{agentBrowser}}'. The runner supplies a unique AGENT_BROWSER_SESSION.
+Before first use run `skills get core` and follow the installed skill. Use `open URL`, `snapshot -i`, `click @e1`, then take a fresh snapshot after changes. Commands include fill, select, check, upload, and get; consult `<command> --help` for exact arguments. Use `close` when finished. Do not use the CLI's MCP mode, direct HTTP, or another automation library.
+Source: D:\dev\bench-src\agent-browser\README.md. README documents these commands and Windows x64 support; installed upload syntax and browser provisioning are verified at runtime, not assumed here.
