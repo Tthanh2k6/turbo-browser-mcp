@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { gotoRetry, navHealth } from './navinfo.mjs';
 import { urlDenial, peekBlocked, denyMessage, matchUrl, getPolicy } from './allow-hosts.mjs';
 import { observeClickAftermath, watchActivity } from './aftermath.mjs';
+import { armToasts, takeToast } from './toast.mjs';
 import { wrapPage, boundariesEnabled } from './boundaries.mjs';
 import { redactText } from './secrets.mjs';
 import path from 'node:path';
@@ -34,6 +35,11 @@ const APPLY_LABEL_RE = /^apply(\s+now)?(?![\p{L}\p{N}_])/iu;
 // smart_fill_form submitButtons: never list these, even when type=submit.
 const SUBMIT_CAND_NEG_RE =
   /^(clear|reset|remove|delete|cancel|close|discard|xóa|xoá|hủy|huỷ|đóng|bỏ\s+qua)(?![\p{L}\p{N}_])/iu;
+// Account-connection / OAuth buttons ("Connect Google Account", "Sign in with GitHub") never commit a filled form.
+const ACCOUNT_CONNECT_RE =
+  /^(connect|disconnect|link|unlink)\s.*\b(account|facebook|google|github|twitter|apple|microsoft|mlh|linkedin|discord|slack|x)\b|(^|\s)(sign|log)\s*(in|up)?\s+with\s+\p{L}|^continue\s+with\s+(google|facebook|github|apple|microsoft|twitter|linkedin|discord)/iu;
+// "Save changes", "Save profile": commit buttons that do not read as submit/publish (but not "Save draft").
+const SAVE_COMMIT_RE = /^save(?!\s*(as\s+)?draft|\s*for\s*later)(?![\p{L}\p{N}_])/iu;
 const NEXT_STEP_RE = /^(next|continue|tiếp(\s*tục)?)(?![\p{L}\p{N}_])/iu;
 
 const COMPOUND_DANGER_RE =
@@ -1520,13 +1526,15 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
   const urlKey = `__url__:${page.url()}`;
   const hadBaseline = Boolean(previousLinesSet && previousLinesSet.size > 0);
   const sameUrlAsBaseline = Boolean(previousLinesSet && previousLinesSet.has(urlKey));
-  const baseline = sameUrlAsBaseline ? snapshotBaselines.get(previousLinesSet) : null;
-  const sameScope = baseline?.mode === mode && baseline?.includeFrames === includeFrames;
+  // One baseline per mode: a snapshot in another mode (an action's returnSnapshot) must not replace this mode's.
+  const store = sameUrlAsBaseline ? snapshotBaselines.get(previousLinesSet) : null;
+  const baseline = store?.byMode?.get(mode) || null;
+  const sameScope = baseline?.includeFrames === includeFrames;
   // Refs are never recycled within a document: attributes persist on live elements and new refs start above
   // the per-document high-water mark (window.__tbmRefHigh), so a stale ref can only fail, never hit another element.
   const preserveRefs = true;
   const frames = includeFrames ? allFrames : allFrames.slice(0, 1);
-  let nextRefNum = baseline?.nextRefNum || 1;
+  let nextRefNum = store?.nextRefNum || 1;
   if (allFrames.length > 1) {
     // Keep bare eN unique across frames: start above the highest ref any frame already holds.
     for (const frameInfo of allFrames) {
@@ -1851,10 +1859,10 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
           if (modeArg === 'interactive') {
             let added = 0;
             for (const dlg of queryAllDeep(root, '[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog[open], .modal')) {
-              if (added >= 8) break;
+              if (added >= 40) break;
               if (isHidden(dlg)) continue;
-              for (const el of queryAllDeep(dlg, '*').slice(0, 400)) {
-                if (added >= 8) break;
+              for (const el of queryAllDeep(dlg, '*').slice(0, 800)) {
+                if (added >= 40) break;
                 if (rawNodes.includes(el) || el.matches?.(sel) || el.closest?.(sel) || !clean(el.textContent)) continue;
                 let clickable = el.hasAttribute('onclick');
                 if (!clickable) {
@@ -1867,6 +1875,21 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
                   rawNodes.push(el);
                   added++;
                 }
+              }
+            }
+            // Elsewhere a pointer cursor alone is too common (whole cards); require a handler signal as well:
+            // an onclick attribute or a tabindex. Cheap attribute selector first, computed style only on those.
+            let extra = 0;
+            for (const el of queryAllDeep(root, '[onclick], [tabindex]:not([tabindex="-1"])')) {
+              if (extra >= 20) break;
+              if (rawNodes.includes(el) || el.matches?.(sel) || el.closest?.(sel)) continue;
+              const txt = clean(el.textContent);
+              if (!txt || txt.length > 120) continue;
+              let ptr = false;
+              try { ptr = getComputedStyle(el).cursor === 'pointer'; } catch {}
+              if (ptr && !isHidden(el)) {
+                rawNodes.push(el);
+                extra++;
               }
             }
           }
@@ -2035,13 +2058,6 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
     }
   }
 
-  if (previousLinesSet && !query && !rootSelector) {
-    previousLinesSet.clear();
-    previousLinesSet.add(urlKey);
-    for (const s of nextSignatures) previousLinesSet.add(s);
-    snapshotBaselines.set(previousLinesSet, { refs: nextRefs, mode, includeFrames, nextRefNum });
-  }
-
   let title = '';
   try {
     title = await page.title();
@@ -2067,6 +2083,23 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
     }
     body = candidate;
     if (/^\*?\[f/.test(line)) shownCount++;
+  }
+
+  if (previousLinesSet && !query && !rootSelector) {
+    // Lines cut off by maxChars were never shown: leave them out of the baseline so the next delta reports them.
+    if (truncated) {
+      const cutAt = entries.indexOf(body.split('\n').pop()) + 1;
+      for (const line of entries.slice(cutAt)) {
+        const ref = /^\*?\[(f\d+:e\d+)\]/.exec(line)?.[1];
+        if (ref) nextRefs.delete(ref);
+      }
+    }
+    previousLinesSet.clear();
+    previousLinesSet.add(urlKey);
+    for (const s of nextSignatures) previousLinesSet.add(s);
+    const byMode = sameUrlAsBaseline && store ? store.byMode : new Map();
+    byMode.set(mode, { refs: nextRefs, includeFrames });
+    snapshotBaselines.set(previousLinesSet, { byMode, nextRefNum });
   }
 
   let text = `${header}${body}${removedLine ? `\n${removedLine}` : ''}`;
@@ -2105,6 +2138,62 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
 // Late hydration can replace a field right after we filled it. On a young page, wait briefly, re-check each text
 // fill (marked data-tbm-fill) and refill once the ones whose element vanished or lost its value.
 const RECHECK_SETTLE_MS = 350;
+
+// Web components (Reddit "faceplate" inputs) can ignore a programmatic value: the inner input holds it, the component
+// state and its Save button do not. In-page probe, only run for fields that sit inside a shadow root. Takes an element
+// (locator.evaluate) or a list of data-tbm-fill ids (frame.evaluate, returns the stale ids).
+function commitStaleProbe(arg) {
+  const getSR = (n) => n?.shadowRoot || window.__tbmGetShadowRoot?.(n) || null;
+  const deep = (root, sel) => {
+    const out = [];
+    const stack = [root];
+    while (stack.length) {
+      const cur = stack.shift();
+      if (!cur) continue;
+      const own = cur.nodeType === 1 ? getSR(cur) : null;
+      if (own) stack.push(own);
+      if (!cur.querySelectorAll) continue;
+      try { out.push(...cur.querySelectorAll(sel)); } catch { /* ignore */ }
+      for (const n of cur.querySelectorAll('*')) { const s = getSR(n); if (s) stack.push(s); }
+    }
+    return out;
+  };
+  const up = (n) => {
+    const rn = n.getRootNode?.();
+    return n.parentElement || (rn instanceof ShadowRoot ? rn.host : null);
+  };
+  const COMMIT = /^(save|ok|okay|done|apply|add|update|confirm|submit|create|continue|next|set)(?![\p{L}\p{N}_])/iu;
+  const isOff = (b) => Boolean(b.matches?.(':disabled') || b.getAttribute('aria-disabled') === 'true');
+  const stale = (el) => {
+    if (!(el.getRootNode?.() instanceof ShadowRoot)) return false;
+    const host = el.getRootNode().host;
+    if (host && typeof host.value === 'string' && host.value !== String(el.value ?? '')) return true;
+    let box = el;
+    while (box && !(box.nodeType === 1 && box.matches('form, dialog, [role="dialog"], [role="alertdialog"], [aria-modal="true"]'))) box = up(box);
+    if (!box) return false;
+    const commits = deep(box, 'button, input[type="submit"], [role="button"]').filter((b) => {
+      const label = (b.getAttribute('aria-label') || b.innerText || b.value || '').replace(/\s+/g, ' ').trim();
+      return b.type === 'submit' || COMMIT.test(label);
+    });
+    return commits.length > 0 && commits.every(isOff);
+  };
+  if (Array.isArray(arg)) return arg.filter((id) => deep(document, `[data-tbm-fill="${id}"]`).some(stale));
+  return stale(arg);
+}
+
+// Fallback for such fields: focus, select all and type for real (trusted key events). Returns true when typed.
+async function retypeField(page, locator, val) {
+  if (/[\r\n]/.test(val)) return false;
+  try {
+    await locator.focus({ timeout: 1500 });
+    await page.keyboard.press('ControlOrMeta+a');
+    if (val === '') await page.keyboard.press('Backspace');
+    else await page.keyboard.type(val);
+    return true;
+  } catch {
+    return false;
+  }
+}
 async function recheckFilled(page, spec, filled) {
   const textFills = filled.filter((e) => e && e.value !== undefined && ['input', 'textarea', 'contenteditable'].includes(e.tag));
   if (textFills.length === 0) return 0;
@@ -3469,6 +3558,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                 tag: el.isContentEditable ? 'contenteditable' : el.tagName.toLowerCase(),
                 label: describe(el).slice(0, 50),
                 value: strVal.slice(0, 60),
+                ...(el.getRootNode?.() instanceof ShadowRoot ? { _sh: 1 } : {}),
               });
               matchedIndexes.push(f._idx);
             }
@@ -3624,7 +3714,20 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
               const rawType =
                 ownType ||
                 (hostType === 'submit' || hostType === 'image' || hostType === 'button' || hostType === 'reset' ? hostType : '');
-              return { frameIdx: frameIdxArg, text: txt, type: rawType };
+              // Same form (or dialog) as a field we just filled: those buttons commit our fill.
+              const scopeOf = (n) => {
+                let cur = n;
+                while (cur) {
+                  if (cur.nodeType === 1 && cur.matches?.('form, dialog, [role="dialog"], [role="alertdialog"], [aria-modal="true"]')) return cur;
+                  const rn = cur.getRootNode?.();
+                  cur = cur.parentElement || (rn instanceof ShadowRoot ? rn.host : null);
+                }
+                return null;
+              };
+              const myScope = el.form || scopeOf(el);
+              let sameScope = false;
+              if (myScope) for (const c of claimed) if ((c.form || scopeOf(c)) === myScope) { sameScope = true; break; }
+              return { frameIdx: frameIdxArg, text: txt, type: rawType, ...(sameScope ? { _same: 1 } : {}) };
             })
             .filter((b) => b.type === 'submit' || b.type === 'image' || b.text);
 
@@ -3653,11 +3756,12 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
     for (const l of res.leftover) leftoverSet.add(l);
     for (const s of res.submits) {
       const cleanLbl = (s.text || '').normalize('NFC').replace(/^[^\p{L}\p{N}]+/u, '').trim();
-      if (SUBMIT_CAND_NEG_RE.test(cleanLbl)) continue;
+      if (SUBMIT_CAND_NEG_RE.test(cleanLbl) || ACCOUNT_CONNECT_RE.test(cleanLbl)) continue;
       const isSafe = Boolean(cleanLbl && SAFE_SUBMIT_TYPE_RE.test(cleanLbl) && !COMPOUND_DANGER_RE.test(cleanLbl));
       if (
         SUBMIT_LABEL_RE.test(cleanLbl) ||
         NEXT_STEP_RE.test(cleanLbl) ||
+        SAVE_COMMIT_RE.test(cleanLbl) ||
         (SAFE_SUBMIT_TYPE_RE.test(cleanLbl) && COMPOUND_DANGER_RE.test(cleanLbl)) ||
         ((s.type === 'submit' || s.type === 'image') && !isSafe)
       ) {
@@ -3666,10 +3770,11 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
     }
   }
   if (submitButtons.length > 1) {
-    const rank = (b) => (b.type === 'submit' || b.type === 'image' ? 0 : 1);
+    const rank = (b) => (b._same ? 0 : 2) + (b.type === 'submit' || b.type === 'image' ? 0 : 1);
     submitButtons.sort((a, b) => rank(a) - rank(b));
   }
   if (submitButtons.length > 3) submitButtons.length = 3;
+  for (const b of submitButtons) delete b._same;
 
   // Pass 1.5: Fallback to custom ARIA [role="combobox"] dropdowns (light + open Shadow DOM)
   for (const frameInfo of frames) {
@@ -4697,6 +4802,26 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
 
   const refilled = spec._noRecheck ? 0 : await recheckFilled(page, spec, filled);
 
+  // Shadow-DOM fields (web components) whose component ignored the programmatic value: type them for real.
+  if (!spec._noRecheck) {
+    const shadowFills = filled.filter((e) => e && e._sh && e.value !== undefined);
+    if (shadowFills.length > 0) {
+      for (const fi of new Set(shadowFills.map((e) => e.frameIdx))) {
+        const frame = frames.find((f) => f.frameIdx === fi)?.frame;
+        if (!frame) continue;
+        const group = shadowFills.filter((e) => e.frameIdx === fi);
+        const bad = await frame.evaluate(commitStaleProbe, group.map((e) => String(e.idx))).catch(() => []);
+        for (const e of group) {
+          if (!bad.includes(String(e.idx))) continue;
+          const want = spec.fields?.[e.idx]?.value;
+          if (typeof want !== 'string') continue;
+          if (await retypeField(page, frame.locator(`[data-tbm-fill="${e.idx}"]`).first(), want)) e.retyped = true;
+        }
+      }
+    }
+    for (const e of filled) if (e && e._sh) delete e._sh;
+  }
+
   const output = {
     filledCount: filled.length,
     filled,
@@ -4835,7 +4960,9 @@ export async function collectItems(page, step = {}) {
                 const v = el.id || el.getAttribute('data-id');
                 if (v) item.id = v;
               } else if (f === 'href') {
-                const v = (el.matches('a[href]') ? el : el.querySelector('a[href]'))?.href;
+                // textSelector on (or inside) a link: that link's URL, not the row's first anchor (an upvote link).
+                const own = sub ? tEl.closest('a[href]') : null;
+                const v = (own || (el.matches('a[href]') ? el : el.querySelector('a[href]')))?.href;
                 if (v) item.href = v;
               }
             }
@@ -4941,34 +5068,44 @@ export async function findOutboundApplyLinks(page) {
 }
 
 async function executeSingleAction(page, params = {}) {
-  const silentState = { count: 0 };
+  const silentState = { count: 0, wantKind: false, clickKind: '' };
   const enabled = params.observeAftermath ?? (process.env.TURBO_BROWSER_OBSERVE_AFTERMATH === 'true');
   const observer = enabled && ['click', 'dblclick'].includes(params.action) ? observeClickAftermath(page) : null;
   const navigation = params.returnSnapshot && ['click', 'dblclick', 'press'].includes(params.action)
     ? watchActionNavigation(page, Number(params.timeoutMs) || DEFAULT_TIMEOUT_MS) : null;
+  // A committing click/key gets the same settle step so a toast ("This domain isn't allowed.") can show up.
+  const wantToast = ['click', 'dblclick', 'press'].includes(params.action);
+  const toastWindow = wantToast && resolveAllowSubmit(params.allowSubmit);
   // One shared settle step replaces fixed sleeps; listeners stay attached until it is done.
-  const activity = observer || navigation ? watchActivity(page) : null;
+  const activity = observer || navigation || toastWindow ? watchActivity(page) : null;
+  if (wantToast) await armToasts(page);
   const beforeApplyUrl = page.url();
   let openedTab = false;
   const onNewPage = () => { openedTab = true; };
   const ctxForTabs = ['click'].includes(params.action) ? page.context() : null;
   ctxForTabs?.on('page', onNewPage);
   let res;
+  silentState.wantKind = Boolean(observer);
   try {
     try {
       res = await executeSingleActionInner(page, params, silentState);
     } catch (err) {
       throw conciseActionError(err);
     }
+    observer?.setKind(silentState.clickKind);
     if (!res.blocked) {
       await navigation?.finish();
       // The guard keeps watching at least 400 ms so a late commit-like request is still reported.
       await activity?.settle({ minMs: observer ? 400 : 0 });
-      if (activity && res && typeof res === 'object') res.outcome = activity.outcome();
+      if ((observer || navigation) && res && typeof res === 'object') res.outcome = activity.outcome();
+      if (wantToast && res && typeof res === 'object') {
+        const toast = await takeToast(page);
+        if (toast) res.toast = toast;
+      }
     }
     await observer?.finish(res, resolveAllowSubmit(params.allowSubmit));
     if (res && res._applyLike) {
-      if (!activity) await new Promise((r) => setTimeout(r, 600));
+      if (!observer && !navigation) await new Promise((r) => setTimeout(r, 600));
       if (!openedTab && page.url() === beforeApplyUrl) {
         const links = await findOutboundApplyLinks(page);
         if (links.length) res.outboundLinks = links;
@@ -4994,6 +5131,13 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
   if (!action) throw new Error('act_fast requires action.');
   const timeout = Number(params.timeoutMs) || DEFAULT_TIMEOUT_MS;
   const allowSubmit = resolveAllowSubmit(params.allowSubmit);
+
+  if (action === 'reload' || action === 'back' || action === 'forward') {
+    const opts = { waitUntil: 'domcontentloaded', timeout };
+    const resp = action === 'reload' ? await page.reload(opts) : action === 'back' ? await page.goBack(opts) : await page.goForward(opts);
+    if (!resp && action !== 'reload') throw new Error(`nothing to go ${action} to`);
+    return { ok: true, action, url: page.url() };
+  }
 
   if (action === 'scroll') {
     if (params.ref || params.selector || params.text) {
@@ -6011,6 +6155,22 @@ ${el.value || ''}`.toLowerCase();
   if (action === 'click' || action === 'dblclick') {
     const disabledLabel = await disabledTargetLabel(locator);
     if (disabledLabel) throw new Error(`target is disabled (${disabledLabel})`);
+    if (silentState.wantKind) {
+      silentState.clickKind = await locator.evaluate((el) => {
+        let cur = el;
+        let form = el.form || null;
+        while (cur) {
+          if (cur.nodeType === 1 && cur.matches?.('a[href]')) return 'link';
+          if (cur.nodeType === 1 && !form && cur.tagName === 'FORM') form = cur;
+          const rn = cur.getRootNode?.();
+          cur = cur.parentElement || (rn instanceof ShadowRoot ? rn.host : null);
+        }
+        if (!form) return 'other';
+        const get = (form.getAttribute('method') || 'get').toLowerCase() === 'get';
+        const searchy = form.getAttribute('role') === 'search' || Boolean(form.querySelector('input[type="search"], input[name="q"], input[name="query"], input[name="search"], input[name="s"], input[name="keyword"]'));
+        return get && searchy ? 'search' : 'form';
+      }).catch(() => '');
+    }
     let isSafeLocatorClick = false;
     let isSafePointClick = false;
     let safePointCoords = null;
@@ -6105,12 +6265,10 @@ ${el.value || ''}`.toLowerCase();
     await withActionSubmitGuard(() => locator.fill(val, { timeout }));
     const out = { ok: true, action, frameIdx, length: val.length };
     // Masks, maxlength and number inputs can change what was typed; say so instead of letting the model assume.
-    const back = await locator.evaluate((el) => (
-      ['INPUT', 'TEXTAREA'].includes(el.tagName) && el.type !== 'file'
-        ? { v: String(el.value), secret: el.type === 'password' } : null
-    )).catch(() => null);
-    if (back && back.v !== val) {
-      out.mismatch = back.secret || process.env.TURBO_BROWSER_SECRETS_FILE ? 'field value differs from the typed value' : `field now holds "${back.v.slice(0, 60)}"`;
+    const back = await readBack(locator);
+    if (back && back.v !== val) out.mismatch = mismatchText(back);
+    else if (back?.sh && await locator.evaluate(commitStaleProbe).catch(() => false) && await retypeField(page, locator, val)) {
+      out.retyped = true;
     }
     return out;
   }
@@ -6242,10 +6400,14 @@ ${el.value || ''}`.toLowerCase();
         isSafeTypeEnter ? { useActiveElement: true } : null,
       );
     }
+    const typedOut = { ok: true, action, frameIdx, length: val.length, submitted: Boolean(params.submit) };
+    // Typing appends, so only the tail has to match; maxlength, masks and number inputs cut it short.
+    const typedBack = val ? await readBack(locator) : null;
+    if (typedBack && !typedBack.v.endsWith(val.replace(/\r\n/g, '\n'))) typedOut.mismatch = mismatchText(typedBack);
     if (params.submit) {
       await page.keyboard.press('Enter');
     }
-    return { ok: true, action, frameIdx, length: val.length, submitted: Boolean(params.submit) };
+    return typedOut;
   }
 
   if (action === 'select') {
@@ -6480,21 +6642,43 @@ export async function smartFillFormGuarded(page, spec = {}, previousLinesSet = n
 }
 
 // A disabled target never becomes clickable by waiting 8 s: allow ~1.2 s for it to enable, then fail with one line.
-async function disabledTargetLabel(locator, waitMs = 1200) {
+// Value the field holds after fill/type, for the mismatch report. Never echoed for password fields or with secrets on.
+function readBack(locator) {
+  return locator.evaluate((el) => (
+    ['INPUT', 'TEXTAREA'].includes(el.tagName) && el.type !== 'file'
+      ? { v: String(el.value), secret: el.type === 'password', sh: el.getRootNode?.() instanceof ShadowRoot } : null
+  )).catch(() => null);
+}
+function mismatchText(back) {
+  return back.secret || process.env.TURBO_BROWSER_SECRETS_FILE ? 'field value differs from the typed value' : `field now holds "${back.v.slice(0, 60)}"`;
+}
+
+async function disabledTargetLabel(locator, waitMs = 150) {
   const probe = () =>
     locator
       .evaluate((el) => {
-        const off = el.matches?.(':disabled') || el.getAttribute('aria-disabled') === 'true';
+        // The matched node can be a span inside a disabled button or a div[aria-disabled] wrapper: check the node
+        // and its ancestors up to the nearest interactive one (crossing shadow roots).
+        const isOff = (n) => n.matches?.(':disabled') || n.getAttribute?.('aria-disabled') === 'true';
+        const INTERACTIVE = 'button, a[href], input, select, textarea, summary, [role="button"], [role="link"], [role="menuitem"], [role="tab"]';
+        let off = null;
+        let cur = el;
+        for (let d = 0; cur && cur.nodeType === 1 && d < 8; d++) {
+          if (isOff(cur)) { off = cur; break; }
+          if (cur !== el && cur.matches(INTERACTIVE)) break;
+          const rn = cur.getRootNode?.();
+          cur = cur.parentElement || (rn instanceof ShadowRoot ? rn.host : null);
+        }
         if (!off) return null;
-        const name = (el.getAttribute('aria-label') || el.innerText || el.value || el.getAttribute('placeholder') || el.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 40);
-        const role = el.getAttribute('role') || el.tagName.toLowerCase();
+        const name = (off.getAttribute('aria-label') || off.innerText || off.value || off.getAttribute('placeholder') || off.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+        const role = off.getAttribute('role') || off.tagName.toLowerCase();
         return name ? `${role} '${name}'` : role;
       }, undefined, { timeout: 1000 })
       .catch(() => null);
   let label = await probe();
   const t0 = Date.now();
   while (label && Date.now() - t0 < waitMs) {
-    await new Promise((r) => setTimeout(r, 150));
+    await new Promise((r) => setTimeout(r, 100));
     label = await probe();
   }
   return label;
@@ -6584,6 +6768,11 @@ export async function batchActions(page, steps = [], options = {}, previousLines
   return out;
 }
 
+const BATCH_ACTIONS = new Set([
+  'click', 'dblclick', 'hover', 'focus', 'clear', 'fill', 'type', 'select', 'check', 'uncheck', 'drag', 'drop', 'press',
+  'scroll', 'wait', 'upload', 'reload', 'back', 'forward',
+]);
+
 async function batchActionsCore(page, stepList, options, previousLinesSet, guardState) {
   const t0 = Date.now();
   const continueOnError = Boolean(options.continueOnError);
@@ -6646,6 +6835,7 @@ async function batchActionsCore(page, stepList, options, previousLinesSet, guard
         }
         if (lastNavBad) stepResult.note = lastNavBad + (stepResult.note ? `; ${stepResult.note}` : '');
       } else {
+        if (step.action && !BATCH_ACTIONS.has(step.action)) throw new Error(`unknown batch action: ${step.action}`);
         lastNavBad = '';
         stepResult = await executeSingleAction(page, {
           ...step,
@@ -6764,8 +6954,10 @@ export async function extractCleanText(page, options = {}) {
   const format = options.format === 'markdown' ? 'markdown' : 'text';
 
   const frames = includeFrames ? getAllFrames(page) : getAllFrames(page).slice(0, 1);
-  const sections = [];
+  let sections = [];
 
+  const runAll = async () => {
+  sections = [];
   for (const frameInfo of frames) {
     let part = '';
     try {
@@ -7155,6 +7347,10 @@ export async function extractCleanText(page, options = {}) {
           const rescued = await runFrame(true, true);
           if (rescued.t.length > res.t.length) res = rescued;
         }
+      } else if (selector && !res.t) {
+        // The selector matched but everything was dropped: a modal library can set aria-hidden on the app root.
+        const rescued = await runFrame(true, true);
+        if (rescued.t) res = rescued;
       }
       part = denoiseText(res.o ? `${res.o}\n${res.t}` : res.t);
     } catch {
@@ -7163,6 +7359,18 @@ export async function extractCleanText(page, options = {}) {
     if (part) {
       sections.push(frameInfo.isMain ? part : `[iframe f${frameInfo.frameIdx}]\n${part}`);
     }
+  }
+  };
+  await runAll();
+  // An SPA right after navigate: the shell is there, the text is not (or is still fading in). Wait once, up to ~2 s.
+  let note = '';
+  if (sections.length === 0) {
+    const until = Date.now() + 2000;
+    while (sections.length === 0 && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 200));
+      await runAll();
+    }
+    if (sections.length === 0) note = 'page has no text yet';
   }
 
   const title = await page.title().catch(() => '');
@@ -7182,6 +7390,7 @@ export async function extractCleanText(page, options = {}) {
     truncated,
     charCount: text.length,
     savePath: savedPath,
+    ...(note ? { note } : {}),
   };
 }
 
@@ -7482,16 +7691,31 @@ export async function capturePage(page, params = {}) {
 
   if (mode === 'pdf') {
     let pdfBuf;
+    // Print media + the page's own @page size/margins; A4 with no margin only when the CSS declares none.
+    await page.emulateMedia({ media: 'print' }).catch(() => {});
     try {
-      pdfBuf = await page.pdf({ format: 'A4', printBackground: true });
-    } catch {
-      const client = await page.context().newCDPSession(page);
       try {
-        const { data } = await client.send('Page.printToPDF', { printBackground: true });
-        pdfBuf = Buffer.from(data, 'base64');
-      } finally {
-        await client.detach().catch(() => {});
+        pdfBuf = await page.pdf({ format: 'A4', printBackground: true, preferCSSPageSize: true });
+      } catch {
+        const client = await page.context().newCDPSession(page);
+        try {
+          const { data } = await client.send('Page.printToPDF', {
+            printBackground: true,
+            preferCSSPageSize: true,
+            paperWidth: 8.27,
+            paperHeight: 11.7,
+            marginTop: 0,
+            marginBottom: 0,
+            marginLeft: 0,
+            marginRight: 0,
+          });
+          pdfBuf = Buffer.from(data, 'base64');
+        } finally {
+          await client.detach().catch(() => {});
+        }
       }
+    } finally {
+      await page.emulateMedia({ media: null }).catch(() => {});
     }
     if (resolvedPath) {
       fs.writeFileSync(resolvedPath, pdfBuf);

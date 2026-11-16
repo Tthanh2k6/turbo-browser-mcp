@@ -58,7 +58,7 @@ describe('field fixes round 4 (field report round 5)', () => {
 
   it('2b: a button that enables within the short wait is clicked', async () => {
     await page.setContent(`<button id="b" disabled onclick="window.__c=1">Go</button>
-      <script>setTimeout(() => { document.getElementById('b').disabled = false; }, 400);</script>`);
+      <script>setTimeout(() => { document.getElementById('b').disabled = false; }, 60);</script>`);
     const r = await actFast(page, { action: 'click', selector: '#b' });
     assert.equal(r.ok, true);
     assert.equal(await page.evaluate(() => window.__c), 1);

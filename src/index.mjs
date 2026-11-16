@@ -379,7 +379,7 @@ export const TOOL_DEFINITIONS = [
         tabId: { type: 'integer' },
         steps: {
           type: 'array',
-          description: 'act_fast or smart_fill_form steps; also {action:"navigate",url} (GET only), {action:"extract",format:"text"|"markdown",selector?,maxChars?}, {action:"collect",selector,scrolls?:5,waitMs?:400,maxItems?:100,maxChars?:8000,fields?:["text","href","id"],textSelector?} (scroll, read matching elements each time, dedupe: virtualized feeds).',
+          description: 'act_fast or smart_fill_form steps (incl. reload/back/forward); also {action:"navigate",url} (GET only), {action:"extract",format:"text"|"markdown",selector?,maxChars?}, {action:"collect",selector,scrolls?:5,waitMs?:400,maxItems?:100,maxChars?:8000,fields?:["text","href","id"],textSelector?} (scroll, read matching elements each time, dedupe: virtualized feeds).',
           items: { type: 'object' },
         },
         continueOnError: { type: 'boolean', default: false },
@@ -707,7 +707,7 @@ async function dispatchToolCallInner(manager, name, rawArgs = {}) {
       const { tabId, page } = await manager.getPage(args.tabId);
       const res = await extractCleanText(page, args);
       return {
-        text: `tabId=${tabId} | chars=${res.charCount} | truncated=${res.truncated}${res.savePath ? ` | savePath=${res.savePath}${res.fullChars ? ` (full ${res.fullChars} chars)` : ''}` : ''}\n${wrapPage(res.text)}`,
+        text: `tabId=${tabId} | chars=${res.charCount} | truncated=${res.truncated}${res.note ? ` | note=${res.note}` : ''}${res.savePath ? ` | savePath=${res.savePath}${res.fullChars ? ` (full ${res.fullChars} chars)` : ''}` : ''}\n${wrapPage(res.text)}`,
       };
     }
     case 'evaluate_js': {

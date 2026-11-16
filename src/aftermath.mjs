@@ -112,10 +112,15 @@ export function observeClickAftermath(page) {
   const onLateRequest = (request) => {
     if (/^(POST|PUT|PATCH|DELETE)$/.test(request.method()) && ['fetch', 'xhr'].includes(request.resourceType())) park(`${request.method()} ${pathOf(request.url())}`);
   };
+  let kind = '';
   return {
+    // What the click landed on ('link' | 'search' | 'form' | 'other'): a plain link or a GET search form that navigates
+    // is reading, not submitting.
+    setKind(k) { kind = k || ''; },
     async finish(result, allowSubmit) {
       if (!result || result.blocked) return;
-      const unexpectedSubmit = !allowSubmit && (navigated || mutatingRequests.some((r) => r.finalSubmit));
+      const readOnlyNav = kind === 'link' || kind === 'search';
+      const unexpectedSubmit = !allowSubmit && ((navigated && !readOnlyNav) || mutatingRequests.some((r) => r.finalSubmit));
       result.aftermath = { beforeUrl, afterUrl: page.url(), navigated, mutatingRequests: [...mutatingRequests], unexpectedSubmit };
       if (!navigated && !unexpectedSubmit) {
         // Keep listening after the result is built, without delaying it.

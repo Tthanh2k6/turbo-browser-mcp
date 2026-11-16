@@ -3,10 +3,10 @@ import { peekBlocked } from './allow-hosts.mjs';
 // Navigation health hints: only emitted when the page is not a plain OK load.
 const BLOCK_TITLE_RES = [
   [/just a moment|attention required|checking your browser|performing security verification/i, 'cloudflare'],
-  [/access denied|are you a robot|verify you are (a )?human|human verification|captcha/i, 'bot-wall'],
+  [/access denied|are you a robot|verify you are (a )?human|human verification|captcha|prove (your humanity|you(?:'|’)?re (a )?human)/i, 'bot-wall'],
 ];
 const BLOCK_BODY_RES = [
-  [/verify(ing)? you are (a )?human|checking if the site connection is secure|enable javascript and cookies to continue|performing security verification/i, 'bot-wall'],
+  [/prove (your humanity|you(?:'|’)?re (a )?human)|verify(ing)? you are (a )?human|checking if the site connection is secure|enable javascript and cookies to continue|performing security verification/i, 'bot-wall'],
   [/complete the security check|unusual traffic|select all (squares|images)|are you a robot|i'?m not a robot|verify you are not a robot/i, 'captcha'],
 ];
 

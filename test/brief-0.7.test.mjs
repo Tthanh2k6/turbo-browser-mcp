@@ -205,7 +205,7 @@ it('140-button delta reports a removal without reordering noise and surviving re
 it('delta caps removals at 30 refs and does not reuse the removed highest ref', async () => {
   await buttons();
   const state = new Set();
-  await inspectCompact(page, {}, state);
+  await inspectCompact(page, { maxChars: 20000 }, state);
   await page.evaluate(() => [...document.querySelectorAll('button')].slice(100).forEach(button => button.remove()));
   const delta = await inspectCompact(page, { onlyChanged: true }, state);
   assert.match(delta.text, /Removed: .* \+10 more/);
