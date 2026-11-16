@@ -21,6 +21,17 @@ const SUBMIT_LABEL_RE =
 const SAFE_SUBMIT_TYPE_RE =
   /^(next|continue|search|filter|save\s*draft|log\s*in|sign\s*in|tiếp(\s*tục)?|tìm(\s*kiếm)?|lọc|lưu\s*nháp|đăng\s+nhập|다음|이전|검색|로그인|次へ|検索|ログイン|下一步|搜索|登录)(?![\p{L}\p{N}_])/iu;
 
+// Destructive-but-local UI (chip remove, clear form, close/cancel): not a final submit unless it is type=submit.
+const LOCAL_UI_RE =
+  /^(?!.*(?:account|profile|permanently|everything|workspace|tài\s*khoản|vĩnh\s*viễn))(remove|clear|cancel|close|hủy|huỷ|đóng|xóa\s+hết\s+câu\s+trả\s+lời|xoá\s+hết\s+câu\s+trả\s+lời|xóa\s+biểu\s+mẫu|xoá\s+biểu\s+mẫu)(?![\p{L}\p{N}_])/iu;
+
+const APPLY_LABEL_RE = /^apply(\s+now)?(?![\p{L}\p{N}_])/iu;
+
+// smart_fill_form submitButtons: never list these, even when type=submit.
+const SUBMIT_CAND_NEG_RE =
+  /^(clear|reset|remove|delete|cancel|close|discard|xóa|xoá|hủy|huỷ|đóng|bỏ\s+qua)(?![\p{L}\p{N}_])/iu;
+const NEXT_STEP_RE = /^(next|continue|tiếp(\s*tục)?)(?![\p{L}\p{N}_])/iu;
+
 const COMPOUND_DANGER_RE =
   /(?:^|[^\p{L}\p{N}_])(submit|publish|post|send|apply(\s+now)?|pay|payment|purchase|buy|place\s+order|complete\s+(order|purchase)|checkout|delete|remove|confirm|thanh\s*toán|đặt\s+hàng|mua\s+ngay|đăng(?!\s+nhập)(\s*bài)?|xoá|xóa|gửi|nộp|제출|결제|送信|提交|支付)(?![\p{L}\p{N}_])/iu;
 
@@ -458,7 +469,7 @@ export async function resolveTarget(page, { ref, selector, text, frameIdx, allow
     }
     if (fallback) return fallback;
     const near = await nearbyRefs(candidates, parsed.refId);
-    throw new Error(`Element ref "${ref}" not found. ${near ? `Nearest current refs: ${near}.` : 'Run inspect_compact to refresh refs.'}`);
+    throw new Error(`Element ref "${ref}" not found. ${near ? `Nearest current refs: ${near}. If the page re-rendered, re-run inspect_compact (same query).` : 'Run inspect_compact to refresh refs.'}`);
   }
 
   const scopedFrames = frameIdx !== undefined && frameIdx !== null
@@ -492,6 +503,22 @@ export async function resolveTarget(page, { ref, selector, text, frameIdx, allow
       }
     }
     if (fallback) return fallback;
+    // No visible text matched: fall back to aria-label, then title (exact first, then contains).
+    const q = String(text).replace(/["\\\n]/g, (c) => (c === '\n' ? ' ' : '\\' + c));
+    for (const attrSel of [`[aria-label="${q}" i]`, `[aria-label*="${q}" i]`, `[title="${q}" i]`, `[title*="${q}" i]`]) {
+      for (const f of scopedFrames) {
+        let picked = null;
+        try {
+          picked = await pickBestLocator(f.frame.locator(attrSel), allowHidden);
+        } catch {}
+        if (picked) {
+          const res = { frame: f.frame, frameIdx: f.frameIdx, locator: picked.locator };
+          if (picked.visible) return res;
+          if (!fallback) fallback = res;
+        }
+      }
+      if (fallback) return fallback;
+    }
     throw new Error(`Text "${text}" matched 0 elements across ${scopedFrames.length} frame(s).`);
   }
 
@@ -509,6 +536,8 @@ export async function isSubmitLikeElement(locator) {
       const safeRe = new RegExp(patterns.safe, 'iu');
       const dangerRe = new RegExp(patterns.danger, 'iu');
       const modalRe = new RegExp(patterns.modal, 'iu');
+      const localRe = new RegExp(patterns.localUi, 'iu');
+      const applyRe = new RegExp(patterns.apply, 'iu');
       const isShadowRoot = (r) => Boolean(r && r.nodeType === 11 && 'host' in r);
       const getSR = (node) => node?.shadowRoot || window.__tbmGetShadowRoot?.(node) || null;
       const closestComposed = (node, sel) => {
@@ -803,7 +832,15 @@ export async function isSubmitLikeElement(locator) {
         type === 'radio' ||
         tag === 'a';
       if (isButtonLike && cleanLbl) {
-        if ((submitRe.test(cleanLbl) || (safeRe.test(cleanLbl) && dangerRe.test(cleanLbl))) && !isSafeLbl) {
+        const isMenuRole = /^menuitem/.test(role);
+        const plainBtn = (tag === 'button' || role === 'button' || (tag === 'input' && type === 'button')) && !isMenuRole;
+        const localUi = plainBtn && localRe.test(cleanLbl);
+        const hrefAttr = tag === 'a' ? (btn.getAttribute?.('href') || '').trim() : '';
+        const applyNav =
+          applyRe.test(cleanLbl) &&
+          !isMenuRole &&
+          ((tag === 'a' && hrefAttr !== '' && !/^(#|javascript:)/i.test(hrefAttr)) || (!ownForm && (plainBtn || tag === 'a')));
+        if ((submitRe.test(cleanLbl) || (safeRe.test(cleanLbl) && dangerRe.test(cleanLbl))) && !isSafeLbl && !localUi && !applyNav) {
           return { isSubmit: true, isSafeSubmit: false, label: rawLabel, reason: 'submit-label-match' };
         }
         if (modalRe.test(cleanLbl) && !isSafeLbl) {
@@ -845,6 +882,8 @@ export async function isSubmitLikeElement(locator) {
       danger: COMPOUND_DANGER_RE.source,
       modal: MODAL_CONFIRM_RE.source,
       modalSelector: MODAL_SELECTOR,
+      localUi: LOCAL_UI_RE.source,
+      apply: APPLY_LABEL_RE.source,
     });
   } catch {
     return { isSubmit: false, label: '', reason: '' };
@@ -1711,6 +1750,34 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
             return clean(walk(rootNode));
           };
 
+
+          // Visible label that is a preceding <label>/[class*=label] in the field container, with no `for` link
+          // (Zoho Recruit style). Walks up at most 4 ancestors; stops when the container holds another field.
+          const nearestFieldLabel = (el) => {
+            const FIELD_SEL =
+              'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="image"]):not([type="reset"]), textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="combobox"]';
+            let cur = el;
+            for (let up = 0; up < 4 && cur.parentElement; up++) {
+              cur = cur.parentElement;
+              let fields = 0;
+              try {
+                fields = cur.querySelectorAll(FIELD_SEL).length;
+              } catch {}
+              if (fields > 1) return '';
+              let best = '';
+              for (const c of cur.querySelectorAll('label, [class*="label" i]')) {
+                if (c.contains(el) || !(c.compareDocumentPosition(el) & 4)) continue;
+                const forId = c.getAttribute?.('for');
+                if (forId && forId !== el.id) continue;
+                if (c.querySelector('input, select, textarea, button')) continue;
+                const t = clean(c.innerText || c.textContent);
+                if (t && t.length <= 80 && /[\p{L}\p{N}]/u.test(t)) best = t;
+              }
+              if (best) return best;
+            }
+            return '';
+          };
+
           const labelFor = (el) => {
             const aria = clean(el.getAttribute('aria-label'));
             if (aria) return aria.slice(0, 80);
@@ -1756,6 +1823,10 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
             }
 
             for (const attr of ['placeholder', 'data-placeholder', 'title', 'name', 'id']) {
+              if (attr === 'name' && (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable)) {
+                const near = nearestFieldLabel(el);
+                if (near) return near.slice(0, 80);
+              }
               const v = clean(el.getAttribute(attr));
               if (v) return v.slice(0, 80);
             }
@@ -2473,6 +2544,34 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             return (rootNode?.getElementById && rootNode.getElementById(id)) || document.getElementById(id);
           };
 
+
+          // Visible label that is a preceding <label>/[class*=label] in the field container, with no `for` link
+          // (Zoho Recruit style). Walks up at most 4 ancestors; stops when the container holds another field.
+          const nearestFieldLabel = (el) => {
+            const FIELD_SEL =
+              'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="image"]):not([type="reset"]), textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="combobox"]';
+            let cur = el;
+            for (let up = 0; up < 4 && cur.parentElement; up++) {
+              cur = cur.parentElement;
+              let fields = 0;
+              try {
+                fields = cur.querySelectorAll(FIELD_SEL).length;
+              } catch {}
+              if (fields > 1) return '';
+              let best = '';
+              for (const c of cur.querySelectorAll('label, [class*="label" i]')) {
+                if (c.contains(el) || !(c.compareDocumentPosition(el) & 4)) continue;
+                const forId = c.getAttribute?.('for');
+                if (forId && forId !== el.id) continue;
+                if (c.querySelector('input, select, textarea, button')) continue;
+                const t = clean(c.innerText || c.textContent);
+                if (t && t.length <= 80 && /[\p{L}\p{N}]/u.test(t)) best = t;
+              }
+              if (best) return best;
+            }
+            return '';
+          };
+
           const describeParts = (el) => {
             const parts = [];
             for (const a of ['aria-label', 'placeholder', 'name', 'id', 'title', 'data-placeholder']) {
@@ -2491,6 +2590,15 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             }
             const wl = closestComposed(el, 'label');
             if (wl) parts.push(composedText(wl) || wl.innerText);
+            else if (
+              !el.getAttribute('aria-label') &&
+              !lby &&
+              !(el.labels && el.labels.length > 0) &&
+              /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)
+            ) {
+              const near = nearestFieldLabel(el);
+              if (near) parts.unshift(near);
+            }
             const blk = closestComposed(el, qBlockSel);
             if (blk) {
               const blkTextInputs = queryAllDeep(
@@ -3489,9 +3597,11 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
     for (const l of res.leftover) leftoverSet.add(l);
     for (const s of res.submits) {
       const cleanLbl = (s.text || '').normalize('NFC').replace(/^[^\p{L}\p{N}]+/u, '').trim();
+      if (SUBMIT_CAND_NEG_RE.test(cleanLbl)) continue;
       const isSafe = Boolean(cleanLbl && SAFE_SUBMIT_TYPE_RE.test(cleanLbl) && !COMPOUND_DANGER_RE.test(cleanLbl));
       if (
         SUBMIT_LABEL_RE.test(cleanLbl) ||
+        NEXT_STEP_RE.test(cleanLbl) ||
         (SAFE_SUBMIT_TYPE_RE.test(cleanLbl) && COMPOUND_DANGER_RE.test(cleanLbl)) ||
         ((s.type === 'submit' || s.type === 'image') && !isSafe)
       ) {
@@ -3499,6 +3609,11 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
       }
     }
   }
+  if (submitButtons.length > 1) {
+    const rank = (b) => (b.type === 'submit' || b.type === 'image' ? 0 : 1);
+    submitButtons.sort((a, b) => rank(a) - rank(b));
+  }
+  if (submitButtons.length > 3) submitButtons.length = 3;
 
   // Pass 1.5: Fallback to custom ARIA [role="combobox"] dropdowns (light + open Shadow DOM)
   for (const frameInfo of frames) {
@@ -6254,7 +6369,7 @@ export async function extractCleanText(page, options = {}) {
   for (const frameInfo of frames) {
     let part = '';
     try {
-      const runFrame = (skipOv) => frameInfo.frame.evaluate(({ sel, fmt, skipOv: doSkip }) => {
+      const runFrame = (skipOv, rescue = false) => frameInfo.frame.evaluate(({ sel, fmt, skipOv: doSkip, rescue: rescueMode }) => {
         const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'SVG', 'TEMPLATE']);
         const skipSet = new Set();
         let overlayNote = '';
@@ -6298,7 +6413,7 @@ export async function extractCleanText(page, options = {}) {
           while (cur && cur.nodeType === 1) {
             if (skipSet.has(cur)) return true;
             if (SKIP_TAGS.has((cur.tagName || '').toUpperCase()) || cur.hasAttribute('hidden')) return true;
-            if (cur.getAttribute('aria-hidden') === 'true') return true;
+            if (!rescueMode && cur.getAttribute('aria-hidden') === 'true') return true;
             const parent = cur.parentElement;
             if (parent && parent.tagName === 'DETAILS' && !parent.open) {
               const firstSummary = [...parent.children].find((c) => c.tagName === 'SUMMARY');
@@ -6374,7 +6489,7 @@ export async function extractCleanText(page, options = {}) {
           root = matches.find((el) => !isCompletelyHiddenRoot(el)) || matches[0] || null;
         } else {
           const mainMatches = findDeepAll(document, 'main, article, [role="main"]');
-          root = mainMatches.find((el) => !isCompletelyHiddenRoot(el)) || document.body;
+          root = rescueMode ? document.body : (mainMatches.find((el) => !isCompletelyHiddenRoot(el)) || document.body);
         }
         if (!root) return ret('');
 
@@ -6620,9 +6735,20 @@ export async function extractCleanText(page, options = {}) {
           .map((line) => line.replace(/\s+/g, ' ').trim())
           .filter(Boolean)
           .join('\n'));
-      }, { sel: selector, fmt: format, skipOv });
+      }, { sel: selector, fmt: format, skipOv, rescue });
       let res = await runFrame(true);
       if (res.o && res.t.length < 200) res = await runFrame(false);
+      if (!selector && res.t.length < 3000) {
+        // Main-content heuristic picked an empty <main> or an aria-hidden app root (modal libraries set it on #__next):
+        // when the result is under 10% of the page's innerText, retry from <body> ignoring aria-hidden.
+        const bodyLen = await frameInfo.frame
+          .evaluate(() => (document.body ? document.body.innerText.replace(/\s+/g, ' ').trim().length : 0))
+          .catch(() => 0);
+        if (bodyLen > 300 && res.t.length < bodyLen * 0.1) {
+          const rescued = await runFrame(true, true);
+          if (rescued.t.length > res.t.length) res = rescued;
+        }
+      }
       part = res.o ? `${res.o}\n${res.t}` : res.t;
     } catch {
       part = '';

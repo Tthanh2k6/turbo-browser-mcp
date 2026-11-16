@@ -4,6 +4,8 @@ import path from 'node:path';
 import { ensureCdpBridgeDaemon } from './cdp-bridge.mjs';
 import { resolveSafePath } from './dom-engine.mjs';
 import { navHealth } from './navinfo.mjs';
+
+const firstLine = (err) => String((err && err.message) || err).split(/\r?\n/)[0];
 import {
   loadPlaywright,
   resolveActiveCdpEndpoint,
@@ -814,6 +816,7 @@ export class BrowserManager {
     const results = [];
     const tabsBefore = new Set(this._knownTabIds || this.tabs.keys());
     let tabsRequested = false;
+    let failedOpen = false;
     for (const op of ops) {
       const action = op.action || (op.url ? 'open' : 'list');
       if (action === 'list' || action === 'open_many' || action === 'close') tabsRequested = true;
@@ -867,7 +870,7 @@ export class BrowserManager {
                   url: page.url(),
                   title,
                   ok: true,
-                  ...(await navHealth(page, resp, targetUrl, title)),
+                  ...(await navHealth(page, resp, targetUrl, title, { waitUntil: navOpts.waitUntil })),
                 };
               } catch (err) {
                 await page.close().catch(() => {});
@@ -922,6 +925,20 @@ export class BrowserManager {
               timeout: op.timeoutMs || this.defaultTimeoutMs,
             });
           } catch (err) {
+            if (err && err.name === 'TimeoutError') {
+              // The page is usually usable after a slow load: keep the tab and say so.
+              results.push({
+                action: 'open',
+                tabId,
+                isolatedContext: ctxName,
+                ok: false,
+                timedOut: true,
+                url: page.url(),
+                title: await page.title().catch(() => ''),
+                error: firstLine(err),
+              });
+              continue;
+            }
             await page.close().catch(() => {});
             this.tabs.delete(tabId);
             this.tabContextName.delete(tabId);
@@ -929,7 +946,10 @@ export class BrowserManager {
               prevActiveTabId !== null && this.tabs.has(prevActiveTabId)
                 ? prevActiveTabId
                 : ([...this.tabs.keys()].pop() ?? null);
-            throw err;
+            if (ops.length === 1) throw err; // a lone failing open keeps rejecting, as before
+            results.push({ action: 'open', ok: false, url: op.url, error: firstLine(err) });
+            failedOpen = true;
+            continue;
           }
         }
         if (op.activate === false) {
@@ -945,18 +965,36 @@ export class BrowserManager {
           isolatedContext: ctxName,
           url: page.url(),
           title: openTitle,
-          ...(op.url ? await navHealth(page, openResp, op.url, openTitle) : {}),
+          ...(op.url ? await navHealth(page, openResp, op.url, openTitle, { waitUntil: op.waitUntil }) : {}),
         });
         continue;
       }
 
       if (action === 'navigate') {
+        if (failedOpen && (op.tabId === undefined || op.tabId === null)) {
+          results.push({ action: 'navigate', ok: false, skipped: true, error: 'skipped: the earlier open failed and no tabId was given' });
+          continue;
+        }
         const { tabId, page } = await this.getPage(op.tabId);
         if (!op.url) throw new Error('navigate action requires url.');
-        const navResp = await page.goto(op.url, {
-          waitUntil: op.waitUntil || 'domcontentloaded',
-          timeout: op.timeoutMs || this.defaultTimeoutMs,
-        });
+        let navResp;
+        try {
+          navResp = await page.goto(op.url, {
+            waitUntil: op.waitUntil || 'domcontentloaded',
+            timeout: op.timeoutMs || this.defaultTimeoutMs,
+          });
+        } catch (err) {
+          results.push({
+            action: 'navigate',
+            tabId,
+            ok: false,
+            ...(err && err.name === 'TimeoutError' ? { timedOut: true } : {}),
+            url: page.url(),
+            title: await page.title().catch(() => ''),
+            error: firstLine(err),
+          });
+          continue;
+        }
         if (op.activate !== false) this.activeTabId = tabId;
         const navTitle = await page.title().catch(() => '');
         results.push({
@@ -964,7 +1002,7 @@ export class BrowserManager {
           tabId,
           url: page.url(),
           title: navTitle,
-          ...(await navHealth(page, navResp, op.url, navTitle)),
+          ...(await navHealth(page, navResp, op.url, navTitle, { waitUntil: op.waitUntil })),
         });
         continue;
       }

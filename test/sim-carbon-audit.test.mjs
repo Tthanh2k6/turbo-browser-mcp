@@ -194,7 +194,9 @@ describe('Deep Adversarial Code Audit & Stress Suite (sim-carbon-audit)', () => 
     // smartFillForm submitButtons discovery must detect NFD submit labels
     const fillScan = await smartFillForm(page, { fields: [] });
     assert.ok(
-      fillScan.submitButtons.length >= 4,
+      fillScan.submitButtons.length === 3 && // capped at 3; destructive "Xóa" is no longer listed
+        fillScan.submitButtons.some((b) => /^Gửi$/u.test(b.text)) &&
+        fillScan.submitButtons.some((b) => /Thanh toán/u.test(b.text)),
       `Expected smartFillForm submitButtons to include NFD buttons, got ${JSON.stringify(fillScan.submitButtons)}`
     );
 
