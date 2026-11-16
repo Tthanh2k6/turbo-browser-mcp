@@ -341,6 +341,36 @@ async function pickBestLocator(allLoc, allowHidden = false) {
   return { locator: allLoc.first(), visible: false };
 }
 
+// Text targeting: among visible matches prefer actionable ones (button/link/role=button/submit/label or
+// pointer cursor), then ones whose whole text equals the query, so a heading "Login Page" never beats the
+// "Login" button and a paragraph that merely mentions "Close" never beats the "Close" control.
+async function pickBestTextLocator(allLoc, text, allowHidden = false) {
+  const count = await allLoc.count().catch(() => 0);
+  if (count === 0) return null;
+  if (allowHidden || count === 1) return pickBestLocator(allLoc, allowHidden);
+  const scores = await allLoc.evaluateAll((els, q) => {
+    const norm = (v) => String(v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const want = norm(q);
+    const act = 'button, a[href], input[type=submit], input[type=button], input[type=image], summary, label, [role=button], [role=link], [role=menuitem], [role=tab], [onclick]';
+    return els.slice(0, 40).map((el) => {
+      const r = el.getBoundingClientRect();
+      let vis = r.width > 0 && r.height > 0;
+      try { vis = vis && getComputedStyle(el).visibility !== 'hidden' && el.checkVisibility?.() !== false; } catch {}
+      if (!vis) return -1;
+      let a = 0;
+      try { a = el.closest(act) ? 2 : getComputedStyle(el).cursor === 'pointer' ? 2 : 0; } catch {}
+      const t = norm(el.value && /^(submit|button)$/.test(el.type) ? el.value : el.textContent);
+      return a + (t === want ? 1 : 0);
+    });
+  }, text).catch(() => null);
+  if (!scores) return pickBestLocator(allLoc, allowHidden);
+  let best = -1;
+  let bestScore = -1;
+  scores.forEach((sc, i) => { if (sc > bestScore) { bestScore = sc; best = i; } });
+  if (best >= 0 && bestScore >= 0) return { locator: allLoc.nth(best), visible: true };
+  return { locator: allLoc.first(), visible: false };
+}
+
 // Up to 3 live refs closest in number to a missing one, each with a short label, so the model can
 // retry without another snapshot. Never throws.
 async function nearbyRefs(frames, refId) {
@@ -453,7 +483,7 @@ export async function resolveTarget(page, { ref, selector, text, frameIdx, allow
     let fallback = null;
     for (const f of scopedFrames) {
       const allLoc = f.frame.getByText(text, { exact: false });
-      const picked = await pickBestLocator(allLoc, allowHidden);
+      const picked = await pickBestTextLocator(allLoc, text, allowHidden);
       if (picked) {
         const res = { frame: f.frame, frameIdx: f.frameIdx, locator: picked.locator };
         if (picked.visible) return res;
@@ -1750,6 +1780,30 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
           if (root.nodeType === 1 && root.matches?.(sel) && !rawNodes.includes(root)) {
             rawNodes.unshift(root);
           }
+          // Inside an open dialog/modal, custom controls (a <p>Close</p> with a pointer cursor or onclick)
+          // are the only way out, so list them too. Only runs when a visible dialog exists.
+          if (modeArg === 'interactive') {
+            let added = 0;
+            for (const dlg of queryAllDeep(root, '[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog[open], .modal')) {
+              if (added >= 8) break;
+              if (isHidden(dlg)) continue;
+              for (const el of queryAllDeep(dlg, '*').slice(0, 400)) {
+                if (added >= 8) break;
+                if (rawNodes.includes(el) || el.matches?.(sel) || el.closest?.(sel) || !clean(el.textContent)) continue;
+                let clickable = el.hasAttribute('onclick');
+                if (!clickable) {
+                  try {
+                    const cur = getComputedStyle(el).cursor === 'pointer';
+                    clickable = cur && (!el.parentElement || getComputedStyle(el.parentElement).cursor !== 'pointer');
+                  } catch {}
+                }
+                if (clickable && !isHidden(el)) {
+                  rawNodes.push(el);
+                  added++;
+                }
+              }
+            }
+          }
           const nodes = rawNodes.filter((el) => !isHidden(el));
 
           const usedRefs = new Set();
@@ -1934,10 +1988,13 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
     truncated = true;
     text = text.slice(0, maxChars);
   }
-  const savedPath = writeSaveFile(options.savePath, text);
+  // savePath gets the full uncapped snapshot; the returned text stays capped.
+  const fullText = options.savePath ? [`${header}${entries.join('\n')}`, removedLine].filter(Boolean).join('\n') : text;
+  const savedPath = writeSaveFile(options.savePath, fullText);
 
   return {
     text,
+    fullChars: savedPath && fullText.length > text.length ? fullText.length : undefined,
     url: page.url(),
     title,
     mode,
@@ -3440,14 +3497,20 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
       .catch(() => {});
   }
 
-  for (const f of domFields) {
+  // An array `option` on a combobox picks each entry in turn (multi-select comboboxes such as react-select).
+  const comboJobs = domFields.flatMap((f) =>
+    f.value === undefined && Array.isArray(f.option) && f.option.length > 0 && f.option.every((o) => typeof o === 'string')
+      ? f.option.map((o, k) => ({ ...f, option: o, _again: k > 0 }))
+      : [f]);
+  for (const f of comboJobs) {
     const comboWanted =
       typeof f.value === 'string'
         ? f.value
         : typeof f.option === 'string'
           ? f.option
           : null;
-    if ((matchedFieldIndexes.has(f._idx) && !f.all) || !comboWanted) continue;
+    if (!comboWanted || (!f._again && matchedFieldIndexes.has(f._idx) && !f.all)) continue;
+    if (f._again && !filled.some((e) => e.idx === f._idx)) continue;
 
     for (const frameInfo of frames) {
       if (f.frameIdx !== undefined && f.frameIdx !== null && Number(f.frameIdx) !== frameInfo.frameIdx) {
@@ -3592,7 +3655,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
 
             const combos = queryAllDeep(document, '[role="combobox"]').filter((el) => {
               if (el.tagName === 'SELECT') return false;
-              if (!fieldSpec.all && el.getAttribute('data-tbm-combo-claimed') === '1') return false;
+              if (!fieldSpec.all && !fieldSpec._again && el.getAttribute('data-tbm-combo-claimed') === '1') return false;
               if (
                 el.disabled ||
                 Boolean(el.matches?.(':disabled')) ||
@@ -6484,10 +6547,11 @@ export async function extractCleanText(page, options = {}) {
   const full = `${header}${joined}`;
   const truncated = full.length > maxChars;
   const text = truncated ? `${full.slice(0, Math.max(0, maxChars - 20))}\n... [truncated]` : full;
-  const savedPath = writeSaveFile(options.savePath, text);
+  const savedPath = writeSaveFile(options.savePath, full);
 
   return {
     text,
+    fullChars: savedPath && truncated ? full.length : undefined,
     url: page.url(),
     title,
     format,

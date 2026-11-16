@@ -587,7 +587,7 @@ export async function dispatchToolCall(manager, name, rawArgs = {}) {
       const { tabId, page } = await manager.getPage(args.tabId);
       const res = await inspectCompact(page, args, manager.getSnapshotState(page));
       return {
-        text: `tabId=${tabId} | chars=${res.charCount} | truncated=${res.truncated} | ms=${res.elapsedMs}${res.savePath ? ` | savePath=${res.savePath}` : ''}\n${res.text}`,
+        text: `tabId=${tabId} | chars=${res.charCount} | truncated=${res.truncated} | ms=${res.elapsedMs}${res.savePath ? ` | savePath=${res.savePath}${res.fullChars ? ` (full ${res.fullChars} chars)` : ''}` : ''}\n${res.text}`,
       };
     }
     case 'smart_fill_form': {
@@ -636,7 +636,7 @@ export async function dispatchToolCall(manager, name, rawArgs = {}) {
       const { tabId, page } = await manager.getPage(args.tabId);
       const res = await extractCleanText(page, args);
       return {
-        text: `tabId=${tabId} | chars=${res.charCount} | truncated=${res.truncated}${res.savePath ? ` | savePath=${res.savePath}` : ''}\n${res.text}`,
+        text: `tabId=${tabId} | chars=${res.charCount} | truncated=${res.truncated}${res.savePath ? ` | savePath=${res.savePath}${res.fullChars ? ` (full ${res.fullChars} chars)` : ''}` : ''}\n${res.text}`,
       };
     }
     case 'evaluate_js': {
