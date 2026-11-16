@@ -5,7 +5,7 @@ const BLOCK_TITLE_RES = [
 ];
 const BLOCK_BODY_RES = [
   [/verify(ing)? you are (a )?human|checking if the site connection is secure|enable javascript and cookies to continue|performing security verification/i, 'bot-wall'],
-  [/complete the security check|unusual traffic from your (computer|network)/i, 'captcha'],
+  [/complete the security check|unusual traffic|select all (squares|images)|are you a robot|i'?m not a robot|verify you are not a robot/i, 'captcha'],
 ];
 
 function sameUrl(a, b) {
@@ -74,14 +74,22 @@ export async function navHealth(page, response, requestedUrl, title, opts = {}) 
     let snippet = '';
     try {
       snippet = await Promise.race([
-        page.evaluate(() => (document.body?.innerText || '').slice(0, 800)),
+        page.evaluate(() => {
+          const t = (document.body?.innerText || '').slice(0, 800);
+          const vis = (f) => {
+            const r = f.getBoundingClientRect();
+            return r.width > 100 && r.height > 100 && r.bottom > 0 && r.right > 0 && getComputedStyle(f).visibility !== 'hidden';
+          };
+          const f = [...document.querySelectorAll('iframe[src*="hcaptcha.com/captcha"],iframe[src*="recaptcha/api2/bframe"],iframe[src*="recaptcha/enterprise/bframe"]')].some(vis);
+          return f && t.length < 600 ? `${t} captcha challenge` : t;
+        }),
         new Promise((r) => setTimeout(() => r(''), 400)),
       ]);
     } catch {
       snippet = '';
     }
     if (!blocked) {
-      for (const [re, tag] of BLOCK_BODY_RES) {
+      for (const [re, tag] of BLOCK_BODY_RES.concat([[/captcha challenge$/, 'captcha']])) {
         if (re.test(snippet)) { blocked = tag; break; }
       }
     }

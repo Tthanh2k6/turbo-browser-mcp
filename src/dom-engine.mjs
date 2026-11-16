@@ -4839,23 +4839,29 @@ export async function collectItems(page, step = {}) {
   const maxItems = Math.min(2000, Math.max(1, Number(step.maxItems) || 100));
   const maxChars = Math.max(200, Number(step.maxChars) || 8000);
   const fields = Array.isArray(step.fields) ? step.fields.filter((f) => f === 'text' || f === 'href' || f === 'id') : [];
+  const sub = String(step.itemSelector || step.textSelector || '');
   const t0 = Date.now();
   const r = await page.evaluate(
-    async ({ sel, scrolls: nScrolls, waitMs: wait, maxItems: cap, maxChars: charCap, fields: want }) => {
+    async ({ sel, sub, scrolls: nScrolls, waitMs: wait, maxItems: cap, maxChars: charCap, fields: want }) => {
       const hash = (s) => {
         let h = 5381;
         for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) | 0;
         return `${s.length}:${h}`;
       };
-      const seen = new Set();
+      const seen = new Set(); // per call only: nothing survives between collect calls or navigations
       const items = [];
       let chars = 0;
       let full = false;
+      let matched = 0;
       const read = () => {
         let added = 0;
-        for (const el of document.querySelectorAll(sel)) {
+        const els = document.querySelectorAll(sel);
+        matched = Math.max(matched, els.length);
+        for (const el of els) {
           if (full) break;
-          const text = (el.innerText || '').replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n').trim().slice(0, 1500);
+          const tEl = sub ? el.querySelector(sub) : el;
+          if (!tEl) continue;
+          const text = (tEl.innerText || '').replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n').trim().slice(0, 1500);
           if (!text) continue;
           const key = hash(text);
           if (seen.has(key)) continue;
@@ -4865,9 +4871,15 @@ export async function collectItems(page, step = {}) {
             item = {};
             for (const f of want) {
               if (f === 'text') item.text = text;
-              else if (f === 'id') item.id = el.id || el.getAttribute('data-id') || undefined;
-              else if (f === 'href') item.href = (el.matches('a[href]') ? el : el.querySelector('a[href]'))?.href;
+              else if (f === 'id') {
+                const v = el.id || el.getAttribute('data-id');
+                if (v) item.id = v;
+              } else if (f === 'href') {
+                const v = (el.matches('a[href]') ? el : el.querySelector('a[href]'))?.href;
+                if (v) item.href = v;
+              }
             }
+            if (!Object.keys(item).length) item = text;
           }
           const size = typeof item === 'string' ? item.length : JSON.stringify(item).length;
           if (items.length >= cap || chars + size > charCap) {
@@ -4889,6 +4901,13 @@ export async function collectItems(page, step = {}) {
         return null;
       };
       read();
+      if (!matched) {
+        // Rows rendered a beat after domcontentloaded: poll briefly before declaring the page empty.
+        for (let k = 0; k < 6 && !matched; k++) {
+          await new Promise((res) => setTimeout(res, 150));
+          read();
+        }
+      }
       let done = 0;
       let idle = 0;
       for (let i = 0; i < nScrolls && !full; i++) {
@@ -4912,11 +4931,13 @@ export async function collectItems(page, step = {}) {
         idle = added === 0 && !moved ? idle + 1 : added === 0 ? idle : 0;
         if (idle >= 1) break;
       }
-      return { items, scrolls: done, truncated: full };
+      return { items, scrolls: done, truncated: full, matched };
     },
-    { sel: selector, scrolls, waitMs, maxItems, maxChars, fields }
+    { sel: selector, sub, scrolls, waitMs, maxItems, maxChars, fields }
   );
-  return { ok: true, action: 'collect', count: r.items.length, scrolls: r.scrolls, truncated: r.truncated, items: r.items, elapsedMs: Date.now() - t0 };
+  const res = { ok: true, action: 'collect', count: r.items.length, scrolls: r.scrolls, truncated: r.truncated, items: r.items, elapsedMs: Date.now() - t0 };
+  if (!r.items.length) res.note = r.matched ? `${r.matched} elements matched but none had text` : 'selector matched 0 elements';
+  return res;
 }
 
 const APPLY_HOST_PATH_RE =/apply|careers|jobs|greenhouse|lever|ashby|workable|freshteam|zohorecruit|smartrecruiters|recruitee|breezy/i;
@@ -6557,6 +6578,7 @@ async function batchActionsCore(page, stepList, options, previousLinesSet, guard
   const t0 = Date.now();
   const continueOnError = Boolean(options.continueOnError);
   const defaultAllowSubmit = resolveAllowSubmit(options.allowSubmit);
+  let lastNavBad = '';
   const results = [];
 
   for (let i = 0; i < stepList.length; i++) {
@@ -6593,11 +6615,14 @@ async function batchActionsCore(page, stepList, options, previousLinesSet, guard
         });
         const navTitle = await page.title().catch(() => '');
         stepResult = { ok: true, action: 'navigate', url: page.url(), ...(await navHealth(page, navResp, url.href, navTitle)) };
+        lastNavBad = stepResult.blocked ? `page blocked (${stepResult.blocked})` : stepResult.status >= 400 ? `page status ${stepResult.status}` : '';
       } else if (step.action === 'extract') {
         stepResult = await extractCleanText(page, step);
       } else if (step.action === 'collect') {
         stepResult = await collectItems(page, step);
+        if (lastNavBad) stepResult.note = lastNavBad + (stepResult.note ? `; ${stepResult.note}` : '');
       } else {
+        lastNavBad = '';
         stepResult = await executeSingleAction(page, {
           ...step,
           returnSnapshot: options.returnSnapshot || step.returnSnapshot,

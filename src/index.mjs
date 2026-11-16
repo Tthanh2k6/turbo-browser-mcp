@@ -370,7 +370,7 @@ export const TOOL_DEFINITIONS = [
         tabId: { type: 'integer' },
         steps: {
           type: 'array',
-          description: 'act_fast or smart_fill_form steps; also {action:"navigate",url} (GET only), {action:"extract",format:"text"|"markdown",selector?,maxChars?}, {action:"collect",selector,scrolls?:5,waitMs?:400,maxItems?:100,maxChars?:8000,fields?:["text","href","id"]} (scroll, read matching elements each time, dedupe: virtualized feeds).',
+          description: 'act_fast or smart_fill_form steps; also {action:"navigate",url} (GET only), {action:"extract",format:"text"|"markdown",selector?,maxChars?}, {action:"collect",selector,scrolls?:5,waitMs?:400,maxItems?:100,maxChars?:8000,fields?:["text","href","id"],textSelector?} (scroll, read matching elements each time, dedupe: virtualized feeds).',
           items: { type: 'object' },
         },
         continueOnError: { type: 'boolean', default: false },
@@ -582,6 +582,18 @@ export const TOOL_DEFINITIONS = [
 ];
 
 export async function dispatchToolCall(manager, name, rawArgs = {}) {
+  const res = await dispatchToolCallInner(manager, name, rawArgs);
+  const note = typeof manager.takeConnectionNote === 'function' ? manager.takeConnectionNote() : '';
+  if (note && res && typeof res.text === 'string') {
+    res.text = res.text.startsWith('{')
+      ? `{"connectionNote":${JSON.stringify(note)},${res.text.slice(1)}`
+      : `connectionNote: ${note}
+${res.text}`;
+  }
+  return res;
+}
+
+async function dispatchToolCallInner(manager, name, rawArgs = {}) {
   const args = rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs) ? rawArgs : {};
   switch (name) {
     case 'tabs_batch': {

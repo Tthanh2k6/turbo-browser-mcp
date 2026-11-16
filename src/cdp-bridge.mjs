@@ -366,6 +366,19 @@ export async function createCdpBridgeServer({
       return;
     }
 
+    if (req.url === '/shutdown' && req.method === 'POST') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"ok":true}');
+      setTimeout(() => {
+        for (const c of clients) c.close();
+        clients.clear();
+        try { upstreamWs?.close(); } catch {}
+        server.close();
+        server.closeAllConnections?.();
+      }, 20);
+      return;
+    }
+
     if (req.url === '/healthz') {
       res.writeHead(upstreamConnected ? 200 : 503, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: upstreamConnected, upstreamUrl, activeClients: clients.size }));
@@ -513,17 +526,56 @@ export async function getRunningBridgeInfo(bridgePort = DEFAULT_BRIDGE_PORT, hos
   return null;
 }
 
+/** Like getRunningBridgeInfo, but also reports a bridge whose upstream is gone (upstreamConnected false). */
+export async function probeBridge(bridgePort = DEFAULT_BRIDGE_PORT, host = '127.0.0.1') {
+  try {
+    const res = await fetch(`http://${host}:${bridgePort}/json/version`, { signal: AbortSignal.timeout(600) });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data && data.turboBridge) {
+      return { bridgeHttpUrl: `http://${host}:${bridgePort}`, upstreamUrl: data.upstreamUrl, upstreamConnected: Boolean(data.upstreamConnected) };
+    }
+  } catch {
+    // nothing listening
+  }
+  return null;
+}
+
+/** Ask a running bridge to exit (POST /shutdown) and wait until its port is free. False for daemons too old to know it. */
+export async function stopBridge(bridgePort = DEFAULT_BRIDGE_PORT, host = '127.0.0.1', waitMs = 2500) {
+  try {
+    await fetch(`http://${host}:${bridgePort}/shutdown`, { method: 'POST', signal: AbortSignal.timeout(800) });
+  } catch {
+    // fall through to the liveness check
+  }
+  const start = Date.now();
+  while (Date.now() - start < waitMs) {
+    if (!(await probeBridge(bridgePort, host))) return true;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return false;
+}
+
 /**
  * Spawn a background detached CDP Bridge process so the single approved Chrome WebSocket
  * persists across process exits and AFK overnight runs.
  */
 export async function ensureCdpBridgeDaemon(
   upstreamUrl,
-  { bridgePort = DEFAULT_BRIDGE_PORT, host = '127.0.0.1', timeoutMs = 45000 } = {}
+  { bridgePort = DEFAULT_BRIDGE_PORT, host = '127.0.0.1', timeoutMs = 45000, onNote = null } = {}
 ) {
-  const existing = await getRunningBridgeInfo(bridgePort, host);
-  if (existing && existing.upstreamUrl === upstreamUrl) {
+  const existing = await probeBridge(bridgePort, host);
+  if (existing && existing.upstreamConnected && existing.upstreamUrl === upstreamUrl) {
     return existing.bridgeHttpUrl;
+  }
+  if (existing) {
+    // A daemon from a previous Chrome run still owns the port: replace it instead of waiting for a port that never frees.
+    const stopped = await stopBridge(bridgePort, host);
+    if (!stopped) {
+      onNote?.(`bridge on port ${bridgePort} is stale (upstream gone) and could not be stopped; connecting directly`);
+      return null;
+    }
+    onNote?.('bridge upstream stale: restarted');
   }
 
   const selfPath = fileURLToPath(import.meta.url);
@@ -563,6 +615,7 @@ export async function ensureCdpBridgeDaemon(
     if (info) return info.bridgeHttpUrl;
     await new Promise((r) => setTimeout(r, 400));
   }
+  onNote?.(`bridge did not start within ${Math.round(timeoutMs / 1000)}s`);
   return null;
 }
 

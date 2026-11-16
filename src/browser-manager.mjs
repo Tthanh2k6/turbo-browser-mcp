@@ -111,6 +111,22 @@ export class BrowserManager {
     this.attachedPages = new WeakSet();
     this.diagnostics = new WeakMap();
     this.tempDownloadFiles = new Set();
+    this.connectionNote = '';
+    this.bridgePort = options.bridgePort;
+    this.cdpAutoTimeoutMs = options.cdpAutoTimeoutMs;
+    // Tests inject a fake endpoint; node:test normally disables the bridge daemon.
+    this.useBridge = options.useBridge;
+  }
+
+  /** One-shot: why auto mode ended up where it did. Returned once, then cleared. */
+  takeConnectionNote() {
+    const n = this.connectionNote;
+    this.connectionNote = '';
+    return n;
+  }
+
+  _note(msg) {
+    this.connectionNote = this.connectionNote ? `${this.connectionNote}; ${msg}` : msg;
   }
 
   _resetBrowserState() {
@@ -174,26 +190,36 @@ export class BrowserManager {
 
     if (this.mode === 'cdp' || (this.mode === 'auto' && activeCdpEndpoint)) {
       let targetEndpoint = activeCdpEndpoint || this.cdpUrl;
-      const inNodeTest = Boolean(process.env.NODE_TEST_CONTEXT) || process.execArgv.includes('--test');
+      const inNodeTest = this.useBridge ? false : Boolean(process.env.NODE_TEST_CONTEXT) || process.execArgv.includes('--test');
       if (
         !inNodeTest &&
         process.env.TURBO_BROWSER_DISABLE_BRIDGE !== 'true' &&
         (targetEndpoint.startsWith('ws://') || targetEndpoint.startsWith('wss://'))
       ) {
         const bridged = await ensureCdpBridgeDaemon(targetEndpoint, {
-          timeoutMs: Math.max(this.defaultTimeoutMs, 30000),
+          timeoutMs: this.mode === 'auto' ? 12000 : Math.max(this.defaultTimeoutMs, 30000),
+          ...(this.bridgePort ? { bridgePort: this.bridgePort } : {}),
+          onNote: (n) => this._note(n),
         });
         if (bridged) {
           targetEndpoint = bridged;
         }
       }
       try {
+        // auto falls back to launch, so it must not wait the full 20 s for a permission prompt nobody answers.
         this.browser = await chromium.connectOverCDP(targetEndpoint, {
-          timeout: Math.max(this.defaultTimeoutMs, 20000),
+          timeout: this.mode === 'auto' ? Math.min(this.cdpAutoTimeoutMs || 10000, 15000) : Math.max(this.defaultTimeoutMs, 20000),
         });
+        this.connectionNote = '';
         this.context = this.browser.contexts()[0] ?? (await this.browser.newContext());
         this.connectionType = 'cdp';
       } catch (err) {
+        if (this.mode === 'auto') {
+          const m = String(err?.message || err);
+          this._note(/timeout/i.test(m)
+            ? `cdp: no response within ${Math.round((this.cdpAutoTimeoutMs || 10000) / 1000)}s (Chrome may be waiting for 'Allow remote debugging')`
+            : `cdp: ${m.slice(0, 120).split(String.fromCharCode(10))[0]}`);
+        }
         if (this.mode === 'cdp') {
           throw new Error(
             `Failed to attach via CDP at ${targetEndpoint}. Enable chrome://inspect/#remote-debugging (and click Allow on the prompt) or start Chrome with --remote-debugging-port=9222. (${err.message})`
@@ -222,6 +248,10 @@ export class BrowserManager {
         viewport: { width: 1280, height: 800 },
       });
       this.connectionType = 'launch';
+    }
+
+    if (this.connectionNote && this.connectionType !== 'cdp') {
+      this.connectionNote = `${this.connectionType} fallback (${this.connectionNote})`;
     }
 
     const currentBrowser = this.browser;
