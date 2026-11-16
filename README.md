@@ -78,6 +78,10 @@ node src/index.mjs --doctor
 | `network_session` | Resource blockers, cookies & storage | `preset` (`turbo`, `no-images`, `no-media`, `clean`), `blockResources`, `blockUrls`, `cookieAction`, `storageAction`, `loadStorageStatePath`, `saveStorageStatePath` |
 | `wait_for_human` | Hand a step to a person, resume in the same session | `message`, `urlMatches`, `selector`, `textMatches`, `textGone`, `timeoutMs`, `pollMs` |
 
+The server also sends short `instructions` in the MCP initialize result (about 46 tokens): batch fields with `smart_fill_form`, chain steps with `batch_actions`, use `onlyChanged` after the first snapshot, and use refs from the latest snapshot.
+
+With `--tools core` (or `TURBO_BROWSER_TOOLS=core`) only `tabs_batch`, `inspect_compact`, `smart_fill_form`, `act_fast`, `batch_actions` and `extract_clean_text` are listed, and calls to the other tools are refused. The default still lists all 11.
+
 ### Examples
 
 #### Fill a form, attach a PDF from disk, return the result in the same call
@@ -177,7 +181,7 @@ Navigation uses GET in the same tab and waits for `domcontentloaded`. Each extra
 ### Page snapshots (`inspect_compact`)
 - Snapshot modes: `interactive`, `forms`, `article`, and `all`.
 - Cross-boundary traversal: flattens main frame DOM, child iframes (`includeFrames`, `frameIdx`), and open Shadow DOM. Injects an init script hooking `Element.prototype.attachShadow` (`WeakMap` + `WeakRef`/`FinalizationRegistry` + `window.__tbmGetShadowRoot`) to keep post-init closed Shadow roots inspectable and guarded, traverses `<slot>` `assignedNodes({ flatten: true })`, and supports Form-Associated Custom Elements.
-- Token controls: `onlyChanged: true` emits only elements added or changed since the prior snapshot; `query` filters by regex or substring; `boxes: true` adds `[box=x,y,w,h]` only when needed; `maxChars` caps payload size; `savePath` writes full output to disk.
+- Token controls: `onlyChanged: true` emits only elements added or changed since the prior snapshot (a `*` before a line marks a ref that is new since then, and a `Removed:` line lists refs that went away; an unchanged Submit-like button is still listed so the model knows it exists, and the submit guard still blocks it); `query` filters by regex or substring; `boxes: true` adds `[box=x,y,w,h]` only when needed; `maxChars` caps payload size; `savePath` writes full output to disk.
 
 ### Forms in one call (`smart_fill_form`)
 Prefills an entire form in one MCP call while flushing microtasks and macrotasks between controlled inputs:
@@ -190,6 +194,8 @@ Prefills an entire form in one MCP call while flushing microtasks and macrotasks
 ### Actions and chains (`act_fast`, `batch_actions`)
 - `act_fast` actions: `click`, `dblclick`, `hover`, `focus`, `clear`, `fill`, `type` (`slowly`, `delayMs`, `submit`), `select`, `check`, `uncheck`, `drag`, `drop` (`file`, `files`, or custom MIME `dropData`), `press` (`key` + `modifiers`: `Alt`, `Control`, `ControlOrMeta`, `Meta`, `Shift`), `scroll` (`dx`, `dy`), `wait` (`ms`, `state`, `loadState`, `text`, `textGone`, `url`), and `upload`.
 - Targeting options: compact `[eN]` `ref`, CSS `selector`, visible `text`, `label`, or viewport `(x, y)` coordinates, with `button` (`left`, `right`, `middle`) and `frameIdx`.
+- Settle step: after a click, double click or key press with `returnSnapshot` or `observeAftermath`, the server waits up to 150 ms for a navigation to start, then for `domcontentloaded` if one did, then until the DOM has been quiet for 80 ms and no request younger than 1.5 s is pending, at most 800 ms. There is no fixed sleep. The result has `outcome`: `navigated` (the URL changed), `changed` (the DOM changed) or `none`.
+- Recoverable errors: a missing ref lists the 3 nearest current refs with labels; an intercepted click names the covering element; a missing `select` option lists up to 5 closest options; `fill` reads the value back and adds `mismatch` when the field holds something else (a mask or `maxlength`; a password value is not echoed).
 - `batch_actions`: runs an ordered list of DOM actions, nested `smart_fill_form` steps, and `navigate`/`extract` steps for multi-page reading in one MCP call, stopping safely if blocked by the Submit guard or optionally continuing on step errors (`continueOnError`).
 
 ### Text, JavaScript and screenshots (`extract_clean_text`, `evaluate_js`, `capture_page`)
@@ -238,6 +244,8 @@ Measured against installed MCP JSON schemas on disk (compact parameter schemas w
 | `turbo-browser-mcp` | `11` (`15,144` full / `13,631` compact) | `13,631` | `3,170` (`3,541` full w/ annotations) | Baseline (`11` tools) |
 | `@playwright/mcp` | `25` | `18,457` | `3,917` | `19.1%` fewer static tokens |
 | `chrome-devtools-mcp` | `33` | `30,252` | `6,737` | `52.9%` fewer static tokens |
+
+v0.7 shortened the tool descriptions: the compact schema went from `3,217` to `3,029` tokens (`3,588` to `3,400` full). `oneOf` unions were kept as they are, because some clients reject JSON Schema type arrays. `--tools core` lists 6 tools at `2,030` compact tokens. The server instructions add 46 tokens once per session.
 
 v0.5.0 added `wait_for_human` and the commit-safety parameters for about 160 tokens per turn (v0.4.0: `3,010` compact). To keep that small, `expect` / `submissionKey` / `allowDuplicate` are declared only on `batch_actions` (a one-step batch works for a single click), and the network guard is switched on by environment variable, so it costs no schema tokens. The label lists for other languages run inside the page and are never sent to the model.
 
@@ -341,7 +349,7 @@ Some sites fail their bot check whenever the browser is remote-controlled, so a 
 
 Set `observeAftermath: true` on `act_fast` or `batch_actions` (or set
 `TURBO_BROWSER_OBSERVE_AFTERMATH=true`) to observe navigation and mutating
-fetch/XHR requests for one second after each click. It is off by default.
+fetch/XHR requests after each click: at least 400 ms, extended while the page is still active, at most 800 ms. It is off by default.
 The result includes `aftermath: { beforeUrl, afterUrl, navigated,
 mutatingRequests, unexpectedSubmit }`. Requests include their method, URL,
 and a `finalSubmit` classification. Main-frame origin/path changes or
@@ -362,6 +370,7 @@ See [fixture and classification details](test/COMMUNITY_FIXTURES.md).
 | `--user-data-dir <path>` | `TURBO_BROWSER_USER_DATA_DIR` | `""` | Persistent profile directory path |
 | `--executable <path>` | - | auto-detected | Custom Chromium, Chrome, Edge, or Brave executable |
 | `--timeout <ms>` | `TURBO_BROWSER_TIMEOUT_MS` | `15000` | Default Playwright action/navigation timeout in ms |
+| `--tools <all|core>` | `TURBO_BROWSER_TOOLS` | `all` | `core` lists only `tabs_batch`, `inspect_compact`, `smart_fill_form`, `act_fast`, `batch_actions`, `extract_clean_text` |
 | `--headless` / `--headed` | `TURBO_BROWSER_HEADLESS` | `true` (headless) | Run headless or visible browser window (`"false"` for headed) |
 | `--allow-submit` | - | `false` | Disable default Submit/Publish confirmation guard |
 | `--doctor` | - | - | Print Node, Playwright, Chromium, and CDP diagnostics as JSON |
@@ -403,6 +412,7 @@ CI runs the tests on Ubuntu with Node 20 and 22.
 - Portaled comboboxes (react-select, Radix, Headless UI style) have a click path and a keyboard fallback that searches up to 100 options and checks the committed value. Virtualized lists beyond the included fixtures still need testing against real apps.
 - Sites with bot detection may need `wait_for_human` and a person to pass the check in the same browser. The server does not bypass those checks.
 - The agent benchmark has one trial per stack and task so far; the ten-trial protocol in `benchmarks/E2E_PLAN.md` has not been run.
+- The settle step ends as soon as the page is quiet. A request a script fires later than that (for example a timer of several hundred milliseconds) is outside the click aftermath window, which is 400 to 800 ms. A page that keeps mutating the DOM (a spinner or ticker) makes the step run to its 800 ms cap.
 - The network guard and click aftermath only watch a short window after each action, and do not inspect WebSocket messages or service-worker requests. Details are under [commit checks](#commit-checks-expect-submissionkey-modal-and-network-guards).
 - Closed Shadow roots that existed before the server attached to a tab cannot be reached through the hook. Actions there fall back to frame handles, coordinates and keyboard input.
 

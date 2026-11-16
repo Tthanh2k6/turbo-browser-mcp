@@ -56,6 +56,21 @@ const COMMIT_PROPS = {
   allowDuplicate: { type: 'boolean' },
 };
 
+// Sent once in the initialize result. Keep it short and do not repeat it in tool descriptions.
+export const SERVER_INSTRUCTIONS =
+  'Fill several fields, comboboxes ({ref, option}) and uploads with one smart_fill_form. Chain steps with batch_actions (returnSnapshot=true for the end state). ' +
+  'After the first inspect_compact use onlyChanged=true; * marks new refs. Use refs from the latest snapshot.';
+
+// Opt-in smaller tool list (--tools core / TURBO_BROWSER_TOOLS=core).
+export const CORE_TOOL_NAMES = [
+  'tabs_batch', 'inspect_compact', 'smart_fill_form', 'act_fast', 'batch_actions', 'extract_clean_text',
+];
+export function activeToolDefinitions(env = process.env) {
+  return String(env.TURBO_BROWSER_TOOLS || '').toLowerCase() === 'core'
+    ? TOOL_DEFINITIONS.filter((t) => CORE_TOOL_NAMES.includes(t.name))
+    : TOOL_DEFINITIONS;
+}
+
 const SUPPORTED_PROTOCOL = '2025-03-26';
 const SUPPORTED_PROTOCOLS = new Set(['2025-03-26', '2024-11-05', '2024-10-07']);
 
@@ -63,7 +78,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'tabs_batch',
     description:
-      'List, open (single or parallel open_many, with optional isolatedContext), navigate, activate, resize viewport, emulate media/colors/contrast/UA, reload, go back/forward, close tabs, or close browser in a single call.',
+      'Tab operations in one call: list, open/open_many, navigate, activate, resize, emulate, reload, back/forward, close.',
     annotations: {
       title: 'Batch Tab Manager',
       readOnlyHint: false,
@@ -116,24 +131,12 @@ export const TOOL_DEFINITIONS = [
               },
               width: { type: 'integer' },
               height: { type: 'integer' },
-              colorScheme: {
-                oneOf: [{ type: 'string', enum: ['light', 'dark', 'no-preference'] }, { type: 'null' }],
-              },
-              media: {
-                oneOf: [{ type: 'string', enum: ['screen', 'print'] }, { type: 'null' }],
-              },
-              reducedMotion: {
-                oneOf: [{ type: 'string', enum: ['reduce', 'no-preference'] }, { type: 'null' }],
-              },
-              forcedColors: {
-                oneOf: [{ type: 'string', enum: ['active', 'none'] }, { type: 'null' }],
-              },
-              contrast: {
-                oneOf: [{ type: 'string', enum: ['more', 'no-preference'] }, { type: 'null' }],
-              },
-              userAgent: {
-                oneOf: [{ type: 'string' }, { type: 'null' }],
-              },
+              colorScheme: { oneOf: [{ type: 'string', enum: ['light', 'dark', 'no-preference'] }, { type: 'null' }] },
+              media: { oneOf: [{ type: 'string', enum: ['screen', 'print'] }, { type: 'null' }] },
+              reducedMotion: { oneOf: [{ type: 'string', enum: ['reduce', 'no-preference'] }, { type: 'null' }] },
+              forcedColors: { oneOf: [{ type: 'string', enum: ['active', 'none'] }, { type: 'null' }] },
+              contrast: { oneOf: [{ type: 'string', enum: ['more', 'no-preference'] }, { type: 'null' }] },
+              userAgent: { oneOf: [{ type: 'string' }, { type: 'null' }] },
               viewport: {
                 type: 'object',
                 properties: {
@@ -152,7 +155,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'inspect_compact',
     description:
-      'Inspect visible interactive elements, forms, or readable sections across main frame, iframes, and open Shadow DOM. Supports query filter, onlyChanged delta mode, bounding boxes, and savePath, capped at maxChars.',
+      'List interactive elements (with refs), forms or readable sections across frames and open Shadow DOM, capped at maxChars.',
     annotations: {
       title: 'Inspect Compact DOM',
       readOnlyHint: true,
@@ -185,7 +188,7 @@ export const TOOL_DEFINITIONS = [
         },
         savePath: {
           type: 'string',
-          description: 'Optional file path confined to cwd (or TURBO_BROWSER_SAVE_ROOT) to save snapshot text.',
+          description: 'File under cwd or TURBO_BROWSER_SAVE_ROOT.',
         },
       },
     },
@@ -193,7 +196,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'smart_fill_form',
     description:
-      'Fill several fields at once, including React inputs, editors, comboboxes/portaled selects, checkboxes, Shadow DOM/iframe fields and disk file uploads. Use act_fast for single actions. Stops before Submit by default.',
+      'Fill several fields at once: inputs, editors, comboboxes, selects, checkboxes, Shadow DOM/iframe fields, file uploads. Stops before Submit by default.',
     annotations: {
       title: 'Smart Form Prefill',
       readOnlyHint: false,
@@ -213,31 +216,16 @@ export const TOOL_DEFINITIONS = [
               ref: { type: 'string' },
               selector: { type: 'string' },
               frameIdx: { type: 'integer' },
-              keys: {
-                oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
-              },
-              not: {
-                oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
-              },
-              value: {
-                oneOf: [
-                  { type: 'string' },
-                  { type: 'boolean' },
-                  { type: 'number' },
-                  { type: 'array', items: { type: 'string' } },
-                ],
-              },
+              keys: { oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }] },
+              not: { oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }] },
+              value: { oneOf: [{ type: 'string' }, { type: 'boolean' }, { type: 'number' }, { type: 'array', items: { type: 'string' } }] },
               values: {
                 type: 'array',
                 items: { type: 'string' },
                 description: 'Multiple option values/patterns for <select multiple>.',
               },
-              option: {
-                oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
-              },
-              check: {
-                oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
-              },
+              option: { oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }] },
+              check: { oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }] },
               file: { type: 'string' },
               files: { type: 'array', items: { type: 'string' } },
               all: {
@@ -267,7 +255,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'act_fast',
     description:
-      'For one action; to fill several fields use smart_fill_form; for several steps use batch_actions. Target a ref, selector, text or coordinates (x, y). Supports returnSnapshot; blocks submit/publish/send unless allowSubmit=true.',
+      'One action on a ref, selector, text or x/y. Supports returnSnapshot; blocks submit/publish/send unless allowSubmit=true.',
     annotations: {
       title: 'Fast Page Action',
       readOnlyHint: false,
@@ -316,17 +304,13 @@ export const TOOL_DEFINITIONS = [
         targetSelector: { type: 'string', description: 'Drop target selector for drag action.' },
         targetText: { type: 'string', description: 'Drop target text for drag action.' },
         targetFrameIdx: { type: 'integer' },
-        value: {
-          oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
-        },
+        value: { oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }] },
         values: {
           type: 'array',
           items: { type: 'string' },
           description: 'Multiple option values/labels for select action.',
         },
-        label: {
-          oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
-        },
+        label: { oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }] },
         slowly: {
           type: 'boolean',
           description: 'When false fills immediately; when true types character by character.',
@@ -352,7 +336,7 @@ export const TOOL_DEFINITIONS = [
         loadState: { type: 'string', enum: ['load', 'domcontentloaded', 'networkidle'] },
         state: { type: 'string', enum: ['visible', 'hidden', 'attached', 'detached'] },
         timeoutMs: { type: 'integer' },
-        observeAftermath: { type: 'boolean', description: 'Observe click navigation and mutating requests for 1 second; report possible submits.' },
+        observeAftermath: { type: 'boolean', description: 'Observe click navigation and mutating requests (up to 800 ms); report possible submits.' },
         allowSubmit: { type: 'boolean', default: false },
         returnSnapshot: { type: 'boolean', default: false },
         snapshotMode: { type: 'string', enum: ['interactive', 'forms', 'article', 'all'] },
@@ -382,7 +366,7 @@ export const TOOL_DEFINITIONS = [
           items: { type: 'object' },
         },
         continueOnError: { type: 'boolean', default: false },
-        observeAftermath: { type: 'boolean', description: 'Observe click aftermath for each action (adds 1 second per click).' },
+        observeAftermath: { type: 'boolean', description: 'Observe click aftermath for each action (adds up to 800 ms per click).' },
         allowSubmit: { type: 'boolean', default: false },
         returnSnapshot: { type: 'boolean', default: false },
         snapshotMode: { type: 'string', enum: ['interactive', 'forms', 'article', 'all'] },
@@ -394,7 +378,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'extract_clean_text',
     description:
-      'Extract clean readable plain text or compact markdown from main/article content (and iframes) without script/style noise, capped at maxChars, with optional savePath file export.',
+      'Extract readable text or markdown from the main content and iframes, capped at maxChars.',
     annotations: {
       title: 'Extract Clean Page Text',
       readOnlyHint: true,
@@ -412,7 +396,7 @@ export const TOOL_DEFINITIONS = [
         maxChars: { type: 'integer', default: 6000 },
         savePath: {
           type: 'string',
-          description: 'Optional file path confined to cwd (or TURBO_BROWSER_SAVE_ROOT) to save text output.',
+          description: 'File under cwd or TURBO_BROWSER_SAVE_ROOT.',
         },
       },
     },
@@ -420,7 +404,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'evaluate_js',
     description:
-      'Evaluate a JavaScript expression or function in a target frame or element (ref/selector/text, passing el and arg) and return JSON-serializable output, with optional savePath export.',
+      'Evaluate JavaScript in a frame or element (ref/selector/text passes el and arg); returns JSON.',
     annotations: {
       title: 'Evaluate Frame JavaScript',
       readOnlyHint: false,
@@ -441,7 +425,7 @@ export const TOOL_DEFINITIONS = [
         arg: {},
         savePath: {
           type: 'string',
-          description: 'Optional file path confined to cwd (or TURBO_BROWSER_SAVE_ROOT) to save result.',
+          description: 'File under cwd or TURBO_BROWSER_SAVE_ROOT.',
         },
       },
     },
@@ -449,7 +433,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'page_diagnostics',
     description:
-      'Read buffered console logs, network requests/failures (supporting includeStatic, urlFilter, and reqId/part detail inspection), completed downloads, and dialog logs/policy for a tab.',
+      'Read buffered console logs, network requests, downloads and dialogs for a tab.',
     annotations: {
       title: 'Page Diagnostics & Network Inspector',
       readOnlyHint: false,
@@ -488,7 +472,7 @@ export const TOOL_DEFINITIONS = [
         },
         savePath: {
           type: 'string',
-          description: 'Optional JSON file path confined to cwd (or TURBO_BROWSER_SAVE_ROOT) to save diagnostics output.',
+          description: 'File under cwd or TURBO_BROWSER_SAVE_ROOT.',
         },
         clear: { type: 'boolean', default: false },
       },
@@ -497,7 +481,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'capture_page',
     description:
-      'Capture a full-page or element screenshot (png/jpeg, css/device scale) or export PDF confined to cwd (or TURBO_BROWSER_SAVE_ROOT), with optional inline image return.',
+      'Screenshot (png/jpeg) or PDF of the page or an element, saved under cwd or TURBO_BROWSER_SAVE_ROOT; optional inline image.',
     annotations: {
       title: 'Capture Screenshot or PDF',
       readOnlyHint: true,
@@ -551,11 +535,11 @@ export const TOOL_DEFINITIONS = [
         items: { type: 'object' },
         saveStorageStatePath: {
           type: 'string',
-          description: 'Save storageState JSON to a path confined to cwd (or TURBO_BROWSER_SAVE_ROOT).',
+          description: 'Save storageState under cwd or TURBO_BROWSER_SAVE_ROOT.',
         },
         loadStorageStatePath: {
           type: 'string',
-          description: 'Load storageState JSON from a path confined to cwd (or TURBO_BROWSER_SAVE_ROOT).',
+          description: 'Load storageState from cwd or TURBO_BROWSER_SAVE_ROOT.',
         },
         blockResources: { type: 'array', items: { type: 'string' } },
         blockUrls: { type: 'array', items: { type: 'string' } },
@@ -769,6 +753,7 @@ export function createJsonRpcHandler(manager) {
             protocolVersion: negotiatedProtocol,
             capabilities: { tools: {} },
             serverInfo: SERVER_INFO,
+            instructions: SERVER_INSTRUCTIONS,
           },
         };
       }
@@ -781,7 +766,7 @@ export function createJsonRpcHandler(manager) {
         return {
           jsonrpc: '2.0',
           id,
-          result: { tools: TOOL_DEFINITIONS },
+          result: { tools: activeToolDefinitions() },
         };
       }
 
@@ -806,6 +791,16 @@ export function createJsonRpcHandler(manager) {
         }
         const toolName = params.name;
         const toolArgs = params.arguments ?? {};
+        if (TOOL_DEFINITIONS.some((t) => t.name === toolName) && !activeToolDefinitions().some((t) => t.name === toolName)) {
+          return {
+            jsonrpc: '2.0',
+            id,
+            result: {
+              content: [{ type: 'text', text: `Tool "${toolName}" is not available (TURBO_BROWSER_TOOLS=core).` }],
+              isError: true,
+            },
+          };
+        }
         try {
           const out = await dispatchToolCall(manager, toolName, toolArgs);
           const content = [{ type: 'text', text: out.text }];
@@ -1006,6 +1001,7 @@ const VALUE_FLAG_ENV = {
   '--executable': 'TURBO_BROWSER_EXECUTABLE',
   '--timeout': 'TURBO_BROWSER_TIMEOUT_MS',
   '--url': 'TURBO_BROWSER_OPEN_URL',
+  '--tools': 'TURBO_BROWSER_TOOLS',
 };
 
 const HELP_TEXT = `turbo-browser-mcp v${SERVER_INFO.version} — Fast, token-efficient Playwright MCP server
@@ -1026,6 +1022,8 @@ Options:
   --user-data-dir <path>     Persistent browser profile directory
   --executable <path>        Override Chromium/Chrome/Edge binary path
   --timeout <ms>             Default timeout in ms (default: 15000)
+  --tools <all|core>         core lists only tabs_batch, inspect_compact, smart_fill_form, act_fast,
+                             batch_actions, extract_clean_text (default: all)
   --headless                 Run Chromium headless (default)
   --headed                   Show Chromium browser window
   --allow-submit             Allow Submit/Publish clicks without explicit allowSubmit=true

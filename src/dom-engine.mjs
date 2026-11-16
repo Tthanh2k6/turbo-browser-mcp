@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { observeClickAftermath } from './aftermath.mjs';
+import { observeClickAftermath, watchActivity } from './aftermath.mjs';
 import path from 'node:path';
 import {
   appendLedger,
@@ -341,6 +341,60 @@ async function pickBestLocator(allLoc, allowHidden = false) {
   return { locator: allLoc.first(), visible: false };
 }
 
+// Up to 3 live refs closest in number to a missing one, each with a short label, so the model can
+// retry without another snapshot. Never throws.
+async function nearbyRefs(frames, refId) {
+  const want = Number(String(refId).replace(/\D/g, ''));
+  const found = [];
+  for (const f of frames) {
+    const rows = await f.frame.evaluate(() => [...document.querySelectorAll('[data-tbm-ref]')].map((el) => [
+      el.getAttribute('data-tbm-ref'),
+      (el.getAttribute('aria-label') || el.innerText || el.value || el.placeholder || el.getAttribute('name') || el.tagName)
+        .toString().replace(/\s+/g, ' ').trim().slice(0, 30),
+    ])).catch(() => []);
+    for (const [id, label] of rows) {
+      const n = Number(String(id).replace(/\D/g, ''));
+      if (Number.isFinite(n)) found.push({ d: Math.abs(n - want), text: `f${f.frameIdx}:${id} "${label}"` });
+    }
+  }
+  return found.sort((a, b) => a.d - b.d).slice(0, 3).map((x) => x.text).join(', ');
+}
+
+// Up to 5 option labels closest to the wanted text: substring matches first, then edit distance.
+function closestOptions(wanted, options, limit = 5) {
+  const w = String(wanted).toLowerCase();
+  const dist = (a, b) => {
+    const row = Array.from({ length: b.length + 1 }, (_, j) => j);
+    for (let i = 1; i <= a.length; i++) {
+      let prev = row[0];
+      row[0] = i;
+      for (let j = 1; j <= b.length; j++) {
+        const tmp = row[j];
+        row[j] = Math.min(row[j] + 1, row[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1));
+        prev = tmp;
+      }
+    }
+    return row[b.length];
+  };
+  return [...new Set(options.map((o) => String(o).trim()).filter(Boolean))]
+    .map((o) => {
+      const l = o.toLowerCase();
+      return { o, d: l.includes(w) || w.includes(l) ? 0 : dist(w, l) };
+    })
+    .sort((a, b) => a.d - b.d)
+    .slice(0, limit)
+    .map((x) => x.o);
+}
+
+// Playwright's click failure carries a long call log; keep the covering element, one line.
+function conciseActionError(err) {
+  const msg = String(err?.message || err);
+  const m = /(<.{3,300}?>)[^\r\n]*?\s+intercepts pointer events/.exec(msg);
+  if (!m) return err;
+  const covering = m[1].replace(/\s+/g, ' ').slice(0, 140);
+  return new Error(`Click blocked: ${covering} covers the target. Close or scroll it away, or act on it, then retry.`);
+}
+
 /**
  * Resolve a compact ref (f0:e3 / e3), CSS/Playwright selector (piercing open Shadow DOM),
  * or text match across frames.
@@ -372,7 +426,8 @@ export async function resolveTarget(page, { ref, selector, text, frameIdx, allow
       }
     }
     if (fallback) return fallback;
-    throw new Error(`Element ref "${ref}" not found. Run inspect_compact again to refresh refs.`);
+    const near = await nearbyRefs(candidates, parsed.refId);
+    throw new Error(`Element ref "${ref}" not found. ${near ? `Nearest current refs: ${near}.` : 'Run inspect_compact to refresh refs.'}`);
   }
 
   const scopedFrames = frameIdx !== undefined && frameIdx !== null
@@ -1354,6 +1409,14 @@ async function isEnterSubmitTarget(page, locator, extra = {}) {
  */
 const snapshotBaselines = new WeakMap();
 
+// Same label rules the submit guard uses, applied to a snapshot line: `[f0:e3] <button> "Submit"`.
+function isSubmitLikeLine(line) {
+  const m = /^\[[^\]]+\] <([^>]+)> "([^"]*)"/.exec(line);
+  if (!m || !/^(button|input:(submit|button|image)|\w+:button)$/.test(m[1])) return false;
+  const label = m[2].trim();
+  return SUBMIT_LABEL_RE.test(label) || (SAFE_SUBMIT_TYPE_RE.test(label) && COMPOUND_DANGER_RE.test(label));
+}
+
 export async function inspectCompact(page, options = {}, previousLinesSet = null) {
   const t0 = Date.now();
   const mode = options.mode || 'interactive';
@@ -1788,8 +1851,13 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
       nextSignatures.add(item.sig);
       nextRefs.set(item.ref, item.sig);
       if (queryRe && !queryRe.test(item.line)) continue;
-      if (onlyChanged && sameScope && baseline.refs.get(item.ref) === item.sig) {
-        continue;
+      if (onlyChanged && sameScope) {
+        if (!baseline.refs.has(item.ref)) {
+          frameItems.push(`*${item.line}`); // new since the last snapshot
+          continue;
+        }
+        // An unchanged submit-like control stays visible so the model knows it exists.
+        if (baseline.refs.get(item.ref) === item.sig && !isSubmitLikeLine(item.line)) continue;
       }
       frameItems.push(item.line);
     }
@@ -1840,7 +1908,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
       break;
     }
     body = candidate;
-    if (line.startsWith('[f')) shownCount++;
+    if (/^\*?\[f/.test(line)) shownCount++;
   }
 
   let text = `${header}${body}${removedLine ? `\n${removedLine}` : ''}`;
@@ -4297,6 +4365,8 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
  * succeeded (e.g. a select changed its value), so ok stays true and batches keep going.
  */
 // Listen before the action: waitForLoadState alone can resolve against the old document.
+// How long to wait for a navigation to start after the action before assuming none will.
+const NAV_START_WINDOW_MS = 150;
 function watchActionNavigation(page, timeout) {
   const deadline = Date.now() + timeout;
   const beforeUrl = page.url();
@@ -4333,7 +4403,7 @@ function watchActionNavigation(page, timeout) {
   return {
     async finish() {
       if (!requested && page.url() === beforeUrl) {
-        await wait(Math.max(0, Math.min(300, deadline - Date.now())));
+        await wait(Math.max(0, Math.min(NAV_START_WINDOW_MS, deadline - Date.now())));
       }
       // pushState/hash changes have no document request and need no load wait.
       while (requested && !loaded) {
@@ -4358,14 +4428,26 @@ async function executeSingleAction(page, params = {}) {
   const observer = enabled && ['click', 'dblclick'].includes(params.action) ? observeClickAftermath(page) : null;
   const navigation = params.returnSnapshot && ['click', 'dblclick', 'press'].includes(params.action)
     ? watchActionNavigation(page, Number(params.timeoutMs) || DEFAULT_TIMEOUT_MS) : null;
+  // One shared settle step replaces fixed sleeps; listeners stay attached until it is done.
+  const activity = observer || navigation ? watchActivity(page) : null;
   let res;
   try {
-    res = await executeSingleActionInner(page, params, silentState);
-    if (!res.blocked) await navigation?.finish();
+    try {
+      res = await executeSingleActionInner(page, params, silentState);
+    } catch (err) {
+      throw conciseActionError(err);
+    }
+    if (!res.blocked) {
+      await navigation?.finish();
+      // The guard keeps watching at least 400 ms so a late commit-like request is still reported.
+      await activity?.settle({ minMs: observer ? 400 : 0 });
+      if (activity && res && typeof res === 'object') res.outcome = activity.outcome();
+    }
     await observer?.finish(res, resolveAllowSubmit(params.allowSubmit));
   } finally {
     observer?.remove();
     navigation?.remove();
+    activity?.remove();
   }
   if (silentState.count > 0 && res && typeof res === 'object' && !res.blocked) {
     res.submitSuppressed = silentState.count;
@@ -5395,7 +5477,16 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
   if (action === 'fill') {
     const val = String(params.value ?? '');
     await withActionSubmitGuard(() => locator.fill(val, { timeout }));
-    return { ok: true, action, frameIdx, length: val.length };
+    const out = { ok: true, action, frameIdx, length: val.length };
+    // Masks, maxlength and number inputs can change what was typed; say so instead of letting the model assume.
+    const back = await locator.evaluate((el) => (
+      ['INPUT', 'TEXTAREA'].includes(el.tagName) && el.type !== 'file'
+        ? { v: String(el.value), secret: el.type === 'password' } : null
+    )).catch(() => null);
+    if (back && back.v !== val) {
+      out.mismatch = back.secret ? 'field value differs from the typed value' : `field now holds "${back.v.slice(0, 60)}"`;
+    }
+    return out;
   }
 
   if (action === 'type') {
@@ -5540,7 +5631,15 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
     } else {
       spec = params.label ? { label: String(params.label) } : String(raw);
     }
-    const chosen = await withActionSubmitGuard(() => locator.selectOption(spec, { timeout }));
+    let chosen;
+    try {
+      chosen = await withActionSubmitGuard(() => locator.selectOption(spec, { timeout }));
+    } catch (err) {
+      const options = await locator.evaluate((el) => [...(el.options || [])].map((o) => o.label || o.text || o.value)).catch(() => []);
+      if (!options.length) throw err;
+      const wanted = [].concat(raw).map(String).join(', ');
+      throw new Error(`Option "${wanted}" not found. Closest: ${closestOptions([].concat(raw)[0], options).join(' | ')}.`);
+    }
     return { ok: true, action, frameIdx, chosen };
   }
 

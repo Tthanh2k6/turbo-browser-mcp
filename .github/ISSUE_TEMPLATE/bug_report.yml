@@ -1,0 +1,79 @@
+name: Bug report
+description: Something does not work as the README says.
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `npx -y turbo-browser-mcp --version`, or the git commit if you run from source.
+    validations:
+      required: true
+  - type: dropdown
+    id: client
+    attributes:
+      label: MCP client
+      options:
+        - Claude Code
+        - Cursor
+        - Codex
+        - Other (name it below)
+    validations:
+      required: true
+  - type: input
+    id: client_other
+    attributes:
+      label: Client name and version
+      description: Fill in if you chose Other, or if you know the client version.
+  - type: input
+    id: os
+    attributes:
+      label: OS and Node version
+      placeholder: Windows 11, Node 22.x
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Browser mode
+      description: The `--mode` value in use. `auto` resolves to cdp or launch, so say which one was used if you know.
+      options:
+        - launch
+        - cdp
+        - persistent
+        - auto (not sure which was used)
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: A public URL or a small HTML page that shows the problem helps most.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+    validations:
+      required: true
+  - type: textarea
+    id: tool_call
+    attributes:
+      label: Tool call JSON and result
+      description: The arguments you sent and what the server returned. Remove personal data first.
+      render: json
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `--doctor`
+      description: Run `npx -y turbo-browser-mcp --doctor` and paste the JSON.
+      render: json
+    validations:
+      required: true

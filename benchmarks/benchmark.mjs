@@ -13,7 +13,7 @@ import {
   inspectCompact,
   smartFillForm,
 } from '../src/dom-engine.mjs';
-import { TOOL_DEFINITIONS } from '../src/index.mjs';
+import { CORE_TOOL_NAMES, SERVER_INSTRUCTIONS, TOOL_DEFINITIONS } from '../src/index.mjs';
 
 function pctSaved(baseline, current) {
   if (!baseline || baseline <= 0) return 0;
@@ -609,6 +609,10 @@ async function runBenchmark() {
     tokenPayloads.s7_toolSchema = toolSchemaStr;
     const compactToolSchemaStr = JSON.stringify(TOOL_DEFINITIONS.map(({ annotations, ...tool }) => tool));
     tokenPayloads.s7_toolSchemaCompact = compactToolSchemaStr;
+    const coreTools = TOOL_DEFINITIONS.filter((t) => CORE_TOOL_NAMES.includes(t.name));
+    const coreToolSchemaStr = JSON.stringify(coreTools.map(({ annotations, ...tool }) => tool));
+    tokenPayloads.s7_toolSchemaCore = coreToolSchemaStr;
+    tokenPayloads.s7_instructions = SERVER_INSTRUCTIONS;
 
     const { tokenizer, counts } = countTokensBatch(tokenPayloads);
 
@@ -727,6 +731,9 @@ async function runBenchmark() {
         schemaTokens: counts.s7_toolSchema,
         compactSchemaChars: compactToolSchemaStr.length,
         compactSchemaTokens: counts.s7_toolSchemaCompact,
+        coreToolCount: coreTools.length,
+        coreCompactSchemaTokens: counts.s7_toolSchemaCore,
+        instructionsTokens: counts.s7_instructions,
       },
     };
 
@@ -761,7 +768,7 @@ async function runBenchmark() {
       `| S6c. Diagnostics error filter | ${results.s6c_diagnosticsFilter.unfilteredTokens} tok unfiltered (${diagAll.requests.length} reqs) | ${results.s6c_diagnosticsFilter.filteredTokens} tok errors-only (${diagFiltered.requests.length} reqs) | ${results.s6c_diagnosticsFilter.tokenSavedPct}% tokens saved |`
     );
     console.log(
-      `| S7. Static MCP tool schema | — | ${results.s7_toolSchema.toolCount} tools (${results.s7_toolSchema.schemaTokens} full / ${results.s7_toolSchema.compactSchemaTokens} compact tok) | Compact excludes annotations |`
+      `| S7. Static MCP tool schema | — | ${results.s7_toolSchema.toolCount} tools (${results.s7_toolSchema.schemaTokens} full / ${results.s7_toolSchema.compactSchemaTokens} compact tok) | Compact excludes annotations; --tools core: ${results.s7_toolSchema.coreToolCount} tools, ${results.s7_toolSchema.coreCompactSchemaTokens} compact tok; server instructions ${results.s7_toolSchema.instructionsTokens} tok |`
     );
     console.log('\nRaw JSON:\n' + JSON.stringify(results, null, 2));
   } finally {

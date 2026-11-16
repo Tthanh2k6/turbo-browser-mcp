@@ -45,3 +45,16 @@ Totals over the three tasks:
 - An earlier stage with Codex (GPT-6 Astra, medium) as host finished 5 of the 12 cells before the account hit its usage limit; all 5 succeeded. Those runs count tokens differently and are not merged here.
 
 Raw records: [e2e-agent/results_claude_all.jsonl](e2e-agent/results_claude_all.jsonl). Transcripts, prompts, answers and server evidence stay in the local `results_claude*` folders, which are not committed.
+
+## turbo-browser-mcp after the changes on `main` (not yet released), same day
+
+Same harness, host and prompts; only turbo-browser-mcp was run again. Changes since 0.6.1: the snapshot after a click waits for the new page, `batch_actions` gained `navigate` and `extract` steps, tool descriptions and server instructions point multi-field forms to `smart_fill_form`, a settle step replaced fixed sleeps, and errors name nearby refs or options.
+
+| Task | Turns | Tokens | Cost (USD) | Seconds | Before (turns / cost / s) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| application | 10 | 341,204 | 0.092 | 21.2 | 23 / 0.205 / 44.5 |
+| catalog | 6 | 237,960 | 0.084 | 21.7 | 12 / 0.110 / 24.0 |
+| booking | 7 | 288,310 | 0.080 | 18.7 | 7 / 0.080 / 17.3 |
+| total | 23 | 867,474 | 0.256 | 61.6 | 42 / 0.395 / 85.8 |
+
+All three passed. Still one trial per cell. The catalog run read the four result pages in one `batch_actions` call; the application run filled name, email and the upload in one `smart_fill_form` call but still chose the portaled Region list with three `act_fast` calls, and a second application run gave 9 turns, 0.096 USD, 26.2 s. The other stacks were not run again, so compare with their stage 1 numbers above with care. Records: [e2e-agent/results_claude_turbo_main.jsonl](e2e-agent/results_claude_turbo_main.jsonl).
