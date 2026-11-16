@@ -1,7 +1,7 @@
 {
   "name": "turbo-browser-mcp",
   "version": "0.6.1",
-  "description": "Fast, token-efficient MCP server for Playwright browser automation with batched DOM actions, React/Shadow DOM/contenteditable form prefill, isolated contexts, download/network diagnostics, and direct disk file uploads.",
+  "description": "MCP server for browser automation on Playwright. It fills whole forms and runs action lists in one call, returns only changed elements, and blocks final Submit clicks by default.",
   "type": "module",
   "main": "./src/index.mjs",
   "bin": {

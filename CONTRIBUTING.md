@@ -2,7 +2,7 @@
 
 turbo-browser-mcp is a one-person project. Issues and pull requests are welcome, and replies are best effort.
 
-The goal is the fastest and most token-efficient browser MCP server, with a submit guard that is on by default. Changes are judged against that goal.
+The goal is a browser MCP server that uses few calls and few tokens, with a submit guard that is on by default. Changes are judged against that goal.
 
 ## Setup
 

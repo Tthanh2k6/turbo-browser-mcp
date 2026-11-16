@@ -1,10 +1,9 @@
 # End-to-end comparison plan
 
-Status: stage-one harness implemented, agent comparison not measured. See
-[e2e-agent/README.md](e2e-agent/README.md) for runnable fixtures, evaluation,
-installation and coordinator run instructions. Stage one uses one trial per
-stack/task and a six-minute timeout; the full protocol below remains planned.
-No competing tools were installed during harness implementation.
+Status: stage one has been run (16 Nov 2026), one trial per stack and task; see
+[E2E_RESULTS.md](E2E_RESULTS.md). The full ten-trial protocol below has not been
+run. See [e2e-agent/README.md](e2e-agent/README.md) for fixtures, evaluation,
+installation and run instructions. Stage one used a six-minute timeout.
 The existing `npm.cmd run benchmark:e2e` is a scripted local wizard/safety
 benchmark, not an agent comparison. Its results in [E2E_COMPARISON.md](E2E_COMPARISON.md)
 must not be presented as measurements of the stacks below.
@@ -61,10 +60,9 @@ tokens, cached tokens, output tokens, reasoning tokens when available, elapsed
 milliseconds, success, failure reason, receipt, and final commit count. Keep
 screenshots and transcripts with secrets removed. Publish all trial records.
 
-## Installation and run entry points (documentation checked 2026-11-16)
+## Installation and run entry points (from upstream READMEs, 16 Nov 2026)
 
-The following commands were checked against upstream READMEs, not executed.
-Pin resolved versions/commits when running the comparison. PowerShell examples
+The commands below are copied from each project's README. The stage-one run used the pinned versions listed in E2E_RESULTS.md and the setup in e2e-agent/. Pin versions when you repeat it. PowerShell examples
 use `npm.cmd`/`npx.cmd`; upstream READMEs spell these `npm`/`npx`.
 
 ### browser-use/browser-harness
@@ -84,7 +82,7 @@ documented skill with the common host agent and feed each task prompt above.
 Connect a fresh test Chrome profile through its documented remote-debugging
 setup. Record whether the run uses the current browser-use engine or a pinned
 legacy browser-harness revision; do not combine their results. Windows setup,
-attachment handling, and model usage capture remain unverified locally.
+attachment handling and model usage capture were handled by the stage-one harness (see E2E_RESULTS.md).
 
 ### anomalyco/browse
 
@@ -100,7 +98,7 @@ then restart or reload the host's MCP connection. Give that host each identical
 task prompt with browse as its only browser tool. This is the documented run
 workflow; no standalone task-runner command is asserted here. The npm launcher
 requires Node 22+ per this README; turbo-browser-mcp retains Node >=20.
-Extension pairing, task completion, and token logging remain unverified locally.
+Extension pairing and the setup hook are described in e2e-agent/README.md.
 
 ### vercel-labs/agent-browser
 
@@ -116,10 +114,9 @@ agent-browser snapshot -i
 The URL is a substitution for the README example, not an existing fixture
 command. Give the common host agent CLI access and the task prompt; it chooses
 actions from snapshots and checks the result until completion. Repeat with
-the catalog and booking URLs. Installation, upload support in this workflow,
-and usage capture remain unverified locally.
+the catalog and booking URLs. The stage-one harness covers installation and usage capture.
 
-## Before publishing numbers
+## Before publishing more numbers
 
 The stage-one `e2e-agent/server.mjs` entry point prints its base URL and
 attachment path; `evaluate.mjs` independently checks outcomes. Its fixture

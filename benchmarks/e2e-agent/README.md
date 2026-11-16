@@ -2,8 +2,8 @@
 
 This implements the three primary tasks in [E2E_PLAN.md](../E2E_PLAN.md).
 The stage-one brief overrides its trial count and timeout: one trial per stack
-and task (12 total), six minutes each, fixed order. No agent comparison has
-been run. The prefill-only variant, randomized ten-trial study and full
+and task (12 total), six minutes each, fixed order. Results of the first run
+are in [../E2E_RESULTS.md](../E2E_RESULTS.md). The prefill-only variant, randomized ten-trial study and full
 provider usage instrumentation remain outside stage one.
 
 From the repository root (Node 22+ for competing npm launchers):
@@ -26,7 +26,7 @@ The PDF is exactly 49,152 bytes. Published SHA-256:
 It is also stored in `fixtures/attachment.pdf.sha256`. Running the server or
 self-test reproducibly regenerates both files.
 
-## Coordinator commands (not executed during implementation)
+## Coordinator commands
 
 ```powershell
 .\benchmarks\e2e-agent\install-stacks.ps1
@@ -129,4 +129,3 @@ node benchmarks/e2e-agent/report.mjs path/to/results.jsonl path/to/report.md
 ```
 
 Do not publish credentials, personal browser data or unsanitized transcripts.
-No real E2E_RESULTS.md is generated until trial records exist.

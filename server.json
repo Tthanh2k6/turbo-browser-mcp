@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
   "name": "io.github.tthanh2k6/turbo-browser-mcp",
-  "description": "Fast, token-efficient Playwright MCP server with batched form fill, Shadow DOM inspection, isolated sessions, download capture, and human-in-the-loop submit guard.",
+  "description": "MCP server for browser automation on Playwright. It fills whole forms and runs action lists in one call, returns only changed elements, and blocks final Submit clicks by default.",
   "version": "0.6.1",
   "repository": {
     "url": "https://github.com/Tthanh2k6/turbo-browser-mcp",
