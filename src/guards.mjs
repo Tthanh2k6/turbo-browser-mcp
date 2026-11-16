@@ -146,6 +146,49 @@ async function frameTexts(page) {
   return out;
 }
 
+function textNewNeedles(textNew) {
+  return String(textNew).split('|').map((x) => x.trim().toLowerCase()).filter(Boolean);
+}
+
+// In-page scan shared by arm (init=true: remember every element already showing the text) and check.
+function textNewScan([ns, k, init]) {
+  // After a full navigation the remembered set is gone: everything on the new page counts as new.
+  const seen = init ? (window[k] = new WeakSet()) : window[k] || new WeakSet();
+  for (const el of document.querySelectorAll('body *')) {
+    let own = '';
+    for (const n of el.childNodes) if (n.nodeType === 3) own += n.nodeValue + ' ';
+    own = own.toLowerCase();
+    const hit = ns.find((x) => own.includes(x));
+    if (!hit) continue;
+    const r = el.getBoundingClientRect();
+    if (!(r.width > 0 && r.height > 0) || getComputedStyle(el).visibility === 'hidden') continue;
+    if (init) seen.add(el);
+    else if (!seen.has(el)) return hit;
+  }
+  return '';
+}
+
+/** expect.textNew: remember what already matches before the click, so only new text counts as evidence. */
+export async function armTextNew(page, textNew) {
+  const key = '__tbmEN' + Math.random().toString(36).slice(2);
+  const ns = textNewNeedles(textNew);
+  await Promise.all(page.frames().map((f) => f.evaluate(textNewScan, [ns, key, true]).catch(() => '')));
+  return key;
+}
+
+async function textNewHit(page, textNew, key) {
+  const ns = textNewNeedles(textNew);
+  for (const f of page.frames()) {
+    const hit = await f.evaluate(textNewScan, [ns, key, false]).catch(() => '');
+    if (hit) return hit;
+  }
+  return '';
+}
+
+async function disarmTextNew(page, key) {
+  await Promise.all(page.frames().map((f) => f.evaluate((k) => { delete window[k]; }, key).catch(() => {})));
+}
+
 async function selectorVisible(page, selector) {
   for (const frame of page.frames()) {
     try {
@@ -166,13 +209,17 @@ function snippetAround(text, re) {
  * Check conditions once. Returns { type, value } for the first condition that holds, else null.
  * conditions: { urlMatches, textMatches, selector, textGone }
  */
-export async function checkConditions(page, conditions = {}) {
+export async function checkConditions(page, conditions = {}, textNewKey = '') {
   const url = page.url();
   if (conditions.urlMatches && toRegex(conditions.urlMatches).test(url)) {
     return { type: 'url', value: url };
   }
   if (conditions.selector && (await selectorVisible(page, String(conditions.selector)))) {
     return { type: 'selector', value: String(conditions.selector) };
+  }
+  if (conditions.textNew && textNewKey) {
+    const hit = await textNewHit(page, conditions.textNew, textNewKey);
+    if (hit) return { type: 'textNew', value: hit };
   }
   if (conditions.textMatches || conditions.textGone) {
     const texts = await frameTexts(page);
@@ -191,15 +238,15 @@ export async function checkConditions(page, conditions = {}) {
 }
 
 export function hasAnyCondition(c) {
-  return Boolean(c && (c.urlMatches || c.textMatches || c.selector || c.textGone));
+  return Boolean(c && (c.urlMatches || c.textMatches || c.textNew || c.selector || c.textGone));
 }
 
-async function pollConditions(page, conditions, timeoutMs, pollMs) {
+async function pollConditions(page, conditions, timeoutMs, pollMs, textNewKey = '') {
   const t0 = Date.now();
   while (true) {
     let hit = null;
     try {
-      hit = await checkConditions(page, conditions);
+      hit = await checkConditions(page, conditions, textNewKey);
     } catch {}
     if (hit) return { hit, waitedMs: Date.now() - t0 };
     if (Date.now() - t0 >= timeoutMs) return { hit: null, waitedMs: Date.now() - t0 };
@@ -211,12 +258,17 @@ async function pollConditions(page, conditions, timeoutMs, pollMs) {
  * After an allowed submit, wait for evidence that the submission registered.
  * "The click landed" is not success: only a URL / text / element on the resulting state counts.
  */
-export async function waitForSubmitEvidence(page, expect = {}) {
+export async function waitForSubmitEvidence(page, expect = {}, textNewKey = '') {
   if (!hasAnyCondition(expect)) {
-    throw new Error('expect requires at least one of urlMatches, textMatches, selector.');
+    throw new Error('expect requires at least one of urlMatches, textMatches, textNew, selector.');
   }
   const timeoutMs = clampInt(expect.timeoutMs, 8000, 100, 120000);
-  const { hit, waitedMs } = await pollConditions(page, expect, timeoutMs, 150);
+  let hit, waitedMs;
+  try {
+    ({ hit, waitedMs } = await pollConditions(page, expect, timeoutMs, 150, textNewKey));
+  } finally {
+    if (textNewKey) await disarmTextNew(page, textNewKey);
+  }
   if (hit) {
     return { submitVerified: true, evidence: { type: hit.type, value: hit.value }, verifyMs: waitedMs };
   }

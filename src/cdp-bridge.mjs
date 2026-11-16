@@ -192,10 +192,17 @@ export async function createCdpBridgeServer({
   let nextUpstreamId = 100000;
   const pendingCalls = new Map(); // upstreamId -> { client, clientMsgId, internalResolve }
   const clients = new Set(); // Set<ServerWsClient>
-  const attachedTargets = new Map(); // sessionId -> Target.attachedToTarget params
   const discoveredTargets = new Map(); // targetId -> targetInfo
-  let autoAttachEnabledUpstream = false;
-  let discoverEnabledUpstream = false;
+  // Every client gets its own CDP sessions. Sessions are not shared: two Playwright clients on one
+  // session fight over one-time setup (Page.setFontFamilies) and miss each other's
+  // Runtime.executionContextCreated. The bridge keeps ONE upstream connection (so Chrome's
+  // "Allow remote debugging" prompt appears once) and attaches a separate flat session per client.
+  const owners = new Map(); // upstream sessionId -> { client, targetId, root }
+  const bridgeAttached = new Map(); // bridge-owned session (S0) -> Target.attachedToTarget params
+  const resumes = new Map(); // S0 sessionId -> { waiting: Set<client>, timer }
+  let upstreamAutoAttach = null; // promise once enabled
+  let upstreamDiscover = null;
+  const RESUME_FALLBACK_MS = 10000;
 
   function sendUpstreamRaw(obj) {
     if (!upstreamWs || upstreamWs.closed) return false;
@@ -203,7 +210,7 @@ export async function createCdpBridgeServer({
     return true;
   }
 
-  function callUpstreamInternal(method, params = {}) {
+  function callUpstreamInternal(method, params = {}, sessionId) {
     return new Promise((resolve) => {
       if (!upstreamWs || upstreamWs.closed) {
         resolve(null);
@@ -211,8 +218,79 @@ export async function createCdpBridgeServer({
       }
       const id = nextUpstreamId++;
       pendingCalls.set(id, { client: null, clientMsgId: null, internalResolve: resolve });
-      sendUpstreamRaw({ id, method, params });
+      sendUpstreamRaw({ id, method, params, ...(sessionId ? { sessionId } : {}) });
     });
+  }
+
+  function resumeBridgeSession(s0) {
+    const rec = resumes.get(s0);
+    if (!rec) return;
+    clearTimeout(rec.timer);
+    resumes.delete(s0);
+    void callUpstreamInternal('Runtime.runIfWaitingForDebugger', {}, s0);
+  }
+
+  function clientResumed(client, s0) {
+    const rec = resumes.get(s0);
+    if (!rec) return;
+    rec.waiting.delete(client);
+    if (rec.waiting.size === 0) resumeBridgeSession(s0);
+  }
+
+  // Attach one new upstream session for this client to a target the bridge already tracks, then announce it.
+  async function attachForClient(client, params, waiting) {
+    const targetId = params.targetInfo?.targetId;
+    if (client.attachedTargetIds.has(targetId)) return;
+    client.attachedTargetIds.add(targetId);
+    const res = await callUpstreamInternal('Target.attachToTarget', { targetId, flatten: true });
+    const sessionId = res?.sessionId;
+    if (!sessionId) {
+      client.attachedTargetIds.delete(targetId);
+      return;
+    }
+    if (client.closed) {
+      void callUpstreamInternal('Target.detachFromTarget', { sessionId });
+      return;
+    }
+    owners.set(sessionId, { client, targetId, root: true });
+    client.sessions.add(sessionId);
+    if (waiting) resumes.get(params.sessionId)?.waiting.add(client);
+    client.send(
+      JSON.stringify({
+        method: 'Target.attachedToTarget',
+        params: { sessionId, targetInfo: params.targetInfo, waitingForDebugger: Boolean(waiting) },
+      })
+    );
+  }
+
+  // A target the bridge just auto-attached to: give every autoAttach client its own session.
+  function handleNewTarget(params) {
+    const s0 = params.sessionId;
+    bridgeAttached.set(s0, params);
+    const waiting = Boolean(params.waitingForDebugger);
+    const targets = [...clients].filter((c) => c.autoAttach && !c.closed);
+    if (waiting) resumes.set(s0, { waiting: new Set(), timer: setTimeout(() => resumeBridgeSession(s0), RESUME_FALLBACK_MS) });
+    const tasks = targets.map((c) => {
+      const t = attachForClient(c, params, waiting && c.waitDbg);
+      c.tasks.add(t);
+      void t.then(() => c.tasks.delete(t), () => c.tasks.delete(t));
+      return t;
+    });
+    Promise.all(tasks)
+      .catch(() => {})
+      .then(() => {
+        if (waiting && resumes.get(s0)?.waiting.size === 0) resumeBridgeSession(s0);
+      });
+  }
+
+  function releaseClient(client) {
+    for (const sid of client.sessions) {
+      owners.delete(sid);
+      void callUpstreamInternal('Target.detachFromTarget', { sessionId: sid });
+    }
+    client.sessions.clear();
+    for (const s0 of [...resumes.keys()]) clientResumed(client, s0);
+    for (const [sid, o] of owners) if (o.client === client) owners.delete(sid);
   }
 
   async function connectUpstream() {
@@ -254,27 +332,6 @@ export async function createCdpBridgeServer({
             return;
           }
 
-          // Track target attachment state on root browser session so concurrent/subsequent clients stay in sync
-          if (!msg.id && msg.method && !msg.sessionId) {
-            if (msg.method === 'Target.attachedToTarget' && msg.params?.sessionId) {
-              attachedTargets.set(msg.params.sessionId, msg.params);
-            } else if (msg.method === 'Target.detachedFromTarget' && msg.params?.sessionId) {
-              attachedTargets.delete(msg.params.sessionId);
-            } else if (msg.method === 'Target.targetCreated' && msg.params?.targetInfo?.targetId) {
-              discoveredTargets.set(msg.params.targetInfo.targetId, msg.params.targetInfo);
-            } else if (msg.method === 'Target.targetDestroyed' && msg.params?.targetId) {
-              discoveredTargets.delete(msg.params.targetId);
-            } else if (msg.method === 'Target.targetInfoChanged' && msg.params?.targetInfo?.targetId) {
-              const tInfo = msg.params.targetInfo;
-              discoveredTargets.set(tInfo.targetId, tInfo);
-              for (const [sid, entry] of attachedTargets.entries()) {
-                if (entry.targetInfo?.targetId === tInfo.targetId) {
-                  attachedTargets.set(sid, { ...entry, targetInfo: tInfo });
-                }
-              }
-            }
-          }
-
           if (msg.id !== undefined) {
             const pending = pendingCalls.get(msg.id);
             if (pending) {
@@ -284,18 +341,81 @@ export async function createCdpBridgeServer({
                 return;
               }
               if (pending.client && !pending.client.closed) {
-                const reply = { ...msg, id: pending.clientMsgId };
-                pending.client.send(JSON.stringify(reply));
+                if (pending.method === 'Target.attachToTarget' && msg.result?.sessionId) {
+                  owners.set(msg.result.sessionId, { client: pending.client, targetId: pending.targetId, root: false });
+                  pending.client.sessions.add(msg.result.sessionId);
+                } else if (pending.method === 'Target.detachFromTarget' && pending.detachSessionId) {
+                  owners.delete(pending.detachSessionId);
+                  pending.client.sessions.delete(pending.detachSessionId);
+                }
+                const out = JSON.stringify({ ...msg, id: pending.clientMsgId });
+                if (pending.method === 'Target.createTarget' && pending.client.tasks.size > 0) {
+                  // Chrome announces the new target (attachedToTarget) before this reply; keep that order.
+                  const c = pending.client;
+                  void Promise.all([...c.tasks]).catch(() => {}).then(() => { if (!c.closed) c.send(out); });
+                } else {
+                  pending.client.send(out);
+                }
               }
             }
             return;
           }
 
-          // Broadcast CDP events to all active downstream clients
-          for (const c of clients) {
-            if (!c.closed) {
-              c.send(rawText);
+          if (msg.sessionId) {
+            // Session event: only the client that owns the session sees it.
+            const owner = owners.get(msg.sessionId);
+            if (!owner || owner.client.closed) return;
+            if (msg.method === 'Target.attachedToTarget' && msg.params?.sessionId) {
+              owners.set(msg.params.sessionId, { client: owner.client, targetId: msg.params.targetInfo?.targetId, root: false });
+              owner.client.sessions.add(msg.params.sessionId);
+            } else if (msg.method === 'Target.detachedFromTarget' && msg.params?.sessionId) {
+              owners.delete(msg.params.sessionId);
+              owner.client.sessions.delete(msg.params.sessionId);
             }
+            owner.client.send(rawText);
+            return;
+          }
+
+          if (!msg.method) return;
+          // Browser-level events.
+          if (msg.method === 'Target.attachedToTarget' && msg.params?.sessionId) {
+            handleNewTarget(msg.params);
+            return;
+          }
+          if (msg.method === 'Target.detachedFromTarget' && msg.params?.sessionId) {
+            const sid = msg.params.sessionId;
+            bridgeAttached.delete(sid);
+            const resume = resumes.get(sid);
+            if (resume) {
+              clearTimeout(resume.timer);
+              resumes.delete(sid);
+            }
+            const owner = owners.get(sid);
+            if (owner) {
+              owners.delete(sid);
+              owner.client.sessions.delete(sid);
+              if (!owner.client.closed) owner.client.send(rawText);
+            }
+            return;
+          }
+          let discoverEvent = false;
+          if (msg.method === 'Target.targetCreated' && msg.params?.targetInfo?.targetId) {
+            discoveredTargets.set(msg.params.targetInfo.targetId, msg.params.targetInfo);
+            discoverEvent = true;
+          } else if (msg.method === 'Target.targetDestroyed' && msg.params?.targetId) {
+            discoveredTargets.delete(msg.params.targetId);
+            discoverEvent = true;
+          } else if (msg.method === 'Target.targetInfoChanged' && msg.params?.targetInfo?.targetId) {
+            const tInfo = msg.params.targetInfo;
+            discoveredTargets.set(tInfo.targetId, tInfo);
+            for (const [sid, entry] of bridgeAttached.entries()) {
+              if (entry.targetInfo?.targetId === tInfo.targetId) bridgeAttached.set(sid, { ...entry, targetInfo: tInfo });
+            }
+            discoverEvent = true;
+          }
+          for (const c of clients) {
+            if (c.closed) continue;
+            if (discoverEvent ? c.discover : true) c.send(rawText);
           }
         };
 
@@ -407,9 +527,18 @@ export async function createCdpBridgeServer({
     );
 
     const client = new ServerWsClient(socket);
+    client.autoAttach = false;
+    client.waitDbg = false;
+    client.discover = false;
+    client.sessions = new Set();
+    client.tasks = new Set();
+    client.attachedTargetIds = new Set();
     clients.add(client);
 
-    client.onMessage = (rawMsg) => {
+    const reply = (id, result, sessionId) =>
+      client.send(JSON.stringify({ id, ...(sessionId ? { sessionId } : {}), result: result ?? {} }));
+
+    client.onMessage = async (rawMsg) => {
       let parsed;
       try {
         parsed = JSON.parse(rawMsg);
@@ -420,50 +549,87 @@ export async function createCdpBridgeServer({
 
       const clientMsgId = parsed.id;
       if (!parsed.sessionId && parsed.method === 'Browser.close') {
-        client.send(JSON.stringify({ id: clientMsgId, result: {} }));
+        reply(clientMsgId, {});
         client.close();
         return;
       }
 
-      const isRootTargetAutoAttach =
-        !parsed.sessionId &&
-        parsed.method === 'Target.setAutoAttach' &&
-        parsed.params?.autoAttach === true;
-      const isRootDiscover =
-        !parsed.sessionId &&
-        parsed.method === 'Target.setDiscoverTargets' &&
-        parsed.params?.discover === true;
+      if (!parsed.sessionId && parsed.method === 'Target.setAutoAttach') {
+        // Handled here: the bridge attaches a separate session for this client (see attachForClient).
+        if (parsed.params?.autoAttach === true) {
+          client.autoAttach = true;
+          client.waitDbg = Boolean(parsed.params?.waitForDebuggerOnStart);
+          if (!upstreamAutoAttach) {
+            upstreamAutoAttach = callUpstreamInternal('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
+          }
+          await upstreamAutoAttach;
+          for (const p of [...bridgeAttached.values()]) {
+            const t = attachForClient(client, p, false);
+            client.tasks.add(t);
+            void t.then(() => client.tasks.delete(t), () => client.tasks.delete(t));
+          }
+          await Promise.all([...client.tasks]).catch(() => {});
+        } else {
+          client.autoAttach = false;
+        }
+        reply(clientMsgId, {});
+        return;
+      }
+      if (!parsed.sessionId && parsed.method === 'Target.setDiscoverTargets') {
+        if (parsed.params?.discover === true) {
+          client.discover = true;
+          if (!upstreamDiscover) upstreamDiscover = callUpstreamInternal('Target.setDiscoverTargets', { discover: true });
+          await upstreamDiscover;
+          for (const targetInfo of discoveredTargets.values()) {
+            client.send(JSON.stringify({ method: 'Target.targetCreated', params: { targetInfo } }));
+          }
+        } else {
+          client.discover = false;
+        }
+        reply(clientMsgId, {});
+        return;
+      }
 
-      // If another client already enabled autoAttach/discover on the upstream socket,
-      // replay cached target events so the new client immediately sees all open tabs!
-      if (isRootTargetAutoAttach && autoAttachEnabledUpstream && attachedTargets.size > 0) {
-        for (const params of attachedTargets.values()) {
-          client.send(JSON.stringify({ method: 'Target.attachedToTarget', params }));
+      if (parsed.sessionId) {
+        const owner = owners.get(parsed.sessionId);
+        if (!owner || owner.client !== client) {
+          client.send(
+            JSON.stringify({ id: clientMsgId, sessionId: parsed.sessionId, error: { code: -32001, message: 'Session with given id not found.' } })
+          );
+          return;
+        }
+        if (owner.root && parsed.method === 'Runtime.runIfWaitingForDebugger') {
+          // The target is held by the bridge's own session until every client has said it is ready.
+          for (const [s0, p] of bridgeAttached) {
+            if (p.targetInfo?.targetId === owner.targetId) clientResumed(client, s0);
+          }
+          reply(clientMsgId, {}, parsed.sessionId);
+          return;
         }
       }
-      if (isRootDiscover && discoverEnabledUpstream && discoveredTargets.size > 0) {
-        for (const targetInfo of discoveredTargets.values()) {
-          client.send(JSON.stringify({ method: 'Target.targetCreated', params: { targetInfo } }));
-        }
-      }
-
-      if (isRootTargetAutoAttach) autoAttachEnabledUpstream = true;
-      if (isRootDiscover) discoverEnabledUpstream = true;
 
       const upstreamId = nextUpstreamId++;
-      pendingCalls.set(upstreamId, { client, clientMsgId, internalResolve: null });
+      pendingCalls.set(upstreamId, {
+        client,
+        clientMsgId,
+        internalResolve: null,
+        method: parsed.method,
+        targetId: parsed.params?.targetId,
+        detachSessionId: parsed.method === 'Target.detachFromTarget' ? parsed.params?.sessionId : undefined,
+      });
       sendUpstreamRaw({ ...parsed, id: upstreamId });
     };
 
     client.onClose = () => {
       clients.delete(client);
-      // When all downstream clients disconnect, reset autoAttach/discover on the upstream
-      // socket so the next sequential client gets fresh Target.attachedToTarget events
-      // from Chrome without closing the upstream WebSocket!
+      releaseClient(client);
+      // With no clients left, drop the bridge's own attachments so Chrome stops instrumenting tabs.
       if (clients.size === 0 && upstreamConnected) {
-        autoAttachEnabledUpstream = false;
-        discoverEnabledUpstream = false;
-        attachedTargets.clear();
+        for (const s0 of [...resumes.keys()]) resumeBridgeSession(s0);
+        upstreamAutoAttach = null;
+        upstreamDiscover = null;
+        for (const s0 of bridgeAttached.keys()) void callUpstreamInternal('Target.detachFromTarget', { sessionId: s0 });
+        bridgeAttached.clear();
         discoveredTargets.clear();
         callUpstreamInternal('Target.setAutoAttach', {
           autoAttach: false,

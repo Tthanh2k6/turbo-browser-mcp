@@ -69,7 +69,7 @@ node src/index.mjs --doctor
 | `inspect_compact` | Size-capped snapshot of elements, forms or article text | `mode` (`interactive`, `forms`, `article`, `all`), `onlyChanged`, `query`, `boxes`, `maxChars`, `includeFrames`, `savePath` |
 | `smart_fill_form` | Fill a form, editors and file inputs in one call | `fields[]` (`ref`, `selector`, `value`, `option`, `values`, `check`, `not`, `keys`, `file`, `files`, `frameIdx`, `all`), `gmail`, `overwrite`, `stopBeforeSubmit`, `returnSnapshot` |
 | `act_fast` | One action on the page | `action` (16 actions), `ref`/`selector`/`text`/`label`/`(x, y)`, `modifiers`, `dropData`, `allowSubmit`, `observeAftermath`, `returnSnapshot` |
-| `batch_actions` | Ordered actions, form steps, and multi-page navigate/extract | `steps[]` (including `navigate` with `url`, `extract` with `format`, `selector`, `maxChars`), `continueOnError`, `allowSubmit`, `expect`, `submissionKey`, `allowDuplicate`, `observeAftermath`, `returnSnapshot`, `snapshotMaxChars` |
+| `batch_actions` | Ordered actions, form steps, and multi-page navigate/extract | `steps[]` (including `navigate` with `url`, `extract` with `format`, `selector`, `maxChars`), `continueOnError`, `allowSubmit`, `expect` (`urlMatches`, `textMatches`, `textNew`, `selector`), `submissionKey`, `allowDuplicate`, `observeAftermath`, `returnSnapshot`, `snapshotMaxChars`, `snapshotQuery` |
 | `extract_clean_text` | Page text or compact Markdown | `format` (`text`, `markdown`), `selector`, `includeFrames`, `maxChars`, `savePath` |
 | `evaluate_js` | JS expression, or a function called with `(el, arg)` | `expression`, `arg`, `frameIdx`, `ref`/`selector`/`text`, `savePath` |
 | `page_diagnostics` | Console, network, downloads and dialogs | `level` (`errors`, `all`), `statusFilter` (`errors`, `all`), `includeStatic`, `urlFilter`, `reqId`, `part`, `dialogPolicy`, `clear`, `savePath` |
@@ -239,7 +239,7 @@ When to keep `chrome-devtools-mcp` as well: it offers Lighthouse audits, perform
 
 A label-based guard has three gaps, and each has an opt-in answer. `expect`, `submissionKey` and `allowDuplicate` appear in the `batch_actions` schema; `act_fast` accepts them without advertising them. The network guard is turned on with `TURBO_BROWSER_NETWORK_GUARD=true` and covers `act_fast`, `batch_actions` and `smart_fill_form`.
 
-1. A click that landed is not a confirmed submission: use `expect`. After an allowed submit, pass `expect: { urlMatches?, textMatches?, selector?, timeoutMs? }`. The result carries `submitVerified` and `evidence` (the new URL, a text snippet such as a receipt number, or the matched selector). If nothing shows up in time you get `submitVerified: false` and a reason, so the agent does not report "done" on an empty submission list.
+1. A click that landed is not a confirmed submission: use `expect`. After an allowed submit, pass `expect: { urlMatches?, textMatches?, textNew?, selector?, timeoutMs? }`. `textMatches` also matches text that was already on the page before the click, so prefer `textNew` for verifying a submit: it counts only elements whose text matches and did not match when the batch started. The result carries `submitVerified` and `evidence` (the new URL, a text snippet such as a receipt number, or the matched selector). If nothing shows up in time you get `submitVerified: false` and a reason, so the agent does not report "done" on an empty submission list.
 2. A re-run is a second entry, not a retry: use `submissionKey`. With `submissionKey: "portal:2026-11-15:entry-42"`, every allowed submit is appended to a JSONL ledger (`~/.turbo-browser-mcp/submissions.jsonl`, or `TURBO_BROWSER_LEDGER`, or `ledgerPath` inside the save root). A later call with the same key is refused with `blockedBy: "ledger"` unless `allowDuplicate: true`.
 3. Labels can be wrong. On many Korean portals the last step reads 다음 and the real commit is a 확인 inside a modal that opens afterwards.
    - Affirmative buttons (`확인`, `OK`, `Yes`, `Confirm`, `確認`, `确定`, `Đồng ý` and others) inside `dialog`, `[role=dialog]`, `[role=alertdialog]` or `[aria-modal=true]` count as commits (`blockedBy: "modal"`). Cookie banners (dialog text mentions cookies) and date or time pickers (the dialog contains a calendar grid or date input) are excluded. A confirmation that only mentions "privacy" or "consent" is still blocked.
@@ -310,6 +310,9 @@ This reports an action that has already happened. It cannot prevent a commit or 
 | `--allow-hosts <a,b>` | `TURBO_BROWSER_ALLOW_HOSTS` | unset | Only navigate to these hosts and their subdomains (see [Restricting navigation](#restricting-navigation)) |
 | `--allow-origins <o,o>` | `TURBO_BROWSER_ALLOW_ORIGINS` | unset | Only navigate to these exact origins; combined with the hosts list when both are set |
 | `--allow-strict` | `TURBO_BROWSER_ALLOW_STRICT` | `false` | With an allowlist, also block sub-resource requests to other hosts |
+| `--secrets <file>` | `TURBO_BROWSER_SECRETS_FILE` | unset | dotenv file of secrets for `$secret:NAME` placeholders (see [Secrets](#secrets)) |
+| `--content-boundaries` | `TURBO_BROWSER_CONTENT_BOUNDARIES` | `false` | Wrap page-sourced text in `<<page:nonce>>` markers (see [Content boundaries](#content-boundaries)) |
+| `--print-skill` | - | - | Print the bundled `SKILL.md` for this version |
 | `--doctor` | - | - | Print Node, Playwright, Chromium and CDP diagnostics as JSON |
 | `--bridge` | `TURBO_BROWSER_BRIDGE_PORT` | `9224` | Start or verify the CDP keep-alive bridge for Chrome 144+ `DevToolsActivePort` (see below) |
 | `--launch-chrome` | - | `~/.turbo-browser-mcp/chrome-profile` | Launch Chrome with a dedicated profile and `--remote-debugging-port=9222` |
@@ -327,8 +330,31 @@ This reports an action that has already happened. It cannot prevent a commit or 
 
 In Chrome 136+/144+, enabling `chrome://inspect/#remote-debugging` on the default `User Data` directory makes Chrome show an "Allow remote debugging?" prompt each time a new WebSocket client connects. That stops overnight or multi-agent runs. Two ways around it:
 
-1. `--bridge` (or `npm run bridge`, started automatically when Chrome exposes `DevToolsActivePort`) starts a background process (`src/cdp-bridge.mjs`, `http://127.0.0.1:9224`) that keeps one WebSocket to Chrome open and ignores `Browser.close`. You click Allow once. After that, any number of MCP servers, scripts or subagents can connect and disconnect without another prompt.
+1. `--bridge` (or `npm run bridge`, started automatically when Chrome exposes `DevToolsActivePort`) starts a background process (`src/cdp-bridge.mjs`, `http://127.0.0.1:9224`) that keeps one WebSocket to Chrome open and ignores `Browser.close`. You click Allow once. After that, any number of MCP servers, scripts or subagents can connect and disconnect without another prompt. The bridge keeps a single upstream connection (so the prompt appears once) and gives every connected client its own CDP sessions, so two MCP servers can drive the same Chrome at the same time. Each client sees the same tabs, but its events and one-time page setup are independent.
 2. `--launch-chrome` (or `npm run launch-chrome`) starts Chrome with `--remote-debugging-port=9222` and its own `--user-data-dir` (`~/.turbo-browser-mcp/chrome-profile`). That port needs no confirmation dialog, even on the first connection.
+
+## Secrets
+
+Set `--secrets <file>` (or `TURBO_BROWSER_SECRETS_FILE`) to a dotenv-format file: `KEY=value` lines, `#` comments, optional single or double quotes. The server reads the file itself and never logs or returns its values.
+
+In `smart_fill_form` field values, in `act_fast` `fill` and `type` values, and in `batch_actions` steps, a value that is exactly `$secret:NAME` is replaced by the value of `NAME` at the moment of typing. Anything else is typed as written. An unknown name fails with `Unknown secret: NAME` before anything is typed. Without a secrets file, `$secret:NAME` is typed literally and nothing changes.
+
+Every tool result, every error and every file written through `savePath` has the real value replaced by its placeholder, in raw, JSON-escaped and URL-encoded form. That includes `inspect_compact` input values, `extract_clean_text`, `evaluate_js` results and `page_diagnostics`. Values shorter than 4 characters are not redacted, because that would damage ordinary output. Limits: a page that rewrites or encodes the value (a mask, base64, a hash) produces text the server cannot match, and screenshots are not redacted. The Submit guard is unchanged.
+
+## Content boundaries
+
+Pages can contain text written to look like instructions. With `--content-boundaries` (or `TURBO_BROWSER_CONTENT_BOUNDARIES=1`), page-sourced text is wrapped as `<<page:3f9a1c>> ... <</page:3f9a1c>>`, with a random nonce chosen per server process. This applies to `extract_clean_text`, `inspect_compact` (all modes, one pair per result), `evaluate_js` results, `extract` and `collect` steps in `batch_actions`, and `returnSnapshot` text. Marker-shaped text inside a page is altered so it cannot close the block early. The server instructions gain one sentence naming the markers. The option is off by default and changes nothing when off. On a typical result the markers add about 21 tokens (measured with tiktoken `o200k_base`), plus 39 tokens once in the server instructions. `collect` adds that cost per item.
+
+## Skill for Claude Code
+
+The package ships a short Agent Skill, `skills/turbo-browser/SKILL.md`, that teaches the low-token loop (one `inspect_compact`, then `onlyChanged`; whole forms with one `smart_fill_form`; chained steps; `textNew` to verify a submit). To install it for Claude Code, copy the file into `~/.claude/skills/turbo-browser/`, or run:
+
+```bash
+mkdir -p ~/.claude/skills/turbo-browser
+npx -y turbo-browser-mcp --print-skill > ~/.claude/skills/turbo-browser/SKILL.md
+```
+
+`--print-skill` prints the file that matches the installed version.
 
 ## Development
 

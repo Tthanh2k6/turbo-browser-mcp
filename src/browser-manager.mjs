@@ -4,6 +4,7 @@ import path from 'node:path';
 import { ensureCdpBridgeDaemon } from './cdp-bridge.mjs';
 import { resolveSafePath } from './dom-engine.mjs';
 import { gotoRetry, navHealth } from './navinfo.mjs';
+import { redactText } from './secrets.mjs';
 import { getPolicy, installGuard, takeBlocked, peekBlocked, urlDenial, denyMessage, matchUrl } from './allow-hosts.mjs';
 
 const firstLine = (err) => String((err && err.message) || err).split(/\r?\n/)[0];
@@ -545,6 +546,38 @@ export class BrowserManager {
     return !!this._unresponsivePages?.has(page);
   }
 
+  /**
+   * Quick liveness probe of the page main world. Marks the page unresponsive when it does not
+   * answer within capMs, clears the mark when it answers again. Returns true when responsive.
+   */
+  async probePage(page, capMs = 2000) {
+    let timer;
+    try {
+      const ok = await Promise.race([
+        page.mainFrame().evaluate('1').then(() => true, () => true),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(false), capMs);
+        }),
+      ]);
+      if (ok) this._unresponsivePages?.delete(page);
+      else this.markPageUnresponsive(page);
+      return ok;
+    } catch {
+      return true;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async _requireResponsive(page) {
+    // Only pages already marked unresponsive (at attach time or by tabs_batch list) pay for a probe:
+    // a short re-check, since the dialog may be gone. Probing every page on every call made slow
+    // but healthy pages (heavy scripts mid-load) look blocked.
+    if (!this.isPageUnresponsive(page)) return;
+    const ok = await this.probePage(page, Number(process.env.TURBO_BROWSER_PROBE_MS) || 1000);
+    if (!ok) throw new Error('page main world is blocked (open dialog or paused debugger?)');
+  }
+
   _ensureDiagState(page) {
     let diag = this.diagnostics.get(page);
     if (!diag) {
@@ -798,12 +831,14 @@ export class BrowserManager {
         throw new Error(`Tab ${tabId} not found or closed.`);
       }
       await this._guard(target);
+      await this._requireResponsive(target);
       return { tabId, page: target };
     }
 
     if (this.activeTabId !== null && this.tabs.has(this.activeTabId)) {
       const activePage = this.tabs.get(this.activeTabId);
       await this._guard(activePage);
+      await this._requireResponsive(activePage);
       return { tabId: this.activeTabId, page: activePage };
     }
 
@@ -827,6 +862,9 @@ export class BrowserManager {
     await this.ensureReady();
     this._syncOpenPages();
     const results = [];
+    // Re-probe the main world of every tab in parallel (1.5 s cap): marks tabs that got stuck after
+    // attach and clears marks on tabs that answer again.
+    await Promise.all([...this.tabs.values()].map((p) => this.probePage(p, 1500)));
     for (const [tabId, page] of this.tabs.entries()) {
       let title = '';
       let timer;
@@ -925,7 +963,8 @@ export class BrowserManager {
       }
 
       if (action === 'list') {
-        results.push(includeTabs === false ? { action: 'list' } : { action: 'list', tabs: await this.listTabs() });
+        // The tab list is returned once, at top level (not repeated inside this result).
+        results.push({ action: 'list' });
         continue;
       }
 
@@ -1296,7 +1335,7 @@ export class BrowserManager {
       if (opts.savePath) {
         const resolved = resolveSafePath(opts.savePath, 'savePath');
         fs.mkdirSync(path.dirname(resolved), { recursive: true });
-        fs.writeFileSync(resolved, JSON.stringify(detailPayload, null, 2), 'utf8');
+        fs.writeFileSync(resolved, redactText(JSON.stringify(detailPayload, null, 2)), 'utf8');
         detailPayload.savePath = resolved;
       }
       return detailPayload;
@@ -1385,7 +1424,7 @@ export class BrowserManager {
     if (opts.savePath) {
       const resolved = resolveSafePath(opts.savePath, 'savePath');
       fs.mkdirSync(path.dirname(resolved), { recursive: true });
-      fs.writeFileSync(resolved, JSON.stringify(snapshot, null, 2), 'utf8');
+      fs.writeFileSync(resolved, redactText(JSON.stringify(snapshot, null, 2)), 'utf8');
       snapshot.savePath = resolved;
     }
 

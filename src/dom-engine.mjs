@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import { gotoRetry, navHealth } from './navinfo.mjs';
 import { urlDenial, peekBlocked, denyMessage, matchUrl, getPolicy } from './allow-hosts.mjs';
 import { observeClickAftermath, watchActivity } from './aftermath.mjs';
+import { wrapPage, boundariesEnabled } from './boundaries.mjs';
+import { redactText } from './secrets.mjs';
 import path from 'node:path';
 import {
   appendLedger,
@@ -12,12 +14,13 @@ import {
   installNetworkGuard,
   resolveNetworkGuard,
   waitForSubmitEvidence,
+  armTextNew,
 } from './guards.mjs';
 
 const DEFAULT_TIMEOUT_MS = 8000;
 
 const SUBMIT_LABEL_RE =
-  /^(submit|publish|post|send|apply(\s+now)?|confirm(\s+and)?\s*(pay|submit|order|booking)|pay(\s+now)?|buy(\s+now)?|order(\s+now)?|complete\s+(order|purchase)|checkout|place\s+order|delete|remove|gửi|đăng(?!\s+nhập)(\s*bài)?|nộp(\s*đơn)?|xác\s*nhận(\s*(nộp|gửi|thanh\s*toán|đặt))?|thanh\s*toán|đặt\s+hàng|mua\s+ngay|xoá|xóa|hoàn\s*tất|(제출|신청|등록|접수|결제|구매|삭제)(하기)?|送信(する)?|確定|申し込む|購入(する)?|削除|提交|确认提交|支付|购买|删除)(?![\p{L}\p{N}_])/iu;
+  /^(submit|publish|post|send|apply(\s+now)?|confirm(\s+and)?\s*(pay|submit|order|booking)|pay(\s+now)?|buy(\s+now)?|order(\s+now)?|complete\s+(order|purchase)|checkout|place\s+order|delete|remove|gửi|đăng(?!\s+nhập)(\s*bài)?|nộp(\s*đơn)?|xác\s*nhận(\s*(nộp|gửi|thanh\s*toán|đặt))?|thanh\s*toán|đặt\s+hàng|mua\s+ngay|xoá|xóa|hoàn\s*tất|lên\s+lịch(\s+họp)?|đặt\s+(lịch|hẹn|chỗ|bàn|phòng)|schedule\s+(meeting|call|demo|appointment|now)|book(\s+(now|an?\s+\p{L}+|appointment|meeting|call|demo))?|(제출|신청|등록|접수|결제|구매|삭제)(하기)?|送信(する)?|確定|申し込む|購入(する)?|削除|提交|确认提交|支付|购买|删除)(?![\p{L}\p{N}_])/iu;
 
 const SAFE_SUBMIT_TYPE_RE =
   /^(next|continue|search|filter|save\s*draft|log\s*in|sign\s*in|tiếp(\s*tục)?|tìm(\s*kiếm)?|lọc|lưu\s*nháp|đăng\s+nhập|다음|이전|검색|로그인|次へ|検索|ログイン|下一步|搜索|登录)(?![\p{L}\p{N}_])/iu;
@@ -34,7 +37,7 @@ const SUBMIT_CAND_NEG_RE =
 const NEXT_STEP_RE = /^(next|continue|tiếp(\s*tục)?)(?![\p{L}\p{N}_])/iu;
 
 const COMPOUND_DANGER_RE =
-  /(?:^|[^\p{L}\p{N}_])(submit|publish|post|send|apply(\s+now)?|pay|payment|purchase|buy|place\s+order|complete\s+(order|purchase)|checkout|delete|remove|confirm|thanh\s*toán|đặt\s+hàng|mua\s+ngay|đăng(?!\s+nhập)(\s*bài)?|xoá|xóa|gửi|nộp|제출|결제|送信|提交|支付)(?![\p{L}\p{N}_])/iu;
+  /(?:^|[^\p{L}\p{N}_])(submit|publish|post|send|apply(\s+now)?|pay|payment|purchase|buy|place\s+order|complete\s+(order|purchase)|checkout|delete|remove|confirm|thanh\s*toán|đặt\s+hàng|mua\s+ngay|đăng(?!\s+nhập)(\s*bài)?|xoá|xóa|gửi|nộp|lên\s+lịch|đặt\s+lịch|schedule\s+(meeting|call|demo)|book\s+(now|an?\s)|제출|결제|送信|提交|支付)(?![\p{L}\p{N}_])/iu;
 
 // Affirmative buttons that commit when they sit inside a modal opened by an earlier "next" step
 // (e.g. Korean portals: 다음 -> modal 확인 is the real submit).
@@ -227,7 +230,8 @@ function writeSaveFile(savePath, content) {
   if (!savePath) return null;
   const resolved = resolveSafePath(savePath, 'savePath');
   fs.mkdirSync(path.dirname(resolved), { recursive: true });
-  fs.writeFileSync(resolved, content, typeof content === 'string' ? 'utf8' : undefined);
+  // Saved files never hold a configured secret value (no-op without a secrets file).
+  fs.writeFileSync(resolved, redactText(content), typeof content === 'string' ? 'utf8' : undefined);
   return resolved;
 }
 
@@ -4707,10 +4711,10 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
   if (spec.returnSnapshot) {
     const snap = await inspectCompact(
       page,
-      { mode: spec.snapshotMode || 'forms', maxChars: spec.snapshotMaxChars || 2500 },
+      { mode: spec.snapshotMode || 'forms', maxChars: spec.snapshotMaxChars || 2500, query: spec.snapshotQuery },
       previousLinesSet
     );
-    output.snapshot = snap.text;
+    output.snapshot = wrapPage(snap.text);
     output.elapsedMs = Date.now() - t0;
   }
 
@@ -5283,7 +5287,16 @@ ${el.value || ''}`.toLowerCase();
       !allowSubmit && frameOverride && !allFrames.includes(frameOverride)
         ? [...allFrames, frameOverride]
         : allFrames;
-    for (const tf of targetFrames) {
+    // One slow or hung frame (ads, analytics iframes on a busy SPA) must not stall the action:
+    // install in parallel and stop waiting after capMs.
+    const capped = (promises, capMs) => {
+      let timer;
+      return Promise.race([
+        Promise.all(promises),
+        new Promise((resolve) => { timer = setTimeout(resolve, capMs); }),
+      ]).finally(() => clearTimeout(timer));
+    };
+    await capped(targetFrames.map(async (tf) => {
       await tf
         .evaluate(
           ({ isAllowSafe, useActiveEl, submitSrc, safeSrc, dangerSrc }) => {
@@ -5602,7 +5615,7 @@ ${el.value || ''}`.toLowerCase();
           }
         )
         .catch(() => {});
-    }
+    }), 3000);
     if (!allowSubmit && allowSafe && safeTargetInfo) {
       if (safeTargetInfo.locator) {
         await safeTargetInfo.locator.evaluate(markSafeElementOwnForm).catch(() => {});
@@ -5620,7 +5633,8 @@ ${el.value || ''}`.toLowerCase();
       return await fn();
     } finally {
       let silentBlocks = 0;
-      for (const tf of targetFrames) {
+      const counts = [];
+      await capped(targetFrames.map(async (tf) => {
         const n = await tf
           .evaluate(async () => {
             await Promise.resolve();
@@ -5631,8 +5645,9 @@ ${el.value || ''}`.toLowerCase();
             return count;
           })
           .catch(() => 0);
-        silentBlocks += Number(n) || 0;
-      }
+        counts.push(Number(n) || 0);
+      }), 2000);
+      for (const n of counts) silentBlocks += n;
       silentState.count += silentBlocks;
     }
   };
@@ -6095,7 +6110,7 @@ ${el.value || ''}`.toLowerCase();
         ? { v: String(el.value), secret: el.type === 'password' } : null
     )).catch(() => null);
     if (back && back.v !== val) {
-      out.mismatch = back.secret ? 'field value differs from the typed value' : `field now holds "${back.v.slice(0, 60)}"`;
+      out.mismatch = back.secret || process.env.TURBO_BROWSER_SECRETS_FILE ? 'field value differs from the typed value' : `field now holds "${back.v.slice(0, 60)}"`;
     }
     return out;
   }
@@ -6394,7 +6409,7 @@ function applyNetworkBlock(res, blockedRequests) {
  */
 function prepareCommitControls(params, maySubmit) {
   if (params.expect !== undefined && params.expect !== null && !hasAnyCondition(params.expect)) {
-    throw new Error('expect requires at least one of urlMatches, textMatches, selector.');
+    throw new Error('expect requires at least one of urlMatches, textMatches, textNew, selector.');
   }
   const key =
     params.submissionKey !== undefined && params.submissionKey !== null && String(params.submissionKey) !== ''
@@ -6420,9 +6435,9 @@ function prepareCommitControls(params, maySubmit) {
   return { key, ledgerPath, refusal: null };
 }
 
-async function finishCommit(page, params, key, ledgerPath, res) {
+async function finishCommit(page, params, key, ledgerPath, res, textNewKey = '') {
   if (params.expect) {
-    Object.assign(res, await waitForSubmitEvidence(page, params.expect));
+    Object.assign(res, await waitForSubmitEvidence(page, params.expect, textNewKey));
   }
   if (key) {
     let origin = '';
@@ -6496,6 +6511,7 @@ export async function actFast(page, params = {}, previousLinesSet = null) {
     !allowSubmit && resolveNetworkGuard(params.networkGuard)
       ? await installNetworkGuard(page, networkGuardOptions(params))
       : null;
+  const tnKey = allowSubmit && params.expect?.textNew ? await armTextNew(page, params.expect.textNew) : '';
   let res;
   try {
     res = await executeSingleAction(page, params);
@@ -6506,15 +6522,15 @@ export async function actFast(page, params = {}, previousLinesSet = null) {
   tagBlockedBy(res);
   if (guard) applyNetworkBlock(res, guard.blocked);
   if (allowSubmit && !res.blocked && (params.expect || key)) {
-    await finishCommit(page, params, key, ledgerPath, res);
+    await finishCommit(page, params, key, ledgerPath, res, tnKey);
   }
   if (params.returnSnapshot && !res.blocked) {
     const snap = await inspectCompact(
       page,
-      { mode: params.snapshotMode || 'interactive', maxChars: params.snapshotMaxChars || 2500 },
+      { mode: params.snapshotMode || 'interactive', maxChars: params.snapshotMaxChars || 2500, query: params.snapshotQuery },
       previousLinesSet
     );
-    res.snapshot = snap.text;
+    res.snapshot = wrapPage(snap.text);
   }
   res.elapsedMs = Date.now() - t0;
   return res;
@@ -6548,6 +6564,7 @@ export async function batchActions(page, steps = [], options = {}, previousLines
       ? await installNetworkGuard(page, networkGuardOptions(options))
       : null;
   const guardState = { guard, seen: 0 };
+  const tnKey = maySubmit && options.expect?.textNew ? await armTextNew(page, options.expect.textNew) : '';
   let out;
   try {
     out = await batchActionsCore(page, stepList, options, previousLinesSet, guardState);
@@ -6561,7 +6578,7 @@ export async function batchActions(page, steps = [], options = {}, previousLines
     if (guard) await guard.remove();
   }
   if (maySubmit && !out.blocked && !out.error && (options.expect || key)) {
-    await finishCommit(page, options, key, ledgerPath, out);
+    await finishCommit(page, options, key, ledgerPath, out, tnKey);
   }
   out.elapsedMs = Date.now() - t0;
   return out;
@@ -6621,8 +6638,12 @@ async function batchActionsCore(page, stepList, options, previousLinesSet, guard
         lastNavBad = stepResult.blocked ? `page blocked (${stepResult.blocked})` : stepResult.status >= 400 ? `page status ${stepResult.status}` : '';
       } else if (step.action === 'extract') {
         stepResult = await extractCleanText(page, step);
+        if (boundariesEnabled() && typeof stepResult.text === 'string') stepResult.text = wrapPage(stepResult.text);
       } else if (step.action === 'collect') {
         stepResult = await collectItems(page, step);
+        if (boundariesEnabled() && Array.isArray(stepResult.items)) {
+          stepResult.items = stepResult.items.map((it) => (typeof it === 'string' ? wrapPage(it) : it && typeof it.text === 'string' ? { ...it, text: wrapPage(it.text) } : it));
+        }
         if (lastNavBad) stepResult.note = lastNavBad + (stepResult.note ? `; ${stepResult.note}` : '');
       } else {
         lastNavBad = '';
@@ -6675,10 +6696,10 @@ async function batchActionsCore(page, stepList, options, previousLinesSet, guard
   if (options.returnSnapshot) {
     const snap = await inspectCompact(
       page,
-      { mode: options.snapshotMode || 'interactive', maxChars: options.snapshotMaxChars || 2500 },
+      { mode: options.snapshotMode || 'interactive', maxChars: options.snapshotMaxChars || 2500, query: options.snapshotQuery },
       previousLinesSet
     );
-    out.snapshot = snap.text;
+    out.snapshot = wrapPage(snap.text);
   }
 
   out.elapsedMs = Date.now() - t0;

@@ -44,13 +44,30 @@ describe('attached browser with a tab whose main world is blocked', () => {
       const res = await bm.tabsBatch([{ action: 'list' }]);
       const ms = Date.now() - t0;
       assert.ok(ms < 8000, `list took ${ms} ms`);
-      const tabs = res.results[0].tabs;
+      const tabs = res.tabs;
+      assert.equal(res.results[0].tabs, undefined, 'tab list is returned once');
       const stuckTab = tabs.find((t) => t.title === 'Stuck' || t.url.includes('paused'));
       const fineTab = tabs.find((t) => t.title === 'Fine');
       assert.ok(stuckTab, 'stuck tab listed');
       assert.equal(stuckTab.unresponsive, true);
       assert.ok(fineTab, 'fine tab listed');
       assert.equal(fineTab.unresponsive, undefined);
+
+      // A tool call that targets the stuck tab fails fast instead of hanging.
+      const t1 = Date.now();
+      await assert.rejects(bm.getPage(stuckTab.tabId), /page main world is blocked/);
+      assert.ok(Date.now() - t1 < 2500, `getPage on stuck tab took ${Date.now() - t1} ms`);
+      // The fine tab still works.
+      const ok = await bm.getPage(fineTab.tabId);
+      assert.equal(ok.tabId, fineTab.tabId);
+
+      // Resume the debugger: the mark clears on the next call.
+      await dbg.send('Debugger.resume').catch(() => {});
+      await dbg.send('Debugger.disable').catch(() => {});
+      await stuck.waitForTimeout(300);
+      const back = await bm.getPage(stuckTab.tabId);
+      assert.equal(back.tabId, stuckTab.tabId);
+      assert.equal(bm.isPageUnresponsive(back.page), false);
     } finally {
       if (bm) await bm.close().catch(() => {});
       await upstream.close().catch(() => {});

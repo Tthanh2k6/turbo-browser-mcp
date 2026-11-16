@@ -13,8 +13,10 @@ export function watchActivity(page) {
   page.on('request', onRequest);
   page.on('requestfinished', onDone);
   page.on('requestfailed', onDone);
-  let startCount = null, changed = false;
-  const install = probe(page.evaluate(() => {
+  let startCount = null, changed = false, pendingMutations = false;
+  // The baseline must survive a slow first evaluate (busy main thread): the probe below gives up
+  // after 250 ms, but the evaluate keeps running and still reports the count from before the action.
+  const installRaw = page.evaluate(() => {
     const w = window;
     if (!w.__tbmActivity) {
       const s = { last: performance.now(), n: 0 };
@@ -23,7 +25,8 @@ export function watchActivity(page) {
       Object.defineProperty(w, '__tbmActivity', { value: s, enumerable: false });
     }
     return w.__tbmActivity.n;
-  })).then((n) => { if (typeof n === 'number') startCount = n; });
+  }).then((n) => { if (typeof n === 'number') startCount = n; return n; }).catch(() => null);
+  const install = probe(installRaw);
   const read = () => probe(page.evaluate(() => {
     const s = window.__tbmActivity;
     return s ? { quiet: performance.now() - s.last, n: s.n } : null;
@@ -38,6 +41,7 @@ export function watchActivity(page) {
         const st = await read();
         if (!st) changed = true; // new document (or mid-navigation): the old observer is gone
         else if (startCount !== null && st.n > startCount) changed = true;
+        else if (startCount === null && st.n > 0) pendingMutations = true; // baseline reply not in yet
         const requestsQuiet = ![...inflight.values()].some((t) => Date.now() - t < INFLIGHT_MS);
         if (Date.now() - start >= minMs && requestsQuiet && (!st || st.quiet >= QUIET_MS)) {
           break;
@@ -47,7 +51,8 @@ export function watchActivity(page) {
     },
     outcome() {
       if (page.url() !== beforeUrl) return 'navigated';
-      return changed ? 'changed' : 'none';
+      // Baseline never arrived but the observer saw mutations: report them rather than 'none'.
+      return changed || (startCount === null && pendingMutations) ? 'changed' : 'none';
     },
     remove() {
       page.off('request', onRequest);

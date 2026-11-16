@@ -29,11 +29,15 @@ import {
 import { takeLate } from './aftermath.mjs';
 import { getPolicy, takeBlocked } from './allow-hosts.mjs';
 import { waitForHuman } from './guards.mjs';
+import { boundariesEnabled, boundaryInstruction, wrapPage } from './boundaries.mjs';
+import { getSecrets, redactText, resolveSecretArgs } from './secrets.mjs';
 
 // Read from package.json so --version, --doctor and serverInfo never drift from the published version.
 const PACKAGE_VERSION = JSON.parse(
   fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
 ).version;
+
+export const SKILL_PATH = fileURLToPath(new URL('../skills/turbo-browser/SKILL.md', import.meta.url));
 
 const SERVER_INFO = {
   name: 'turbo-browser-mcp',
@@ -51,6 +55,7 @@ const COMMIT_PROPS = {
     properties: {
       urlMatches: { type: 'string' },
       textMatches: { type: 'string' },
+      textNew: { type: 'string', description: 'Like textMatches, only text new since the click.' },
       selector: { type: 'string' },
       timeoutMs: { type: 'integer' },
     },
@@ -352,6 +357,7 @@ export const TOOL_DEFINITIONS = [
         returnSnapshot: { type: 'boolean', default: false },
         snapshotMode: { type: 'string', enum: ['interactive', 'forms', 'article', 'all'] },
         snapshotMaxChars: { type: 'integer', default: 2500 },
+        snapshotQuery: { type: 'string' },
       },
     },
   },
@@ -382,6 +388,7 @@ export const TOOL_DEFINITIONS = [
         returnSnapshot: { type: 'boolean', default: false },
         snapshotMode: { type: 'string', enum: ['interactive', 'forms', 'article', 'all'] },
         snapshotMaxChars: { type: 'integer', default: 2500 },
+        snapshotQuery: { type: 'string' },
         ...COMMIT_PROPS,
       },
     },
@@ -584,7 +591,29 @@ export const TOOL_DEFINITIONS = [
   },
 ];
 
+/**
+ * Single boundary for every tool call. With a secrets file configured, `$secret:NAME` values are
+ * resolved on the way in and every result (text and errors) is redacted on the way out.
+ * Without one this is a straight pass-through.
+ */
 export async function dispatchToolCall(manager, name, rawArgs = {}) {
+  const secrets = getSecrets();
+  if (!secrets) return dispatchToolCallBase(manager, name, rawArgs);
+  const args = resolveSecretArgs(rawArgs, secrets);
+  try {
+    const res = await dispatchToolCallBase(manager, name, args);
+    if (res && typeof res.text === 'string') res.text = redactText(res.text, secrets);
+    return res;
+  } catch (err) {
+    if (err && typeof err.message === 'string') {
+      const clean = redactText(err.message, secrets);
+      if (clean !== err.message) err.message = clean;
+    }
+    throw err;
+  }
+}
+
+async function dispatchToolCallBase(manager, name, rawArgs = {}) {
   const res = await dispatchToolCallInner(manager, name, rawArgs);
   const lateTab = manager.tabs?.get?.(rawArgs?.tabId ?? manager.activeTabId);
   const late = lateTab ? takeLate(lateTab) : '';
@@ -628,7 +657,7 @@ async function dispatchToolCallInner(manager, name, rawArgs = {}) {
       const { tabId, page } = await manager.getPage(args.tabId);
       const res = await inspectCompact(page, args, manager.getSnapshotState(page));
       return {
-        text: `tabId=${tabId} | chars=${res.charCount} | truncated=${res.truncated} | ms=${res.elapsedMs}${res.savePath ? ` | savePath=${res.savePath}${res.fullChars ? ` (full ${res.fullChars} chars)` : ''}` : ''}\n${res.text}`,
+        text: `tabId=${tabId} | chars=${res.charCount} | truncated=${res.truncated} | ms=${res.elapsedMs}${res.savePath ? ` | savePath=${res.savePath}${res.fullChars ? ` (full ${res.fullChars} chars)` : ''}` : ''}\n${wrapPage(res.text)}`,
       };
     }
     case 'smart_fill_form': {
@@ -656,6 +685,7 @@ async function dispatchToolCallInner(manager, name, rawArgs = {}) {
           returnSnapshot: args.returnSnapshot,
           snapshotMode: args.snapshotMode,
           snapshotMaxChars: args.snapshotMaxChars,
+          snapshotQuery: args.snapshotQuery,
           expect: args.expect,
           submissionKey: args.submissionKey,
           allowDuplicate: args.allowDuplicate,
@@ -677,7 +707,7 @@ async function dispatchToolCallInner(manager, name, rawArgs = {}) {
       const { tabId, page } = await manager.getPage(args.tabId);
       const res = await extractCleanText(page, args);
       return {
-        text: `tabId=${tabId} | chars=${res.charCount} | truncated=${res.truncated}${res.savePath ? ` | savePath=${res.savePath}${res.fullChars ? ` (full ${res.fullChars} chars)` : ''}` : ''}\n${res.text}`,
+        text: `tabId=${tabId} | chars=${res.charCount} | truncated=${res.truncated}${res.savePath ? ` | savePath=${res.savePath}${res.fullChars ? ` (full ${res.fullChars} chars)` : ''}` : ''}\n${wrapPage(res.text)}`,
       };
     }
     case 'evaluate_js': {
@@ -685,6 +715,14 @@ async function dispatchToolCallInner(manager, name, rawArgs = {}) {
       const res = await evaluateJs(page, args);
       // With savePath the full result lives in the file: return only its location, size and a short preview.
       const { result: fullResult, ...rest } = res;
+      if (boundariesEnabled() && !res.savePath) {
+        // Page-sourced value: metadata as JSON, then the serialized result inside the markers.
+        const { result: pageValue, ...meta } = res;
+        let body = typeof pageValue === 'string' ? pageValue : JSON.stringify(pageValue);
+        if (body.length > 19000) body = `${body.slice(0, 18980)}... [truncated]`; // cut inside the markers
+        return { text: `${JSON.stringify({ tabId, ...meta })}
+${wrapPage(body)}` };
+      }
       const encoded = JSON.stringify(res.savePath ? { tabId, ...rest } : { tabId, ...res });
       return {
         text: encoded.length > 20000
@@ -799,7 +837,7 @@ export function createJsonRpcHandler(manager) {
             protocolVersion: negotiatedProtocol,
             capabilities: { tools: {} },
             serverInfo: SERVER_INFO,
-            instructions: SERVER_INSTRUCTIONS,
+            instructions: SERVER_INSTRUCTIONS + boundaryInstruction(),
           },
         };
       }
@@ -1050,6 +1088,7 @@ const VALUE_FLAG_ENV = {
   '--tools': 'TURBO_BROWSER_TOOLS',
   '--allow-hosts': 'TURBO_BROWSER_ALLOW_HOSTS',
   '--allow-origins': 'TURBO_BROWSER_ALLOW_ORIGINS',
+  '--secrets': 'TURBO_BROWSER_SECRETS_FILE',
 };
 
 const HELP_TEXT = `turbo-browser-mcp v${SERVER_INFO.version} — Fast, token-efficient Playwright MCP server
@@ -1078,6 +1117,9 @@ Options:
   --allow-hosts <a,b>        Only allow navigation to these hosts and their subdomains (TURBO_BROWSER_ALLOW_HOSTS)
   --allow-origins <o,o>      Only allow these exact origins, e.g. http://localhost:3000 (TURBO_BROWSER_ALLOW_ORIGINS)
   --allow-strict             With an allowlist, also block sub-resource requests to other hosts
+  --secrets <file>           dotenv file of secrets; use $secret:NAME as a fill/type value, values are redacted from results (TURBO_BROWSER_SECRETS_FILE)
+  --content-boundaries       Wrap page text in <<page:nonce>> markers (TURBO_BROWSER_CONTENT_BOUNDARIES=1)
+  --print-skill              Print the bundled SKILL.md for this version and exit
 
 Example MCP config:
   {
@@ -1125,6 +1167,10 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
       out.envOverrides.TURBO_BROWSER_HEADLESS = 'false';
     } else if (flag === '--allow-strict') {
       out.envOverrides.TURBO_BROWSER_ALLOW_STRICT = '1';
+    } else if (flag === '--content-boundaries') {
+      out.envOverrides.TURBO_BROWSER_CONTENT_BOUNDARIES = '1';
+    } else if (flag === '--print-skill') {
+      out.printSkill = true;
     } else if (flag === '--allow-submit') {
       out.envOverrides.TURBO_BROWSER_ALLOW_SUBMIT = 'true';
     } else if (Object.prototype.hasOwnProperty.call(VALUE_FLAG_ENV, flag)) {
@@ -1157,6 +1203,19 @@ async function runCli() {
   if (parsed.help) {
     process.stdout.write(HELP_TEXT);
     process.exit(0);
+  }
+  if (parsed.printSkill) {
+    process.stdout.write(fs.readFileSync(SKILL_PATH, 'utf8'));
+    process.exit(0);
+  }
+  if (process.env.TURBO_BROWSER_SECRETS_FILE) {
+    try {
+      getSecrets();
+    } catch (err) {
+      process.stderr.write(`${err.message}
+`);
+      process.exit(2);
+    }
   }
   if (parsed.doctor) {
     const report = await diagnoseEnvironment(process.env.TURBO_BROWSER_CDP_URL || 'http://127.0.0.1:9222');
