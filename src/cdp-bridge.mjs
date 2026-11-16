@@ -532,9 +532,13 @@ export async function ensureCdpBridgeDaemon(
       // Spawn outside any temporary Job Object on Windows via Win32_Process.Create
       const cmdLine = `"${process.execPath}" "${selfPath}" --daemon --upstream "${upstreamUrl}" --port ${bridgePort} --host ${host}`;
       const escaped = cmdLine.replace(/'/g, "''");
+      // DETACHED_PROCESS (no console) + SW_HIDE: node.exe is a console app, so without them Windows opens a console window.
+      const ps = "$si = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0; CreateFlags = [uint32]8 }; " +
+        `$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${escaped}'; ProcessStartupInformation = $si }; ` +
+        'if ($r.ReturnValue -ne 0) { exit 1 }';
       execSync(
-        `powershell -NoProfile -Command "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${escaped}' }"`,
-        { stdio: 'ignore', timeout: 5000 }
+        `powershell -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand ${Buffer.from(ps, 'utf16le').toString('base64')}`,
+        { stdio: 'ignore', timeout: 5000, windowsHide: true }
       );
     } catch {
       const child = spawn(
@@ -548,7 +552,7 @@ export async function ensureCdpBridgeDaemon(
     const child = spawn(
       process.execPath,
       [selfPath, '--daemon', '--upstream', upstreamUrl, '--port', String(bridgePort), '--host', host],
-      { detached: true, stdio: 'ignore' }
+      { detached: true, stdio: 'ignore', windowsHide: true }
     );
     child.unref();
   }
