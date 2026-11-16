@@ -509,8 +509,11 @@ describe('sim-carbon-recheck: Round-3 deep adversarial audit suite', { concurren
       const openOut = await isolatedMgr.tabsBatch([
         { action: 'open', url: `${fx.baseUrl}/blank`, activate: false },
       ]);
-      assert.equal(openOut.tabs.length, 1);
-      const firstTabId = openOut.tabs[0].tabId;
+      // open no longer echoes the tab list (it returns its own tabId); list explicitly.
+      const openTabs = (await isolatedMgr.tabsBatch([{ action: 'list' }])).tabs;
+      assert.equal(openTabs.length, 1);
+      const firstTabId = openOut.results[0].tabId;
+      assert.equal(firstTabId, openTabs[0].tabId);
 
       const got = await isolatedMgr.getPage();
       const allTabs = await isolatedMgr.listTabs();

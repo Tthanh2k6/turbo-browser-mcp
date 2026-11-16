@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { ensureCdpBridgeDaemon } from './cdp-bridge.mjs';
 import { resolveSafePath } from './dom-engine.mjs';
+import { navHealth } from './navinfo.mjs';
 import {
   loadPlaywright,
   resolveActiveCdpEndpoint,
@@ -811,8 +812,11 @@ export class BrowserManager {
       : [{ action: 'list' }];
 
     const results = [];
+    const tabsBefore = new Set(this._knownTabIds || this.tabs.keys());
+    let tabsRequested = false;
     for (const op of ops) {
       const action = op.action || (op.url ? 'open' : 'list');
+      if (action === 'list' || action === 'open_many' || action === 'close') tabsRequested = true;
 
       if (action === 'close_browser') {
         await this.close();
@@ -855,13 +859,15 @@ export class BrowserManager {
               const page = await ctx.newPage();
               const tabId = this._registerPage(page, false, ctxName);
               try {
-                await page.goto(targetUrl, navOpts);
+                const resp = await page.goto(targetUrl, navOpts);
+                const title = await page.title().catch(() => '');
                 return {
                   tabId,
                   isolatedContext: ctxName,
                   url: page.url(),
-                  title: await page.title().catch(() => ''),
+                  title,
                   ok: true,
+                  ...(await navHealth(page, resp, targetUrl, title)),
                 };
               } catch (err) {
                 await page.close().catch(() => {});
@@ -908,9 +914,10 @@ export class BrowserManager {
               ? prevActiveTabId
               : tabId;
         }
+        let openResp = null;
         if (op.url) {
           try {
-            await page.goto(op.url, {
+            openResp = await page.goto(op.url, {
               waitUntil: op.waitUntil || 'domcontentloaded',
               timeout: op.timeoutMs || this.defaultTimeoutMs,
             });
@@ -931,12 +938,14 @@ export class BrowserManager {
               ? prevActiveTabId
               : tabId;
         }
+        const openTitle = await page.title().catch(() => '');
         results.push({
           action: 'open',
           tabId,
           isolatedContext: ctxName,
           url: page.url(),
-          title: await page.title().catch(() => ''),
+          title: openTitle,
+          ...(op.url ? await navHealth(page, openResp, op.url, openTitle) : {}),
         });
         continue;
       }
@@ -944,16 +953,18 @@ export class BrowserManager {
       if (action === 'navigate') {
         const { tabId, page } = await this.getPage(op.tabId);
         if (!op.url) throw new Error('navigate action requires url.');
-        await page.goto(op.url, {
+        const navResp = await page.goto(op.url, {
           waitUntil: op.waitUntil || 'domcontentloaded',
           timeout: op.timeoutMs || this.defaultTimeoutMs,
         });
         if (op.activate !== false) this.activeTabId = tabId;
+        const navTitle = await page.title().catch(() => '');
         results.push({
           action: 'navigate',
           tabId,
           url: page.url(),
-          title: await page.title().catch(() => ''),
+          title: navTitle,
+          ...(await navHealth(page, navResp, op.url, navTitle)),
         });
         continue;
       }
@@ -1039,12 +1050,25 @@ export class BrowserManager {
       throw new Error(`Unsupported tabs_batch action: ${action}`);
     }
 
+    // Echo the tab list only when asked (list/open_many/close) or when it changed in a way the
+    // caller did not request (popup opened, tab crashed). open/navigate/etc. return their own tabId.
+    let echoTabs = tabsRequested;
+    if (!echoTabs) {
+      const expected = new Set(tabsBefore);
+      for (const r of results) {
+        if (r.action === 'open' && r.tabId !== undefined && r.tabId !== null) expected.add(r.tabId);
+      }
+      this._syncOpenPages();
+      const now = [...this.tabs.keys()];
+      echoTabs = now.length !== expected.size || now.some((id) => !expected.has(id));
+    }
+    this._knownTabIds = new Set(this.tabs.keys());
     return {
       connectionType: this.connectionType,
       activeTabId: this.activeTabId,
       elapsedMs: Date.now() - batchStart,
       results,
-      tabs: await this.listTabs(),
+      ...(echoTabs ? { tabs: await this.listTabs() } : {}),
     };
   }
 

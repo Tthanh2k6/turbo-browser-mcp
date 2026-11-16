@@ -294,7 +294,7 @@ export const TOOL_DEFINITIONS = [
         },
         ref: { type: 'string' },
         selector: { type: 'string' },
-        text: { type: 'string' },
+        text: { type: 'string', description: 'Visible text. For wait: "A|B" matches any alternative (result.matched).' },
         frameIdx: { type: 'integer' },
         x: { type: 'number', description: 'Viewport x coordinate (or offset relative to target).' },
         y: { type: 'number', description: 'Viewport y coordinate (or offset relative to target).' },

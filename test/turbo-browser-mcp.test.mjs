@@ -1029,7 +1029,9 @@ describe('turbo-browser-mcp integration', () => {
         { action: 'open', url: `${baseUrl}/v3`, isolatedContext: 'work-iso', waitUntil: 'networkidle' },
       ]);
       const isoTab = openIso.activeTabId;
-      assert.ok(openIso.tabs.some((t) => t.tabId === isoTab && t.isolatedContext === 'work-iso'));
+      assert.equal(openIso.tabs, undefined, 'open does not echo the tab list');
+      assert.equal(openIso.results[0].isolatedContext, 'work-iso');
+      assert.ok((await manager.tabsBatch([{ action: 'list' }])).tabs.some((t) => t.tabId === isoTab && t.isolatedContext === 'work-iso'));
 
       const isoCookies = await manager.manageNetworkSession(isoTab, { cookieAction: 'get' });
       assert.equal(isoCookies.cookies.some((c) => c.name === 'ctx_scope'), false, 'isolated context must not inherit default cookies');
@@ -1458,7 +1460,8 @@ describe('turbo-browser-mcp integration', () => {
       assert.equal(openRes.result.isError, false);
       const tabPayload = JSON.parse(openRes.result.content[0].text);
       assert.equal(tabPayload.connectionType, 'launch');
-      assert.ok(tabPayload.tabs.some((t) => t.url.startsWith(baseUrl)));
+      assert.equal(tabPayload.tabs, undefined, 'open does not echo the tab list');
+      assert.ok(tabPayload.results[0].url.startsWith(baseUrl));
 
       const inspectRes = await callRpc(4, 'tools/call', {
         name: 'inspect_compact',

@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { navHealth } from './navinfo.mjs';
 import { observeClickAftermath, watchActivity } from './aftermath.mjs';
 import path from 'node:path';
 import {
@@ -1460,6 +1461,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
 
   const allFrames = getAllFrames(page);
   const urlKey = `__url__:${page.url()}`;
+  const hadBaseline = Boolean(previousLinesSet && previousLinesSet.size > 0);
   const sameUrlAsBaseline = Boolean(previousLinesSet && previousLinesSet.has(urlKey));
   const baseline = sameUrlAsBaseline ? snapshotBaselines.get(previousLinesSet) : null;
   const sameScope = baseline?.mode === mode && baseline?.includeFrames === includeFrames;
@@ -1871,7 +1873,24 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
               const txt = clean(el.innerText);
               if (txt) extra += ` val="${txt.slice(0, 40)}"`;
             } else if (tag === 'a' && el.getAttribute('href')) {
-              extra += ` href="${el.getAttribute('href').slice(0, 50)}"`;
+              const rawHref = el.getAttribute('href');
+              let shownHref = rawHref;
+              try {
+                const isAbs = /^(https?:)?\/\//i.test(rawHref);
+                const u = new URL(el.href || rawHref, location.href);
+                if (/^https?:$/.test(u.protocol) && (isAbs || rawHref.includes('?'))) {
+                  const TRACK = /^(utm_.*|trk|trkinfo|refid|trackingid|fbclid|gclid|mc_[a-z]+|ref_src|igshid)$/i;
+                  for (const k of [...u.searchParams.keys()]) if (TRACK.test(k)) u.searchParams.delete(k);
+                  if (isAbs) {
+                    shownHref = u.origin === location.origin ? `${u.pathname}${u.search}${u.hash}` : u.href;
+                  } else {
+                    shownHref = `${rawHref.slice(0, rawHref.indexOf('?'))}${u.search}${u.hash}`;
+                  }
+                }
+              } catch {
+                shownHref = rawHref;
+              }
+              extra += ` href="${shownHref.slice(0, 120)}"`;
             }
 
             if (
@@ -1964,7 +1983,10 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
   }
 
   const filterNote = `${query ? ` | Query: "${query}"` : ''}${onlyChanged ? ' | Delta: true' : ''}`;
-  const header = `URL: ${page.url()}\nTitle: ${title}\nMode: ${mode} | Frames: ${frames.length} | Elements: ${totalMatched}${filterNote}\n`;
+  const urlChangedNote = onlyChanged && hadBaseline && !sameUrlAsBaseline
+    ? 'URL changed: full snapshot\n'
+    : '';
+  const header = `URL: ${page.url()}\nTitle: ${title}\nMode: ${mode} | Frames: ${frames.length} | Elements: ${totalMatched}${filterNote}\n${urlChangedNote}`;
   let body = '';
   let shownCount = 0;
   let truncated = false;
@@ -4714,10 +4736,17 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
       if (scopedFrames.length === 0) {
         throw new Error(`No matching frames found for wait target (${params.selector || params.text}).`);
       }
+      const textAlts = !params.selector && typeof params.text === 'string' && params.text.includes('|')
+        ? params.text.split('|').map((x) => x.trim()).filter(Boolean)
+        : [];
+      const altMode = textAlts.length > 1;
+      const altRe = altMode
+        ? new RegExp(textAlts.map((x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'i')
+        : null;
       const makeListLoc = (f) =>
         params.selector
           ? f.frame.locator(params.selector)
-          : f.frame.getByText(params.text, { exact: false });
+          : f.frame.getByText(altMode ? altRe : params.text, { exact: false });
 
       if (desiredState === 'hidden' || desiredState === 'detached') {
         const deadline = Date.now() + timeout;
@@ -4760,6 +4789,7 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
 
       const deadline = Date.now() + timeout;
       let foundVisible = false;
+      let matchedAlt;
       while (Date.now() <= deadline) {
         for (const f of scopedFrames) {
           const list = makeListLoc(f);
@@ -4767,6 +4797,10 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
           for (let i = 0; i < cnt; i++) {
             if (await list.nth(i).isVisible().catch(() => false)) {
               foundVisible = true;
+              if (altMode) {
+                const hay = ((await list.nth(i).textContent().catch(() => '')) || '').toLowerCase();
+                matchedAlt = textAlts.find((x) => hay.includes(x.toLowerCase()));
+              }
               break;
             }
           }
@@ -4778,7 +4812,7 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
       if (!foundVisible) {
         throw new Error(`Timed out after ${timeout}ms waiting for "${params.selector || params.text}" to become ${desiredState}.`);
       }
-      return { ok: true, action, waitedFor: params.selector || params.text };
+      return { ok: true, action, waitedFor: params.selector || params.text, ...(matchedAlt ? { matched: matchedAlt } : {}) };
     }
     const ms = Math.min(Number(params.ms) || 500, 15000);
     await page.waitForTimeout(ms);
@@ -6138,10 +6172,11 @@ async function batchActionsCore(page, stepList, options, previousLinesSet, guard
             step.body !== undefined || step.postData !== undefined) {
           throw new Error('navigate supports GET only, without a request body.');
         }
-        await page.goto(url.href, {
+        const navResp = await page.goto(url.href, {
           waitUntil: 'domcontentloaded', timeout: Number(step.timeoutMs) || DEFAULT_TIMEOUT_MS,
         });
-        stepResult = { ok: true, action: 'navigate', url: page.url() };
+        const navTitle = await page.title().catch(() => '');
+        stepResult = { ok: true, action: 'navigate', url: page.url(), ...(await navHealth(page, navResp, url.href, navTitle)) };
       } else if (step.action === 'extract') {
         stepResult = await extractCleanText(page, step);
       } else {
@@ -6219,8 +6254,11 @@ export async function extractCleanText(page, options = {}) {
   for (const frameInfo of frames) {
     let part = '';
     try {
-      part = await frameInfo.frame.evaluate(({ sel, fmt }) => {
+      const runFrame = (skipOv) => frameInfo.frame.evaluate(({ sel, fmt, skipOv: doSkip }) => {
         const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'SVG', 'TEMPLATE']);
+        const skipSet = new Set();
+        let overlayNote = '';
+        const ret = (t) => ({ t, o: overlayNote });
         const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
         const getSR = (node) => node?.shadowRoot || window.__tbmGetShadowRoot?.(node) || null;
 
@@ -6258,6 +6296,7 @@ export async function extractCleanText(page, options = {}) {
           if (!el || el.nodeType !== 1) return false;
           let cur = el;
           while (cur && cur.nodeType === 1) {
+            if (skipSet.has(cur)) return true;
             if (SKIP_TAGS.has((cur.tagName || '').toUpperCase()) || cur.hasAttribute('hidden')) return true;
             if (cur.getAttribute('aria-hidden') === 'true') return true;
             const parent = cur.parentElement;
@@ -6337,7 +6376,56 @@ export async function extractCleanText(page, options = {}) {
           const mainMatches = findDeepAll(document, 'main, article, [role="main"]');
           root = mainMatches.find((el) => !isCompletelyHiddenRoot(el)) || document.body;
         }
-        if (!root) return '';
+        if (!root) return ret('');
+
+        if (!sel && doSkip) {
+          // Skip visible overlays (dialogs, sign-in walls, cookie banners) so they do not replace the page text.
+          const COOKIE_RE = /cookie|consent|gdpr|onetrust|privacy-?(banner|notice)|cc-window/i;
+          const cands = new Set();
+          const addAll = (q) => {
+            try { for (const e of root.querySelectorAll(q)) cands.add(e); } catch { /* ignore */ }
+          };
+          addAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog[open], [id*="cookie" i], [class*="cookie" i], [id*="consent" i], [class*="consent" i], [id*="gdpr" i], [class*="gdpr" i], [id*="onetrust" i], [class*="onetrust" i]');
+          for (const c1 of root.children || []) {
+            cands.add(c1);
+            for (const c2 of c1.children || []) cands.add(c2);
+          }
+          const vw = window.innerWidth || 1;
+          const vh = window.innerHeight || 1;
+          const found = [];
+          for (const el of cands) {
+            if (el === root || el.nodeType !== 1 || SKIP_TAGS.has(el.tagName)) continue;
+            let st;
+            try { st = getComputedStyle(el); } catch { continue; }
+            if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) continue;
+            if (st.position !== 'fixed' && st.position !== 'sticky' && st.position !== 'absolute') continue;
+            const r = el.getBoundingClientRect();
+            const w = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
+            const h = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
+            if (w < 40 || h < 20) continue;
+            const idc = `${el.id || ''} ${typeof el.className === 'string' ? el.className : ''}`;
+            const role = el.getAttribute('role');
+            const isDialog = role === 'dialog' || role === 'alertdialog' || el.getAttribute('aria-modal') === 'true' || el.tagName === 'DIALOG';
+            const cookieLike = COOKIE_RE.test(idc);
+            const z = parseInt(st.zIndex, 10) || 0;
+            const cover = (w * h) / (vw * vh);
+            const stuck = st.position === 'fixed' || st.position === 'sticky';
+            const ok = (isDialog && (stuck || st.position === 'absolute')) ||
+              (cookieLike && stuck) ||
+              (stuck && z >= 100 && (cover >= 0.5 || (w >= vw * 0.6 && (r.top <= 4 || r.bottom >= vh - 4) && cookieLike)));
+            if (!ok) continue;
+            if (el.querySelector('main, article, [role="main"]')) continue;
+            if (clean(el.innerText).length > 4000) continue;
+            found.push(el);
+          }
+          const top = found.filter((el) => !found.some((o) => o !== el && o.contains(el)));
+          if (top.length > 0) {
+            for (const el of top) skipSet.add(el);
+            const head = top[0].querySelector('h1,h2,h3,[role="heading"]');
+            const label = clean(head?.innerText || top[0].innerText).slice(0, 40);
+            overlayNote = `Overlay: ${label}${top.length > 1 ? ` +${top.length - 1}` : ''} (skipped)`;
+          }
+        }
 
         if (fmt === 'markdown') {
           const childNodesOf = (node) => {
@@ -6524,15 +6612,18 @@ export async function extractCleanText(page, options = {}) {
           };
 
           walkContainer(root);
-          if (out.length > 0) return out.join('\n');
+          if (out.length > 0) return ret(out.join('\n'));
         }
 
-        return extractDeepPlain(root)
+        return ret(extractDeepPlain(root)
           .split('\n')
           .map((line) => line.replace(/\s+/g, ' ').trim())
           .filter(Boolean)
-          .join('\n');
-      }, { sel: selector, fmt: format });
+          .join('\n'));
+      }, { sel: selector, fmt: format, skipOv });
+      let res = await runFrame(true);
+      if (res.o && res.t.length < 200) res = await runFrame(false);
+      part = res.o ? `${res.o}\n${res.t}` : res.t;
     } catch {
       part = '';
     }
