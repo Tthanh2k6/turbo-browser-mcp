@@ -1777,7 +1777,11 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
 
             const role = el.getAttribute('role');
             const type = el.getAttribute('type') || '';
-            const kind = tag === 'input'
+            const isComboInput =
+              tag === 'input' && (role === 'combobox' || Boolean(el.getAttribute('aria-autocomplete')));
+            const kind = isComboInput
+              ? 'input:combobox'
+              : tag === 'input'
               ? `input:${type || 'text'}`
               : el.isContentEditable
                 ? `${tag}:editable`
@@ -1785,7 +1789,18 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
                   ? `${tag}:${role}`
                   : tag;
 
-            const lbl = labelFor(el);
+            let lbl = labelFor(el);
+            if (tag === 'input' && /^react-select-\d+-input$/.test(lbl)) {
+              // Auto-generated id: use short visible text of the nearby wrapper instead (placeholder/value).
+              let host = el.parentElement;
+              for (let up = 0; host && up < 3; up++, host = host.parentElement) {
+                const near = clean(host.innerText || host.textContent);
+                if (near && near.length <= 60) {
+                  lbl = near;
+                  break;
+                }
+              }
+            }
             let extra = '';
             if (tag === 'input' || tag === 'textarea' || tag === 'select') {
               if (type === 'checkbox' || type === 'radio') {
@@ -2787,6 +2802,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
           for (const f of domSpec) {
             if (f.option !== undefined || f.check !== undefined) {
               const wanted = f.check ?? f.option;
+              const checkIsBool = typeof f.check === 'boolean';
               const patterns = Array.isArray(wanted) ? wanted : [wanted];
               let hitAny = false;
 
@@ -2913,10 +2929,39 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                       preTagged.length > 0
                         ? preTagged
                         : queryAllDeep(document, f.selector).filter(vis).sort(compareComposedOrder);
-                    explicitTargets = f.all ? matchedEls : matchedEls.slice(0, 1);
+                    explicitTargets =
+                      f.all || (f.check !== undefined && !checkIsBool) ? matchedEls : matchedEls.slice(0, 1);
                   }
                 }
-                if (
+                // check:'label' / ['a','b'] on one radio/checkbox of a named group: act on the whole group.
+                if (f.check !== undefined && !checkIsBool && explicitTargets.length === 1) {
+                  const one = explicitTargets[0];
+                  if (one.matches?.('input[type="checkbox"], input[type="radio"]') && one.name) {
+                    explicitTargets = queryAllDeep(document, choiceSel).filter(
+                      (c) => vis(c) && c.name === one.name && c.type === one.type && c.form === one.form
+                    );
+                  }
+                }
+                if (checkIsBool) {
+                  for (const raw of explicitTargets) {
+                    const ctrl = raw.tagName === 'LABEL' && raw.control ? raw.control : raw;
+                    if (!ctrl.matches?.(choiceSel)) continue;
+                    const isAria = ctrl.hasAttribute('role') && !ctrl.matches('input');
+                    const isRadio = (isAria ? ctrl.getAttribute('role') : ctrl.type) === 'radio';
+                    const now = isAria ? ctrl.getAttribute('aria-checked') === 'true' : Boolean(ctrl.checked);
+                    if (f.check === false && isRadio) continue;
+                    if (now !== f.check) safeControlClick(ctrl);
+                    ctrl.style.outline = '2px solid #E0461D';
+                    claimed.add(ctrl);
+                    frameFilled.push({
+                      idx: f._idx,
+                      frameIdx: frameIdxArg,
+                      tag: isAria ? ctrl.getAttribute('role') : `input:${ctrl.type}`,
+                      label: getChoiceOptLabel(ctrl).slice(0, 60),
+                    });
+                    hitAny = true;
+                  }
+                } else if (
                   explicitTargets.length > 0 &&
                   !explicitTargets.some((el) => el.tagName === 'SELECT' || isCustomCombobox(el))
                 ) {
@@ -4052,6 +4097,14 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
         // Ignore dropdown option lookup failures and move on.
       }
     }
+  }
+
+  // Never drop a field silently: anything neither filled nor already reported is listed here.
+  const reported = new Set(skipped.map((e) => e.idx));
+  for (const f of domFields) {
+    if (matchedFieldIndexes.has(f._idx) || reported.has(f._idx)) continue;
+    const hasTarget = Boolean(f.ref || f.selector || f.keys);
+    skipped.push({ idx: f._idx, reason: hasTarget ? 'not-found' : 'no-target' });
   }
 
   if (selectorHandlesToDispose.length > 0) {

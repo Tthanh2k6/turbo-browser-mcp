@@ -493,6 +493,9 @@ export class BrowserManager {
         lastSnapshotLines: new Set(),
         blockedResources: new Set(),
         blockedUrlPatterns: [],
+        presetBlockedReqs: new WeakSet(),
+        presetResources: new Set(),
+        presetUrlSources: new Set(),
         routeHandlerAttached: false,
         cdpSession: null,
       };
@@ -600,6 +603,7 @@ export class BrowserManager {
         const entry = ensureEntryInRing(diag.reqObjToEntry.get(req) ?? this._recordRequest(diag, req));
         entry.ok = false;
         entry.failureText = req.failure()?.errorText || 'failed';
+        if (diag.presetBlockedReqs.has(req)) entry.blockedByPreset = true;
         entry.durationMs = Date.now() - entry.startTime;
       });
 
@@ -1125,9 +1129,35 @@ export class BrowserManager {
     const includeStatic = Boolean(opts.includeStatic);
     const urlMatcher = opts.urlFilter ? compileUrlPattern(opts.urlFilter) : null;
 
+    const blockedByPreset = diag.requests.filter((r) => r.blockedByPreset).length;
+    // Collapse identical entries into one with a count (first occurrence keeps its reqId/ts).
+    const collapse = (list, keyOf) => {
+      const seen = new Map();
+      const out = [];
+      for (const item of list) {
+        const key = keyOf(item);
+        const prev = seen.get(key);
+        if (prev) {
+          prev.count = (prev.count || 1) + 1;
+        } else {
+          const copy = { ...item };
+          seen.set(key, copy);
+          out.push(copy);
+        }
+      }
+      return out;
+    };
+
     const consoleFiltered = level === 'all'
       ? [...diag.console]
-      : diag.console.filter((c) => ERROR_CONSOLE_LEVELS.has(c.level));
+      : collapse(
+          diag.console.filter(
+            (c) =>
+              ERROR_CONSOLE_LEVELS.has(c.level) &&
+              !(blockedByPreset > 0 && /ERR_BLOCKED_BY_CLIENT/.test(c.text))
+          ),
+          (c) => `${c.level} ${c.text}`
+        );
 
     const compactReq = (r) => ({
       reqId: r.reqId,
@@ -1143,7 +1173,13 @@ export class BrowserManager {
 
     const isErrorReq = (r) => r.ok === false || (r.status !== null && r.status >= 400);
     const matchesUrl = (r) => !urlMatcher || urlMatcher.test(r.url);
-    const networkErrors = diag.requests.filter((r) => isErrorReq(r) && matchesUrl(r)).map(compactReq);
+    const reqKey = (r) => `${r.method} ${r.url} ${r.status} ${r.failureText}`;
+    const networkErrors = collapse(
+      diag.requests
+        .filter((r) => isErrorReq(r) && matchesUrl(r) && (statusFilter === 'all' || !r.blockedByPreset))
+        .map(compactReq),
+      reqKey
+    );
 
     const filteredReqs = statusFilter === 'all'
       ? diag.requests.filter((r) => {
@@ -1166,6 +1202,7 @@ export class BrowserManager {
       downloads: [...diag.downloads],
       totalBufferedRequests: diag.requests.length,
     };
+    if (blockedByPreset > 0) snapshot.blockedByPreset = blockedByPreset;
 
     if (opts.savePath) {
       const resolved = resolveSafePath(opts.savePath, 'savePath');
@@ -1199,6 +1236,8 @@ export class BrowserManager {
     if (params.unblockAll || presetName === 'clean') {
       diag.blockedResources.clear();
       diag.blockedUrlPatterns.length = 0;
+      diag.presetResources.clear();
+      diag.presetUrlSources.clear();
       if (diag.routeHandlerAttached) {
         await page.unroute('**/*').catch(() => {});
         diag.routeHandlerAttached = false;
@@ -1223,6 +1262,10 @@ export class BrowserManager {
 
     if (blockResourcesInput.length > 0 || blockUrlsInput.length > 0) {
       for (const r of blockResourcesInput) diag.blockedResources.add(r);
+      if (presetSpec) {
+        for (const r of presetSpec.resources) diag.presetResources.add(r);
+        for (const u of presetSpec.urls) diag.presetUrlSources.add(u);
+      }
       const existingSources = new Set(diag.blockedUrlPatterns.map((p) => p.source));
       for (const src of blockUrlsInput) {
         if (!existingSources.has(src)) {
@@ -1240,6 +1283,13 @@ export class BrowserManager {
             diag.blockedResources.has(resType) ||
             diag.blockedUrlPatterns.some((p) => p.matcher.test(reqUrl))
           ) {
+            // Only our own preset's blocks are hidden from default diagnostics; explicit blocks stay visible.
+            if (
+              diag.presetResources.has(resType) ||
+              diag.blockedUrlPatterns.some((p) => diag.presetUrlSources.has(p.source) && p.matcher.test(reqUrl))
+            ) {
+              diag.presetBlockedReqs.add(req);
+            }
             await route.abort('blockedbyclient').catch(() => {});
             return;
           }

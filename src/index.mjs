@@ -225,7 +225,10 @@ export const TOOL_DEFINITIONS = [
                 description: 'Multiple option values/patterns for <select multiple>.',
               },
               option: { oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }] },
-              check: { oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }] },
+              check: {
+                oneOf: [{ type: 'string' }, { type: 'boolean' }, { type: 'array', items: { type: 'string' } }],
+                description: 'true/false sets a checkbox/radio; label(s) check matching options.',
+              },
               file: { type: 'string' },
               files: { type: 'array', items: { type: 'string' } },
               all: {
