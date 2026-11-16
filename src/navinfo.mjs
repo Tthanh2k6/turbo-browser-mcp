@@ -1,3 +1,5 @@
+import { peekBlocked } from './allow-hosts.mjs';
+
 // Navigation health hints: only emitted when the page is not a plain OK load.
 const BLOCK_TITLE_RES = [
   [/just a moment|attention required|checking your browser|performing security verification/i, 'cloudflare'],
@@ -107,7 +109,7 @@ export async function gotoRetry(page, url, opts) {
   try {
     return { resp: await page.goto(url, opts) };
   } catch (err) {
-    if (!/ERR_ABORTED/.test(String(err?.message || err)) || page.url() !== before) throw err;
+    if (!/ERR_ABORTED/.test(String(err?.message || err)) || page.url() !== before || peekBlocked(page)) throw err;
     await Promise.race([
       page.waitForLoadState('domcontentloaded').catch(() => {}),
       new Promise((r) => setTimeout(r, 1500)),

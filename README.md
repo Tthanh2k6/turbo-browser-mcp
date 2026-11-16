@@ -255,6 +255,20 @@ Limits:
 - The ledger is written only when the call returns. If the call throws after the page already sent the submission (for example a navigation timeout), nothing is recorded. Check the site before re-running.
 - An `expect.selector` that is not a valid selector never matches, so the call reports `submitVerified: false` after the timeout.
 
+### Restricting navigation
+
+By default the server can open any URL. To limit where the browser may go, set `TURBO_BROWSER_ALLOW_HOSTS` (or `--allow-hosts a.com,b.com`; the flag wins over the variable). Each entry matches that host and its subdomains, case-insensitively, and `*.example.com` means the same as `example.com`. Spaces and empty entries are ignored. `TURBO_BROWSER_ALLOW_ORIGINS` (or `--allow-origins`) takes exact origins such as `http://localhost:3000`. When both are set, a URL must pass both. With neither set (or only empty entries) nothing changes: no listeners, no request interception and no extra fields in any result.
+
+What is enforced:
+
+- Every URL you pass in (`tabs_batch` `open`, `open_many` and `navigate`, and `navigate` steps in `batch_actions`) is checked before it loads. A denied URL is not requested and that operation fails with `host not allowed: evil.com (TURBO_BROWSER_ALLOW_HOSTS)`. In `open_many` only the denied URL fails.
+- Main-frame navigations that no URL input started (link clicks, form submits, script redirects, server redirects, including every hop of a redirect chain) are stopped when they target a disallowed host. The server uses CDP `Fetch` limited to document requests, so the cost is one round trip per document request. The page stays where it was, and the next result for that tab carries `"blocked":"host-not-allowed"` once, with the denied address in `url` (`tabs_batch` results) or `blockedUrl` (other tools). If that result already has a boolean `blocked` from the submit guard, it gets `navBlocked` instead.
+- `about:blank`, `data:`, `blob:` and `chrome-error:` are always allowed. `file:` is blocked while a policy is set, as is any scheme other than http and https.
+
+What is not enforced by default: images, scripts, stylesheets, fetch, XHR, WebSocket and other sub-resources load from any host, and iframes are not restricted. This is a navigation allowlist, not a data-exfiltration barrier. Set `TURBO_BROWSER_ALLOW_STRICT=1` (or `--allow-strict`) to also abort sub-resource and iframe requests to disallowed hosts and to wrap `WebSocket`, `EventSource` and `navigator.sendBeacon` in the page. Strict mode is still best effort: page script can restore the original constructors, a document that was already loaded when the guard attached is not wrapped until its next navigation, WebRTC and requests made by service workers or other workers are not covered, and the first request of a popup can start before the guard attaches.
+
+Scope: the guard is installed only on tabs the server opens or acts on. In CDP mode attached to your own Chrome, other tabs are never touched, but a tab you point a tool at (by `tabId`, or the active tab) is guarded from that point on. Treat the setting as a guard rail for an agent, not as a security boundary.
+
 ### Handing a step to a person (`wait_for_human`, `--open-profile`)
 
 Some sites fail their bot check whenever the browser is remote-controlled, so a person has to open the same profile in a normal browser first. turbo-browser-mcp does not try to hide automation: no stealth plugins, no fingerprint or `navigator.webdriver` patching, no CAPTCHA solving. It supports two hand-off flows.
@@ -293,6 +307,9 @@ This reports an action that has already happened. It cannot prevent a commit or 
 | `--tools <all\|core>` | `TURBO_BROWSER_TOOLS` | `all` | `core` lists only `tabs_batch`, `inspect_compact`, `smart_fill_form`, `act_fast`, `batch_actions`, `extract_clean_text` |
 | `--headless` / `--headed` | `TURBO_BROWSER_HEADLESS` | `true` (headless) | Headless or visible browser window (`"false"` for headed) |
 | `--allow-submit` | - | `false` | Turn off the default Submit/Publish guard |
+| `--allow-hosts <a,b>` | `TURBO_BROWSER_ALLOW_HOSTS` | unset | Only navigate to these hosts and their subdomains (see [Restricting navigation](#restricting-navigation)) |
+| `--allow-origins <o,o>` | `TURBO_BROWSER_ALLOW_ORIGINS` | unset | Only navigate to these exact origins; combined with the hosts list when both are set |
+| `--allow-strict` | `TURBO_BROWSER_ALLOW_STRICT` | `false` | With an allowlist, also block sub-resource requests to other hosts |
 | `--doctor` | - | - | Print Node, Playwright, Chromium and CDP diagnostics as JSON |
 | `--bridge` | `TURBO_BROWSER_BRIDGE_PORT` | `9224` | Start or verify the CDP keep-alive bridge for Chrome 144+ `DevToolsActivePort` (see below) |
 | `--launch-chrome` | - | `~/.turbo-browser-mcp/chrome-profile` | Launch Chrome with a dedicated profile and `--remote-debugging-port=9222` |

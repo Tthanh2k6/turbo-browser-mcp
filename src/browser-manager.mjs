@@ -4,6 +4,7 @@ import path from 'node:path';
 import { ensureCdpBridgeDaemon } from './cdp-bridge.mjs';
 import { resolveSafePath } from './dom-engine.mjs';
 import { gotoRetry, navHealth } from './navinfo.mjs';
+import { getPolicy, installGuard, takeBlocked, peekBlocked, urlDenial, denyMessage, matchUrl } from './allow-hosts.mjs';
 
 const firstLine = (err) => String((err && err.message) || err).split(/\r?\n/)[0];
 import {
@@ -509,15 +510,39 @@ export class BrowserManager {
     try {
       pages = ctx.pages();
     } catch {}
-    for (const p of pages) {
-      let frames = [];
-      try {
-        frames = p.frames();
-      } catch {}
-      for (const f of frames) {
-        await f.evaluate(initFn).catch(() => {});
-      }
-    }
+    // Existing tabs in an attached browser can have a blocked main world (an open
+    // alert/confirm, a paused debugger). Evaluate never resolves there, so cap each
+    // frame and run them in parallel: one stuck tab must not hang every tool call.
+    const capMs = Number(process.env.TURBO_BROWSER_INIT_EVAL_MS) || 1500;
+    await Promise.all(
+      pages.map(async (p) => {
+        let frames = [];
+        try {
+          frames = p.frames();
+        } catch {}
+        const results = await Promise.all(
+          frames.map((f) => {
+            let timer;
+            const capped = new Promise((resolve) => {
+              timer = setTimeout(() => resolve('timeout'), capMs);
+            });
+            return Promise.race([f.evaluate(initFn).then(() => 'ok', () => 'error'), capped]).finally(() =>
+              clearTimeout(timer)
+            );
+          })
+        );
+        if (results[0] === 'timeout') this.markPageUnresponsive(p);
+      })
+    );
+  }
+
+  markPageUnresponsive(page) {
+    if (!this._unresponsivePages) this._unresponsivePages = new WeakSet();
+    this._unresponsivePages.add(page);
+  }
+
+  isPageUnresponsive(page) {
+    return !!this._unresponsivePages?.has(page);
   }
 
   _ensureDiagState(page) {
@@ -587,6 +612,12 @@ export class BrowserManager {
     this.pageToId.set(page, tabId);
     if (makeActive || this.activeTabId === null) {
       this.activeTabId = tabId;
+    }
+
+    // Pages in contexts turbo owns are guarded on sight; in CDP mode only pages turbo opens or drives are.
+    if (this.connectionType !== 'cdp') {
+      const policy = getPolicy();
+      if (policy) installGuard(page, policy).catch(() => {});
     }
 
     if (!this.attachedPages.has(page)) {
@@ -766,16 +797,26 @@ export class BrowserManager {
       if (!target || target.isClosed()) {
         throw new Error(`Tab ${tabId} not found or closed.`);
       }
+      await this._guard(target);
       return { tabId, page: target };
     }
 
     if (this.activeTabId !== null && this.tabs.has(this.activeTabId)) {
-      return { tabId: this.activeTabId, page: this.tabs.get(this.activeTabId) };
+      const activePage = this.tabs.get(this.activeTabId);
+      await this._guard(activePage);
+      return { tabId: this.activeTabId, page: activePage };
     }
 
     const page = await this.context.newPage();
+    await this._guard(page);
     const newId = this._registerPage(page, true);
     return { tabId: newId, page };
+  }
+
+  /** Navigation allowlist: no-op unless a policy is set. */
+  async _guard(page) {
+    const policy = getPolicy();
+    if (policy) await installGuard(page, policy);
   }
 
   getSnapshotState(page) {
@@ -788,18 +829,28 @@ export class BrowserManager {
     const results = [];
     for (const [tabId, page] of this.tabs.entries()) {
       let title = '';
+      let timer;
       try {
-        title = await page.title();
+        title = await Promise.race([
+          page.title(),
+          new Promise((resolve) => {
+            timer = setTimeout(() => resolve(''), 1500);
+          }),
+        ]);
       } catch {
         title = '';
+      } finally {
+        clearTimeout(timer);
       }
-      results.push({
+      const entry = {
         tabId,
         url: page.url(),
         title,
         active: tabId === this.activeTabId,
         isolatedContext: this.tabContextName.get(tabId) || 'default',
-      });
+      };
+      if (this.isPageUnresponsive(page)) entry.unresponsive = true;
+      results.push(entry);
     }
     return results;
   }
@@ -899,9 +950,14 @@ export class BrowserManager {
           const slice = urls.slice(i, i + concurrency);
           const chunkResults = await Promise.all(
             slice.map(async (targetUrl) => {
+              const denied = urlDenial(targetUrl);
+              if (denied) {
+                return { tabId: null, isolatedContext: ctxName, url: targetUrl, title: '', ok: false, error: denied };
+              }
               const page = await ctx.newPage();
               const tabId = this._registerPage(page, false, ctxName);
               try {
+                await this._guard(page);
                 const resp = await page.goto(targetUrl, navOpts);
                 const title = await page.title().catch(() => '');
                 return {
@@ -913,16 +969,18 @@ export class BrowserManager {
                   ...(await navHealth(page, resp, targetUrl, title, { waitUntil: navOpts.waitUntil })),
                 };
               } catch (err) {
+                const stopped = takeBlocked(page);
                 await page.close().catch(() => {});
                 this.tabs.delete(tabId);
                 this.tabContextName.delete(tabId);
                 return {
                   tabId: null,
                   isolatedContext: ctxName,
-                  url: targetUrl,
+                  url: stopped ? stopped.url : targetUrl,
                   title: '',
                   ok: false,
-                  error: String(err?.message || err),
+                  error: stopped ? denyMessage(matchUrl(stopped.url, getPolicy())) : String(err?.message || err),
+                  ...(stopped ? { blocked: 'host-not-allowed' } : {}),
                 };
               }
             })
@@ -947,6 +1005,13 @@ export class BrowserManager {
       }
 
       if (action === 'open') {
+        const denied = op.url ? urlDenial(op.url) : null;
+        if (denied) {
+          if (ops.length === 1) throw new Error(denied);
+          results.push({ action: 'open', ok: false, url: op.url, error: denied });
+          failedOpen = true;
+          continue;
+        }
         const prevActiveTabId = this.activeTabId;
         const { name: ctxName, ctx } = await this._getOrCreateContext(op.isolatedContext);
         const page = await ctx.newPage();
@@ -960,12 +1025,13 @@ export class BrowserManager {
         let openResp = null;
         if (op.url) {
           try {
+            await this._guard(page);
             openResp = await page.goto(op.url, {
               waitUntil: op.waitUntil || 'domcontentloaded',
               timeout: op.timeoutMs || this.defaultTimeoutMs,
             });
           } catch (err) {
-            if (err && err.name === 'TimeoutError') {
+            if (err && err.name === 'TimeoutError' && !peekBlocked(page)) {
               // The page is usually usable after a slow load: keep the tab and say so.
               results.push({
                 action: 'open',
@@ -979,6 +1045,8 @@ export class BrowserManager {
               });
               continue;
             }
+            const stopped = takeBlocked(page);
+            if (stopped) err = new Error(denyMessage(matchUrl(stopped.url, getPolicy())));
             await page.close().catch(() => {});
             this.tabs.delete(tabId);
             this.tabContextName.delete(tabId);
@@ -987,7 +1055,7 @@ export class BrowserManager {
                 ? prevActiveTabId
                 : ([...this.tabs.keys()].pop() ?? null);
             if (ops.length === 1) throw err; // a lone failing open keeps rejecting, as before
-            results.push({ action: 'open', ok: false, url: op.url, error: firstLine(err) });
+            results.push({ action: 'open', ok: false, url: stopped ? stopped.url : op.url, error: firstLine(err), ...(stopped ? { blocked: 'host-not-allowed' } : {}) });
             failedOpen = true;
             continue;
           }
@@ -1015,8 +1083,13 @@ export class BrowserManager {
           results.push({ action: 'navigate', ok: false, skipped: true, error: 'skipped: the earlier open failed and no tabId was given' });
           continue;
         }
-        const { tabId, page } = await this.getPage(op.tabId);
         if (!op.url) throw new Error('navigate action requires url.');
+        const navDenied = urlDenial(op.url);
+        if (navDenied) {
+          results.push({ action: 'navigate', ok: false, url: op.url, error: navDenied });
+          continue;
+        }
+        const { tabId, page } = await this.getPage(op.tabId);
         let navResp, navRetried;
         try {
           ({ resp: navResp, retried: navRetried } = await gotoRetry(page, op.url, {
@@ -1024,14 +1097,16 @@ export class BrowserManager {
             timeout: op.timeoutMs || this.defaultTimeoutMs,
           }));
         } catch (err) {
+          const stopped = takeBlocked(page);
           results.push({
             action: 'navigate',
             tabId,
             ok: false,
-            ...(err && err.name === 'TimeoutError' ? { timedOut: true } : {}),
-            url: page.url(),
+            ...(err && err.name === 'TimeoutError' && !stopped ? { timedOut: true } : {}),
+            url: stopped ? stopped.url : page.url(),
             title: await page.title().catch(() => ''),
-            error: firstLine(err),
+            error: stopped ? denyMessage(matchUrl(stopped.url, getPolicy())) : firstLine(err),
+            ...(stopped ? { blocked: 'host-not-allowed' } : {}),
           });
           continue;
         }

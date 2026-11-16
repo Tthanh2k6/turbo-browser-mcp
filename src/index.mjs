@@ -27,6 +27,7 @@ import {
   smartFillFormGuarded,
 } from './dom-engine.mjs';
 import { takeLate } from './aftermath.mjs';
+import { getPolicy, takeBlocked } from './allow-hosts.mjs';
 import { waitForHuman } from './guards.mjs';
 
 // Read from package.json so --version, --doctor and serverInfo never drift from the published version.
@@ -591,6 +592,21 @@ export async function dispatchToolCall(manager, name, rawArgs = {}) {
     res.text = res.text.startsWith('{') ? `{"late":${JSON.stringify(late)}${res.text[1] === '}' ? '' : ','}${res.text.slice(1)}` : `late: ${late}
 ${res.text}`;
   }
+  if (getPolicy() && lateTab && res && typeof res.text === 'string') {
+    const b = takeBlocked(lateTab);
+    if (b && !res.text.includes('"blocked":"host-not-allowed"')) {
+      let obj = null;
+      if (res.text.startsWith('{')) { try { obj = JSON.parse(res.text); } catch { obj = null; } }
+      if (obj && typeof obj === 'object') {
+        // Rare path: parse and re-emit so a result that already has a boolean "blocked" (submit guard) keeps one key.
+        const { blocked: prior, ...rest } = obj;
+        res.text = JSON.stringify(prior ? { ...obj, navBlocked: 'host-not-allowed', blockedUrl: b.url } : { blocked: 'host-not-allowed', blockedUrl: b.url, ...rest });
+      } else {
+        res.text = `blocked: host-not-allowed ${b.url}
+${res.text}`;
+      }
+    }
+  }
   const note = typeof manager.takeConnectionNote === 'function' ? manager.takeConnectionNote() : '';
   if (note && res && typeof res.text === 'string') {
     res.text = res.text.startsWith('{')
@@ -1032,6 +1048,8 @@ const VALUE_FLAG_ENV = {
   '--timeout': 'TURBO_BROWSER_TIMEOUT_MS',
   '--url': 'TURBO_BROWSER_OPEN_URL',
   '--tools': 'TURBO_BROWSER_TOOLS',
+  '--allow-hosts': 'TURBO_BROWSER_ALLOW_HOSTS',
+  '--allow-origins': 'TURBO_BROWSER_ALLOW_ORIGINS',
 };
 
 const HELP_TEXT = `turbo-browser-mcp v${SERVER_INFO.version} — Fast, token-efficient Playwright MCP server
@@ -1057,6 +1075,9 @@ Options:
   --headless                 Run Chromium headless (default)
   --headed                   Show Chromium browser window
   --allow-submit             Allow Submit/Publish clicks without explicit allowSubmit=true
+  --allow-hosts <a,b>        Only allow navigation to these hosts and their subdomains (TURBO_BROWSER_ALLOW_HOSTS)
+  --allow-origins <o,o>      Only allow these exact origins, e.g. http://localhost:3000 (TURBO_BROWSER_ALLOW_ORIGINS)
+  --allow-strict             With an allowlist, also block sub-resource requests to other hosts
 
 Example MCP config:
   {
@@ -1102,6 +1123,8 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
       out.envOverrides.TURBO_BROWSER_HEADLESS = 'true';
     } else if (flag === '--headed') {
       out.envOverrides.TURBO_BROWSER_HEADLESS = 'false';
+    } else if (flag === '--allow-strict') {
+      out.envOverrides.TURBO_BROWSER_ALLOW_STRICT = '1';
     } else if (flag === '--allow-submit') {
       out.envOverrides.TURBO_BROWSER_ALLOW_SUBMIT = 'true';
     } else if (Object.prototype.hasOwnProperty.call(VALUE_FLAG_ENV, flag)) {

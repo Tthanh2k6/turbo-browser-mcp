@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import { gotoRetry, navHealth } from './navinfo.mjs';
+import { urlDenial, peekBlocked, denyMessage, matchUrl, getPolicy } from './allow-hosts.mjs';
 import { observeClickAftermath, watchActivity } from './aftermath.mjs';
 import path from 'node:path';
 import {
@@ -6602,9 +6603,19 @@ async function batchActionsCore(page, stepList, options, previousLinesSet, guard
             step.body !== undefined || step.postData !== undefined) {
           throw new Error('navigate supports GET only, without a request body.');
         }
-        const { resp: navResp, retried: navRetried } = await gotoRetry(page, url.href, {
-          waitUntil: 'domcontentloaded', timeout: Number(step.timeoutMs) || DEFAULT_TIMEOUT_MS,
-        });
+        const denied = urlDenial(url.href);
+        if (denied) throw new Error(denied);
+        let navResp, navRetried;
+        try {
+          ({ resp: navResp, retried: navRetried } = await gotoRetry(page, url.href, {
+            waitUntil: 'domcontentloaded', timeout: Number(step.timeoutMs) || DEFAULT_TIMEOUT_MS,
+          }));
+        } catch (navErr) {
+          // A redirect to a disallowed host: the record stays on the page so the tool result reports it once.
+          const stopped = peekBlocked(page);
+          if (stopped) throw new Error(denyMessage(matchUrl(stopped.url, getPolicy())));
+          throw navErr;
+        }
         const navTitle = await page.title().catch(() => '');
         stepResult = { ok: true, action: 'navigate', url: page.url(), ...(navRetried ? { retried: navRetried } : {}), ...(await navHealth(page, navResp, url.href, navTitle)) };
         lastNavBad = stepResult.blocked ? `page blocked (${stepResult.blocked})` : stepResult.status >= 400 ? `page status ${stepResult.status}` : '';
