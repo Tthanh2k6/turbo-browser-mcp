@@ -227,9 +227,18 @@ v0.5.0 added `wait_for_human` and the commit-safety parameters for about 160 tok
 
 [`benchmarks/E2E_COMPARISON.md`](benchmarks/E2E_COMPARISON.md) runs a fixed script against a Korean-language contest wizard (6 fields, a `다음` step, a `확인` inside a modal, a receipt page). One action per call with a full ARIA snapshot after each takes 9 calls and 32,942 cumulative context tokens. `inspect_compact` plus one `batch_actions` call with `expect` takes 2 calls and 1,430 tokens, and confirms the receipt number itself. The same file covers the commit-safety cases.
 
-### Agent benchmark against other browser stacks (in progress)
+### Agent benchmark against other browser stacks (stage 1)
 
-[`benchmarks/e2e-agent/`](benchmarks/e2e-agent/) gives a coding agent three tasks on local fixture sites (a job application with a file upload, a catalog search, a booking with a confirmation step) and runs it with each stack: turbo-browser-mcp, agent-browser, browse and browser-use. A separate script checks each result on the server side, and the runner records model tokens and wall time. The plan and success checks are in [`benchmarks/E2E_PLAN.md`](benchmarks/E2E_PLAN.md). Results will be added here once every stack has finished all three tasks. Until then, the numbers above say nothing about how this server compares with those tools in a full agent run.
+[`benchmarks/e2e-agent/`](benchmarks/e2e-agent/) gives a coding agent three tasks on local fixture sites (a job application with a file upload, a catalog search over several pages, a booking with a draft step and a confirmation) and runs it with each stack. The fixture server decides success: one committed record with the right fields and file bytes, and a receipt in the answer that matches it. Host agent: Claude Code with Claude Sonnet 5.5, one trial per cell, 16 Nov 2026.
+
+| Stack | Tasks passed | Turns | Cost (USD) | Seconds |
+| --- | :---: | ---: | ---: | ---: |
+| turbo-browser-mcp 0.6.1 (headless) | 3/3 | 42 | 0.395 | 85.8 |
+| agent-browser 0.43.0 (headless) | 3/3 | 33 | 0.440 | 196.8 |
+| browse 0.0.17 (headed Chrome, extension) | 3/3 | 20 | 0.237 | 118.6 |
+| browser-use 1.0.5 (headed Chrome) | 3/3 | 33 | 0.344 | 120.6 |
+
+Every stack passed every task. turbo-browser-mcp was fastest in total and browse was cheapest. One trial per cell is not enough to rank them, and the headless and headed browsers are not equally fast. The application task cost turbo-browser-mcp 23 turns, the most of any trial; that is being looked into. Per-task numbers, how tokens are counted, and the harness fixes made during the run are in [`benchmarks/E2E_RESULTS.md`](benchmarks/E2E_RESULTS.md).
 
 ## Comparison with `@playwright/mcp` and `chrome-devtools-mcp`
 
@@ -375,6 +384,7 @@ CI runs the tests on Ubuntu with Node 20 and 22.
 
 - Portaled comboboxes (react-select, Radix, Headless UI style) have a click path and a keyboard fallback that searches up to 100 options and checks the committed value. Virtualized lists beyond the included fixtures still need testing against real apps.
 - Sites with bot detection may need `wait_for_human` and a person to pass the check in the same browser. The server does not bypass those checks.
+- The agent benchmark has one trial per stack and task so far; the ten-trial protocol in `benchmarks/E2E_PLAN.md` has not been run.
 - The network guard and click aftermath only watch a short window after each action, and do not inspect WebSocket messages or service-worker requests. Details are under [commit checks](#commit-checks-expect-submissionkey-modal-and-network-guards).
 - Closed Shadow roots that existed before the server attached to a tab cannot be reached through the hook. Actions there fall back to frame handles, coordinates and keyboard input.
 

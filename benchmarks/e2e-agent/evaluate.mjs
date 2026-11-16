@@ -8,7 +8,9 @@ export function evaluate(task, state, finalAnswer) {
   const reasons = [];
   if (task === 'catalog') {
     let rows; try { rows = JSON.parse(answer); } catch { reasons.push('Last line is not JSON'); }
-    if (!isDeepStrictEqual(rows, state.expectedRows)) reasons.push('Rows must exactly match all 37 rows, sorted by id, with numeric prices');
+    // The task prompt does not say prices must be JSON numbers, so a numeric string such as "25.75" is accepted.
+    if (Array.isArray(rows)) rows = rows.map(r => (r && typeof r.price === 'string' && /^\d+(\.\d+)?$/.test(r.price.trim())) ? { ...r, price: Number(r.price) } : r);
+    if (!isDeepStrictEqual(rows, state.expectedRows)) reasons.push('Rows must exactly match all 37 rows, sorted by id, with prices equal to the listed values');
     if (state.writes !== 0) reasons.push('Catalog task performed writes');
   } else if (task === 'application' || task === 'booking') {
     const s = state[task], r = s.records[0];

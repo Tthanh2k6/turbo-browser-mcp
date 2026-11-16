@@ -32,6 +32,10 @@ self-test reproducibly regenerates both files.
 .\benchmarks\e2e-agent\install-stacks.ps1
 .\benchmarks\e2e-agent\run.ps1 -CodexPath 'C:\path\codex.exe' -Model 'YOUR_MODEL' -Reasoning medium -ChromiumPath 'C:\Program Files\Google\Chrome\Application\chrome.exe' -SetupHook 'D:\dev\bench-tmp\setup.ps1'
 node benchmarks/e2e-agent/report.mjs
+# Claude Code as the host agent instead of Codex (used for E2E_RESULTS.md); BENCH_STACKS / BENCH_ONLY pick cells:
+node benchmarks/e2e-agent/runner.mjs --claude 'C:\path\claude.exe' --model sonnet --hook 'D:\dev\bench-tmp\setup.ps1' --results results_claude
+# Re-score saved answers against saved server evidence and merge result folders (no model calls):
+node benchmarks/e2e-agent/rescore.mjs results_claude_all.jsonl results_claude
 # After closing benchmark browsers and daemons:
 .\benchmarks\e2e-agent\uninstall-stacks.ps1
 ```
