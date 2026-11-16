@@ -10,6 +10,7 @@ import { dispatchToolCall } from '../src/index.mjs';
 let server, base, manager, page, workDir;
 const requests = [];
 before(async () => {
+  fs.mkdirSync(path.resolve('tmp'), { recursive: true });
   workDir = fs.mkdtempSync(path.resolve('tmp/brief-07-'));
   server = http.createServer((req, res) => {
     requests.push({ url: req.url, method: req.method });
