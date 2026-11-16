@@ -19,6 +19,7 @@ import {
 import {
   actFast,
   batchActions,
+  cleanErrorMessage,
   capturePage,
   evaluateJs,
   extractCleanText,
@@ -833,7 +834,7 @@ export function createJsonRpcHandler(manager) {
             jsonrpc: '2.0',
             id,
             result: {
-              content: [{ type: 'text', text: String(err?.message || err) }],
+              content: [{ type: 'text', text: cleanErrorMessage(err?.message || err) }],
               isError: true,
             },
           };

@@ -429,10 +429,23 @@ function closestOptions(wanted, options, limit = 5) {
 }
 
 // Playwright's click failure carries a long call log; keep the covering element, one line.
+// Strip ANSI escapes and Playwright's "Call log:" block: keep the first line plus at most one detail line.
+const ANSI_RE = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
+export function cleanErrorMessage(raw) {
+  const msg = String(raw ?? '').replace(ANSI_RE, '');
+  const at = msg.search(/\r?\n\s*Call log:/i);
+  if (at < 0) return msg;
+  const head = msg.slice(0, at).trim();
+  const log = msg.slice(at).split(/\r?\n/).slice(1).map((l) => l.replace(/^\s*-\s*/, '').trim()).filter(Boolean);
+  const detail = log.length ? log[log.length - 1].slice(0, 160) : '';
+  return detail ? `${head}\n${detail}` : head;
+}
+
 function conciseActionError(err) {
-  const msg = String(err?.message || err);
-  const m = /(<.{3,300}?>)[^\r\n]*?\s+intercepts pointer events/.exec(msg);
-  if (!m) return err;
+  const raw = String(err?.message || err);
+  const msg = cleanErrorMessage(raw);
+  const m = /(<.{3,300}?>)[^\r\n]*?\s+intercepts pointer events/.exec(raw.replace(ANSI_RE, ''));
+  if (!m) return msg === raw ? err : new Error(msg);
   const covering = m[1].replace(/\s+/g, ' ').slice(0, 140);
   return new Error(`Click blocked: ${covering} covers the target. Close or scroll it away, or act on it, then retry.`);
 }
@@ -2129,6 +2142,57 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
  * radios/checkboxes, open Shadow DOM fields, Gmail compose dialogs, iframe fields,
  * and direct disk file inputs.
  */
+// Late hydration can replace a field right after we filled it. On a young page, wait briefly, re-check each text
+// fill (marked data-tbm-fill) and refill once the ones whose element vanished or lost its value.
+const RECHECK_SETTLE_MS = 350;
+async function recheckFilled(page, spec, filled) {
+  const textFills = filled.filter((e) => e && e.value !== undefined && ['input', 'textarea', 'contenteditable'].includes(e.tag));
+  if (textFills.length === 0) return 0;
+  const frames = getAllFrames(page);
+  const frameOf = (e) => frames.find((f) => f.frameIdx === e.frameIdx)?.frame;
+  const probe = (frame) =>
+    Promise.race([
+      frame.evaluate(() => document.readyState !== 'complete' || performance.now() < 3000).catch(() => false),
+      new Promise((r) => setTimeout(() => r(false), 300)),
+    ]);
+  const fills = [...new Set(textFills.map(frameOf).filter(Boolean))];
+  const young = (await Promise.all(fills.map(probe))).some(Boolean);
+  if (!young) return 0;
+  await new Promise((r) => setTimeout(r, RECHECK_SETTLE_MS));
+  const bad = new Set();
+  for (const e of textFills) {
+    const frame = frameOf(e);
+    if (!frame) continue;
+    const ok = await frame
+      .evaluate((idx) => {
+        const els = [...document.querySelectorAll(`[data-tbm-fill="${idx}"]`)];
+        if (els.length === 0) return false;
+        return els.every((el) => el.isConnected && String(el.isContentEditable ? el.textContent : el.value ?? '').trim() !== '');
+      }, String(e.idx))
+      .catch(() => true);
+    if (!ok) bad.add(e.idx);
+  }
+  if (bad.size === 0) return 0;
+  const idxs = [...bad];
+  const sub = await smartFillForm(page, {
+    ...spec,
+    fields: idxs.map((i) => spec.fields[i]),
+    overwrite: false,
+    main: undefined,
+    gmail: undefined,
+    returnSnapshot: false,
+    _noRecheck: true,
+  });
+  let n = 0;
+  for (const e of sub.filled || []) {
+    const orig = idxs[e.idx];
+    for (let k = filled.length - 1; k >= 0; k--) if (filled[k].idx === orig && filled[k].tag === e.tag) filled.splice(k, 1);
+    filled.push({ ...e, idx: orig });
+    n++;
+  }
+  return n;
+}
+
 export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
   const t0 = Date.now();
   const frames = getAllFrames(page);
@@ -3438,6 +3502,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                 continue;
               }
               claimed.add(el);
+              try { el.setAttribute('data-tbm-fill', String(f._idx)); } catch { /* ignore */ }
               frameFilled.push({
                 idx: f._idx,
                 frameIdx: frameIdxArg,
@@ -4670,6 +4735,8 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
     }
   }
 
+  const refilled = spec._noRecheck ? 0 : await recheckFilled(page, spec, filled);
+
   const output = {
     filledCount: filled.length,
     filled,
@@ -4677,6 +4744,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
     leftover: [...leftoverSet].slice(0, 12),
     stoppedBeforeSubmit: spec.stopBeforeSubmit !== false,
     submitButtons,
+    ...(refilled > 0 ? { refilled } : {}),
     elapsedMs: Date.now() - t0,
   };
 
@@ -5098,6 +5166,32 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
             }
           }
           if (foundVisible) break;
+        }
+        if (!foundVisible && !params.selector && typeof params.text === 'string') {
+          // No visible text matched: fall back to a placeholder, aria-label or value (e.g. "Add a comment").
+          const needles = (altMode ? textAlts : [params.text]).map((x) => x.toLowerCase());
+          for (const f of scopedFrames) {
+            const hit = await f.frame
+              .evaluate((ns) => {
+                for (const el of document.querySelectorAll('[placeholder],[aria-label],input[value],textarea')) {
+                  const hay = `${el.getAttribute('placeholder') || ''}
+${el.getAttribute('aria-label') || ''}
+${el.value || ''}`.toLowerCase();
+                  const n = ns.find((x) => hay.includes(x));
+                  if (!n) continue;
+                  const r = el.getBoundingClientRect();
+                  const st = getComputedStyle(el);
+                  if (r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none') return n;
+                }
+                return '';
+              }, needles)
+              .catch(() => '');
+            if (hit) {
+              foundVisible = true;
+              if (altMode) matchedAlt = textAlts.find((x) => x.toLowerCase() === hit);
+              break;
+            }
+          }
         }
         if (foundVisible) break;
         await page.waitForTimeout(50);
@@ -5886,6 +5980,8 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
   }
 
   if (action === 'click' || action === 'dblclick') {
+    const disabledLabel = await disabledTargetLabel(locator);
+    if (disabledLabel) throw new Error(`target is disabled (${disabledLabel})`);
     let isSafeLocatorClick = false;
     let isSafePointClick = false;
     let safePointCoords = null;
@@ -6354,6 +6450,27 @@ export async function smartFillFormGuarded(page, spec = {}, previousLinesSet = n
   return res;
 }
 
+// A disabled target never becomes clickable by waiting 8 s: allow ~1.2 s for it to enable, then fail with one line.
+async function disabledTargetLabel(locator, waitMs = 1200) {
+  const probe = () =>
+    locator
+      .evaluate((el) => {
+        const off = el.matches?.(':disabled') || el.getAttribute('aria-disabled') === 'true';
+        if (!off) return null;
+        const name = (el.getAttribute('aria-label') || el.innerText || el.value || el.getAttribute('placeholder') || el.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+        const role = el.getAttribute('role') || el.tagName.toLowerCase();
+        return name ? `${role} '${name}'` : role;
+      }, undefined, { timeout: 1000 })
+      .catch(() => null);
+  let label = await probe();
+  const t0 = Date.now();
+  while (label && Date.now() - t0 < waitMs) {
+    await new Promise((r) => setTimeout(r, 150));
+    label = await probe();
+  }
+  return label;
+}
+
 export async function actFast(page, params = {}, previousLinesSet = null) {
   const t0 = Date.now();
   const allowSubmit = resolveAllowSubmit(params.allowSubmit);
@@ -6506,13 +6623,13 @@ async function batchActionsCore(page, stepList, options, previousLinesSet, guard
         };
       }
     } catch (err) {
-      results.push({ step: i, ok: false, action: step?.action, error: err.message });
+      results.push({ step: i, ok: false, action: step?.action, error: cleanErrorMessage(err.message) });
       if (!continueOnError) {
         return {
           completed: i,
           total: stepList.length,
           blocked: false,
-          error: err.message,
+          error: cleanErrorMessage(err.message),
           elapsedMs: Date.now() - t0,
           results,
         };

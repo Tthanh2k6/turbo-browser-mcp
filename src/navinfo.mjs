@@ -27,24 +27,25 @@ const SPLASH_RE = /^(loading|thinking|please wait|just a moment|đang tải|vui 
  * "Loading..."/"Thinking" label. Waits up to maxMs for the text to grow; returns the ms waited, 0 when not a splash.
  */
 export async function settleSplash(page, maxMs = 3000) {
+  const t0 = Date.now();
+  const left = () => Math.max(0, maxMs - (Date.now() - t0));
   const read = () =>
     Promise.race([
       page.evaluate(() => {
         const t = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
         return { len: t.length, text: t.slice(0, 40), scripts: document.querySelectorAll('script[src]').length };
       }),
-      new Promise((r) => setTimeout(() => r(null), 300)),
+      new Promise((r) => setTimeout(() => r(null), Math.min(300, left()))),
     ]).catch(() => null);
   const first = await read();
   if (!first || first.len >= 80) return 0;
   if (!(first.len === 0 ? first.scripts > 0 : SPLASH_RE.test(first.text))) return 0;
-  const t0 = Date.now();
-  while (Date.now() - t0 < maxMs) {
-    await new Promise((r) => setTimeout(r, 100));
+  while (left() > 0) {
+    await new Promise((r) => setTimeout(r, Math.min(100, left())));
     const cur = await read();
     if (cur && cur.len >= 80) break;
   }
-  return Date.now() - t0;
+  return Math.min(maxMs, Date.now() - t0);
 }
 
 /** Build { status?, finalUrl?, blocked?, settledMs? } for a finished goto. Empty object in the OK case. */
