@@ -3,11 +3,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { ensureCdpBridgeDaemon } from './cdp-bridge.mjs';
 import { resolveSafePath } from './dom-engine.mjs';
-import { navHealth } from './navinfo.mjs';
+import { gotoRetry, navHealth } from './navinfo.mjs';
 
 const firstLine = (err) => String((err && err.message) || err).split(/\r?\n/)[0];
 import {
   loadPlaywright,
+  cdpConnectWaitMs,
+  hasDevToolsActivePort,
   resolveActiveCdpEndpoint,
   resolveChromiumExecutable,
 } from './playwright-loader.mjs';
@@ -190,6 +192,13 @@ export class BrowserManager {
 
     if (this.mode === 'cdp' || (this.mode === 'auto' && activeCdpEndpoint)) {
       let targetEndpoint = activeCdpEndpoint || this.cdpUrl;
+      // Chrome 144+ shows an Allow prompt on the first connect: give a person time to click it.
+      const human = this.mode === 'auto' && Boolean(activeCdpEndpoint) && /^wss?:/.test(activeCdpEndpoint) &&
+        hasDevToolsActivePort(this.userDataDir, this.cdpUrl);
+      const waitMs = cdpConnectWaitMs({ optionMs: this.cdpAutoTimeoutMs, human });
+      if (human) process.stderr.write(`waiting for 'Allow' in Chrome (up to ${Math.round(waitMs / 1000)} s)
+`);
+      let bridgeTimedOut = false;
       const inNodeTest = this.useBridge ? false : Boolean(process.env.NODE_TEST_CONTEXT) || process.execArgv.includes('--test');
       if (
         !inNodeTest &&
@@ -197,9 +206,9 @@ export class BrowserManager {
         (targetEndpoint.startsWith('ws://') || targetEndpoint.startsWith('wss://'))
       ) {
         const bridged = await ensureCdpBridgeDaemon(targetEndpoint, {
-          timeoutMs: this.mode === 'auto' ? 12000 : Math.max(this.defaultTimeoutMs, 30000),
+          timeoutMs: this.mode === 'auto' ? Math.max(12000, human ? waitMs + 2000 : 0) : Math.max(this.defaultTimeoutMs, 30000),
           ...(this.bridgePort ? { bridgePort: this.bridgePort } : {}),
-          onNote: (n) => this._note(n),
+          onNote: (n) => { if (/did not start/.test(n)) bridgeTimedOut = true; this._note(n); },
         });
         if (bridged) {
           targetEndpoint = bridged;
@@ -208,7 +217,8 @@ export class BrowserManager {
       try {
         // auto falls back to launch, so it must not wait the full 20 s for a permission prompt nobody answers.
         this.browser = await chromium.connectOverCDP(targetEndpoint, {
-          timeout: this.mode === 'auto' ? Math.min(this.cdpAutoTimeoutMs || 10000, 15000) : Math.max(this.defaultTimeoutMs, 20000),
+          // After a bridge that waited the full Allow window, a direct retry would only prompt again: keep it short.
+          timeout: this.mode === 'auto' ? (bridgeTimedOut ? 3000 : Math.min(waitMs, 60000)) : Math.max(this.defaultTimeoutMs, 20000),
         });
         this.connectionNote = '';
         this.context = this.browser.contexts()[0] ?? (await this.browser.newContext());
@@ -217,7 +227,7 @@ export class BrowserManager {
         if (this.mode === 'auto') {
           const m = String(err?.message || err);
           this._note(/timeout/i.test(m)
-            ? `cdp: no response within ${Math.round((this.cdpAutoTimeoutMs || 10000) / 1000)}s (Chrome may be waiting for 'Allow remote debugging')`
+            ? `cdp: no response within ${Math.round(waitMs / 1000)}s (Chrome may be waiting for 'Allow remote debugging')`
             : `cdp: ${m.slice(0, 120).split(String.fromCharCode(10))[0]}`);
         }
         if (this.mode === 'cdp') {
@@ -1007,12 +1017,12 @@ export class BrowserManager {
         }
         const { tabId, page } = await this.getPage(op.tabId);
         if (!op.url) throw new Error('navigate action requires url.');
-        let navResp;
+        let navResp, navRetried;
         try {
-          navResp = await page.goto(op.url, {
+          ({ resp: navResp, retried: navRetried } = await gotoRetry(page, op.url, {
             waitUntil: op.waitUntil || 'domcontentloaded',
             timeout: op.timeoutMs || this.defaultTimeoutMs,
-          });
+          }));
         } catch (err) {
           results.push({
             action: 'navigate',
@@ -1032,6 +1042,7 @@ export class BrowserManager {
           tabId,
           url: page.url(),
           title: navTitle,
+          ...(navRetried ? { retried: navRetried } : {}),
           ...(await navHealth(page, navResp, op.url, navTitle, { waitUntil: op.waitUntil })),
         });
         continue;

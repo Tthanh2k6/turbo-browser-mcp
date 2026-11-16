@@ -97,3 +97,21 @@ export async function navHealth(page, response, requestedUrl, title, opts = {}) 
   if (blocked) out.blocked = blocked;
   return out;
 }
+
+/**
+ * page.goto with one retry when the load is cancelled (net::ERR_ABORTED) and the tab did not move:
+ * a beforeunload/navigation race on the old page, not a real failure. Returns { resp, retried? }.
+ */
+export async function gotoRetry(page, url, opts) {
+  const before = page.url();
+  try {
+    return { resp: await page.goto(url, opts) };
+  } catch (err) {
+    if (!/ERR_ABORTED/.test(String(err?.message || err)) || page.url() !== before) throw err;
+    await Promise.race([
+      page.waitForLoadState('domcontentloaded').catch(() => {}),
+      new Promise((r) => setTimeout(r, 1500)),
+    ]);
+    return { resp: await page.goto(url, opts), retried: 1 };
+  }
+}

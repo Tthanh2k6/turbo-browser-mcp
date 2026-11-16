@@ -57,6 +57,16 @@ export function watchActivity(page) {
   };
 }
 
+// A navigation or mutating request that lands after a click already returned navigated:false is parked here
+// (one line per page) and attached once to the next tool result on that tab.
+const lateNotes = new WeakMap();
+const LATE_MS = 2000;
+export function takeLate(page) {
+  const n = page && lateNotes.get(page);
+  if (n) lateNotes.delete(page);
+  return n || '';
+}
+
 // Observation only: this cannot undo a request or establish submission success.
 export function observeClickAftermath(page) {
   const beforeUrl = page.url();
@@ -83,16 +93,41 @@ export function observeClickAftermath(page) {
   };
   page.on('request', onRequest);
   page.on('framenavigated', onNavigation);
+  let late = false, lateTimer = null;
+  const detach = () => {
+    clearTimeout(lateTimer);
+    page.off('request', onRequest);
+    page.off('framenavigated', onNavigation);
+    page.off('request', onLateRequest);
+    page.off('framenavigated', onLateNav);
+  };
+  const park = (text) => { if (!lateNotes.has(page)) lateNotes.set(page, text); detach(); };
+  const pathOf = (u) => { try { return new URL(u).pathname; } catch { return u; } };
+  const onLateNav = (frame) => { if (frame === page.mainFrame() && pathChanged(frame.url())) park(`navigated to ${pathOf(frame.url())}`); };
+  const onLateRequest = (request) => {
+    if (/^(POST|PUT|PATCH|DELETE)$/.test(request.method()) && ['fetch', 'xhr'].includes(request.resourceType())) park(`${request.method()} ${pathOf(request.url())}`);
+  };
   return {
     async finish(result, allowSubmit) {
       if (!result || result.blocked) return;
       const unexpectedSubmit = !allowSubmit && (navigated || mutatingRequests.some((r) => r.finalSubmit));
-      result.aftermath = { beforeUrl, afterUrl: page.url(), navigated, mutatingRequests, unexpectedSubmit };
+      result.aftermath = { beforeUrl, afterUrl: page.url(), navigated, mutatingRequests: [...mutatingRequests], unexpectedSubmit };
+      if (!navigated && !unexpectedSubmit) {
+        // Keep listening after the result is built, without delaying it.
+        late = true;
+        page.off('request', onRequest);
+        page.off('framenavigated', onNavigation);
+        page.on('request', onLateRequest);
+        page.on('framenavigated', onLateNav);
+        lateTimer = setTimeout(detach, LATE_MS);
+        lateTimer.unref?.();
+      }
       if (unexpectedSubmit) {
         result.aftermath.warning = 'Possible final submit observed despite allowSubmit=false. The action already occurred; inspect the result before retrying.';
       }
     },
     remove() {
+      if (late) return; // late listeners detach themselves after LATE_MS
       page.off('request', onRequest);
       page.off('framenavigated', onNavigation);
     },

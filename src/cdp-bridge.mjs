@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { spawn, execSync } from 'node:child_process';
+import { spawn, execSync, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -557,6 +557,35 @@ export async function stopBridge(bridgePort = DEFAULT_BRIDGE_PORT, host = '127.0
 }
 
 /**
+ * A bridge from older code has no /shutdown route. Stop it only when the process that listens on the port
+ * provably is our daemon (command line has cdp-bridge.mjs, --daemon and --port <port>). Returns true when it is gone.
+ */
+export async function killVerifiedStaleBridge(bridgePort = DEFAULT_BRIDGE_PORT, host = '127.0.0.1') {
+  let pid = 0, cmd = '';
+  try {
+    if (process.platform === 'win32') {
+      const ps = `$c = Get-NetTCPConnection -LocalPort ${Number(bridgePort)} -ErrorAction Stop | Where-Object { $_.RemotePort -eq 0 } | Select-Object -First 1; ` +
+        '$p = Get-CimInstance Win32_Process -Filter "ProcessId=$($c.OwningProcess)"; "$($p.ProcessId)|$($p.CommandLine)"';
+      const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8', timeout: 6000, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+      [pid, cmd] = [Number(out.split('|')[0]), out.slice(out.indexOf('|') + 1)];
+    } else {
+      pid = Number(execFileSync('lsof', ['-ti', `tcp:${Number(bridgePort)}`, '-sTCP:LISTEN'], { encoding: 'utf8', timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'] }).split(/\s+/)[0]);
+      cmd = execFileSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8', timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'] });
+    }
+  } catch {
+    return false;
+  }
+  if (!pid || pid === process.pid || !/cdp-bridge\.mjs/.test(cmd) || !/--daemon\b/.test(cmd) || !new RegExp('--port\\s+' + Number(bridgePort) + '\\b').test(cmd)) return false;
+  try { process.kill(pid); } catch { return false; }
+  const start = Date.now();
+  while (Date.now() - start < 2500) {
+    if (!(await probeBridge(bridgePort, host))) return true;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return false;
+}
+
+/**
  * Spawn a background detached CDP Bridge process so the single approved Chrome WebSocket
  * persists across process exits and AFK overnight runs.
  */
@@ -570,12 +599,17 @@ export async function ensureCdpBridgeDaemon(
   }
   if (existing) {
     // A daemon from a previous Chrome run still owns the port: replace it instead of waiting for a port that never frees.
-    const stopped = await stopBridge(bridgePort, host);
+    let stopped = await stopBridge(bridgePort, host);
+    let how = 'bridge upstream stale: restarted';
+    if (!stopped && (await killVerifiedStaleBridge(bridgePort, host))) {
+      stopped = true;
+      how = 'bridge from older code (no /shutdown) terminated and restarted';
+    }
     if (!stopped) {
       onNote?.(`bridge on port ${bridgePort} is stale (upstream gone) and could not be stopped; connecting directly`);
       return null;
     }
-    onNote?.('bridge upstream stale: restarted');
+    onNote?.(how);
   }
 
   const selfPath = fileURLToPath(import.meta.url);

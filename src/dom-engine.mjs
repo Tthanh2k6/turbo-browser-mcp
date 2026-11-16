@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { navHealth } from './navinfo.mjs';
+import { gotoRetry, navHealth } from './navinfo.mjs';
 import { observeClickAftermath, watchActivity } from './aftermath.mjs';
 import path from 'node:path';
 import {
@@ -5032,6 +5032,43 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
       );
       return { ok: true, action, url: page.url() };
     }
+    if (params.textNew) {
+      // Only text that appears after this step starts: elements already showing it are remembered and ignored.
+      const needleOrig = String(params.textNew).split('|').map((x) => x.trim()).filter(Boolean);
+      const needles = needleOrig.map((x) => x.toLowerCase());
+      const key = '__tbmTN' + Math.random().toString(36).slice(2);
+      const scan = ([ns, k, init]) => {
+        const seen = init ? (window[k] = new WeakSet()) : window[k];
+        if (!seen) return '';
+        for (const el of document.querySelectorAll('body *')) {
+          let own = '';
+          for (const n of el.childNodes) if (n.nodeType === 3) own += n.nodeValue + ' ';
+          own = own.toLowerCase();
+          const hit = ns.find((x) => own.includes(x));
+          if (!hit) continue;
+          const r = el.getBoundingClientRect();
+          if (!(r.width > 0 && r.height > 0) || getComputedStyle(el).visibility === 'hidden') continue;
+          if (init) seen.add(el);
+          else if (!seen.has(el)) return hit;
+        }
+        return '';
+      };
+      const frames = getAllFrames(page);
+      await Promise.all(frames.map((f) => f.frame.evaluate(scan, [needles, key, true]).catch(() => '')));
+      const deadline = Date.now() + timeout;
+      try {
+        while (Date.now() <= deadline) {
+          for (const f of getAllFrames(page)) {
+            const hit = await f.frame.evaluate(scan, [needles, key, false]).catch(() => '');
+            if (hit) return { ok: true, action, waitedFor: params.textNew, ...(needles.length > 1 ? { matched: needleOrig[needles.indexOf(hit)] } : {}) };
+          }
+          await page.waitForTimeout(80);
+        }
+      } finally {
+        for (const f of getAllFrames(page)) f.frame.evaluate((k) => { delete window[k]; }, key).catch(() => {});
+      }
+      throw new Error(`Timed out after ${timeout}ms waiting for new "${params.textNew}".`);
+    }
     if (params.textGone) {
       const deadline = Date.now() + timeout;
       while (Date.now() <= deadline) {
@@ -6565,11 +6602,11 @@ async function batchActionsCore(page, stepList, options, previousLinesSet, guard
             step.body !== undefined || step.postData !== undefined) {
           throw new Error('navigate supports GET only, without a request body.');
         }
-        const navResp = await page.goto(url.href, {
+        const { resp: navResp, retried: navRetried } = await gotoRetry(page, url.href, {
           waitUntil: 'domcontentloaded', timeout: Number(step.timeoutMs) || DEFAULT_TIMEOUT_MS,
         });
         const navTitle = await page.title().catch(() => '');
-        stepResult = { ok: true, action: 'navigate', url: page.url(), ...(await navHealth(page, navResp, url.href, navTitle)) };
+        stepResult = { ok: true, action: 'navigate', url: page.url(), ...(navRetried ? { retried: navRetried } : {}), ...(await navHealth(page, navResp, url.href, navTitle)) };
         lastNavBad = stepResult.blocked ? `page blocked (${stepResult.blocked})` : stepResult.status >= 400 ? `page status ${stepResult.status}` : '';
       } else if (step.action === 'extract') {
         stepResult = await extractCleanText(page, step);

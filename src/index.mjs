@@ -26,6 +26,7 @@ import {
   inspectCompact,
   smartFillFormGuarded,
 } from './dom-engine.mjs';
+import { takeLate } from './aftermath.mjs';
 import { waitForHuman } from './guards.mjs';
 
 // Read from package.json so --version, --doctor and serverInfo never drift from the published version.
@@ -340,6 +341,7 @@ export const TOOL_DEFINITIONS = [
         dy: { type: 'number' },
         ms: { type: 'integer' },
         textGone: { type: 'string', description: 'Wait until matching text disappears.' },
+        textNew: { type: 'string', description: 'Wait for text ("A|B") appearing after the step starts; existing matches ignored.' },
         url: { type: 'string', description: 'Wait until page URL matches pattern.' },
         loadState: { type: 'string', enum: ['load', 'domcontentloaded', 'networkidle'] },
         state: { type: 'string', enum: ['visible', 'hidden', 'attached', 'detached'] },
@@ -583,10 +585,16 @@ export const TOOL_DEFINITIONS = [
 
 export async function dispatchToolCall(manager, name, rawArgs = {}) {
   const res = await dispatchToolCallInner(manager, name, rawArgs);
+  const lateTab = manager.tabs?.get?.(rawArgs?.tabId ?? manager.activeTabId);
+  const late = lateTab ? takeLate(lateTab) : '';
+  if (late && res && typeof res.text === 'string') {
+    res.text = res.text.startsWith('{') ? `{"late":${JSON.stringify(late)}${res.text[1] === '}' ? '' : ','}${res.text.slice(1)}` : `late: ${late}
+${res.text}`;
+  }
   const note = typeof manager.takeConnectionNote === 'function' ? manager.takeConnectionNote() : '';
   if (note && res && typeof res.text === 'string') {
     res.text = res.text.startsWith('{')
-      ? `{"connectionNote":${JSON.stringify(note)},${res.text.slice(1)}`
+      ? `{"connectionNote":${JSON.stringify(note)}${res.text[1] === '}' ? '' : ','}${res.text.slice(1)}`
       : `connectionNote: ${note}
 ${res.text}`;
   }

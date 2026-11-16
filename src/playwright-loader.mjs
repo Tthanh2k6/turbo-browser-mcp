@@ -212,6 +212,21 @@ function getDefaultUserDataDirs() {
   ];
 }
 
+/** True when a DevToolsActivePort file exists (Chrome 144+ "Allow remote debugging" flow: the first connect needs a human click). */
+export function hasDevToolsActivePort(userDataDir = '', cdpUrl = 'http://127.0.0.1:9222') {
+  const isDefaultLocalCdp = /^https?:\/\/(127\.0\.0\.1|localhost):9222\/?$/i.test(String(cdpUrl || '').trim());
+  const inNodeTest = Boolean(process.env.NODE_TEST_CONTEXT) || process.execArgv.includes('--test');
+  const dirs = [userDataDir ? path.resolve(userDataDir) : '', ...(!inNodeTest && isDefaultLocalCdp ? getDefaultUserDataDirs() : [])].filter(Boolean);
+  return dirs.some((d) => fs.existsSync(path.join(d, 'DevToolsActivePort')));
+}
+
+/** How long auto mode waits for the first CDP connect: 45 s when a person must click Allow, else 10 s. An explicit option wins. */
+export function cdpConnectWaitMs({ optionMs, human, env = process.env } = {}) {
+  if (optionMs) return optionMs;
+  if (!human) return 10000;
+  return Number(env.TURBO_BROWSER_ALLOW_WAIT_MS) > 0 ? Number(env.TURBO_BROWSER_ALLOW_WAIT_MS) : 45000;
+}
+
 /**
  * Resolve an active CDP HTTP or WebSocket endpoint. Supports both classic
  * `--remote-debugging-port` (`/json/version`) and Chrome 144+
