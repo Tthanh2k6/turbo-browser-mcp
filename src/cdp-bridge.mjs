@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { spawn, execSync, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -145,11 +146,15 @@ class ServerWsClient {
     }
   }
 
-  close() {
+  close(code = 0, reason = '') {
     if (this.closed) return;
     this.closed = true;
     try {
-      this.socket.end(encodeWsFrame(Buffer.alloc(0), 0x08, this.maskOutgoing));
+      let body = Buffer.alloc(0);
+      if (code) {
+        body = Buffer.concat([Buffer.from([(code >> 8) & 0xff, code & 0xff]), Buffer.from(String(reason).slice(0, 100), 'utf8')]);
+      }
+      this.socket.end(encodeWsFrame(body, 0x08, this.maskOutgoing));
     } catch {
       this.socket.destroy();
     }
@@ -176,6 +181,13 @@ export async function createCdpBridgeServer({
   port = DEFAULT_BRIDGE_PORT,
   host = '127.0.0.1',
   connectTimeoutMs = 60000,
+  // Called once when the upstream is gone for good (after the optional reconnect). The daemon exits from it.
+  onUpstreamLost = null,
+  // Library use keeps a bridge with a dead upstream alive (probeBridge reports upstreamConnected:false); the daemon sets this.
+  reconnectMs = 0,
+  log = null,
+  // Called when the bridge's own listening socket errors or closes unexpectedly (not via /shutdown).
+  onServerLost = null,
 } = {}) {
   if (!upstreamUrl || (!upstreamUrl.startsWith('ws://') && !upstreamUrl.startsWith('wss://'))) {
     throw new Error(`createCdpBridgeServer requires a ws:// or wss:// upstreamUrl (got ${upstreamUrl})`);
@@ -449,12 +461,26 @@ export async function createCdpBridgeServer({
         };
 
         ws.onClose = () => {
+          if (upstreamWs !== ws) return;
           upstreamConnected = false;
           upstreamWs = null;
+          // Everything tied to the dead connection is void: tell clients why, and fail any waiting internal calls.
           for (const c of clients) {
-            c.close();
+            c.close(1011, 'turbo-bridge: upstream Chrome closed the remote-debugging connection');
           }
           clients.clear();
+          for (const [id, p] of pendingCalls) {
+            pendingCalls.delete(id);
+            p.internalResolve?.(null);
+          }
+          owners.clear();
+          bridgeAttached.clear();
+          discoveredTargets.clear();
+          for (const r of resumes.values()) clearTimeout(r.timer);
+          resumes.clear();
+          upstreamAutoAttach = null;
+          upstreamDiscover = null;
+          if (!shuttingDown) void handleUpstreamLost();
         };
 
         try {
@@ -488,6 +514,45 @@ export async function createCdpBridgeServer({
     });
   }
 
+  let shuttingDown = false;
+  let lostHandled = false;
+
+  // Reconnect only where no approval is involved: a classic --remote-debugging-port answers /json/version and reports
+  // the same browser websocket URL. Chrome 144+ inspect mode (no /json/version) would show a fresh "Allow" prompt, so never retry there.
+  async function upstreamStillSameBrowser() {
+    try {
+      const u = new URL(upstreamUrl);
+      const res = await fetch(`http://${u.hostname}:${u.port}/json/version`, { signal: AbortSignal.timeout(800) });
+      if (!res.ok) return false;
+      const data = await res.json();
+      return data && data.webSocketDebuggerUrl === upstreamUrl;
+    } catch {
+      return false;
+    }
+  }
+
+  async function handleUpstreamLost() {
+    if (lostHandled || shuttingDown) return;
+    lostHandled = true;
+    const deadline = Date.now() + reconnectMs;
+    while (Date.now() < deadline && !shuttingDown) {
+      if (await upstreamStillSameBrowser()) {
+        try {
+          await connectUpstream();
+          lostHandled = false;
+          log?.('upstream reconnected');
+          return;
+        } catch {
+          // keep trying until the deadline
+        }
+      }
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    if (shuttingDown) return;
+    log?.(`upstream ${upstreamUrl} closed and could not be re-established`);
+    try { await onUpstreamLost?.(); } catch {}
+  }
+
   await connectUpstream();
 
   const server = http.createServer((req, res) => {
@@ -518,8 +583,9 @@ export async function createCdpBridgeServer({
     if (req.url === '/shutdown' && req.method === 'POST') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end('{"ok":true}');
+      shuttingDown = true;
       setTimeout(() => {
-        for (const c of clients) c.close();
+        for (const c of clients) c.close(1001, 'turbo-bridge: shutting down');
         clients.clear();
         try { upstreamWs?.close(); } catch {}
         server.close();
@@ -679,6 +745,23 @@ export async function createCdpBridgeServer({
     server.listen(port, host, () => resolve());
   });
 
+  let serverLostFired = false;
+  const serverLost = (why) => {
+    if (shuttingDown || serverLostFired) return;
+    serverLostFired = true;
+    log?.(`bridge server socket lost (${why})`);
+    for (const c of clients) c.close(1011, 'turbo-bridge: bridge server failed');
+    clients.clear();
+    try { upstreamWs?.close(); } catch {}
+    try { onServerLost?.(why); } catch {}
+  };
+  server.on('error', (err) => serverLost(err?.message || 'error'));
+  server.on('close', () => serverLost('closed'));
+  if (onServerLost) {
+    // A listening socket that vanished without an event (observed once on Windows) must not leave a zombie daemon.
+    setInterval(() => { if (!server.listening) serverLost('not listening'); }, 3000).unref();
+  }
+
   const addr = server.address();
   const actualPort = typeof addr === 'object' && addr ? addr.port : port;
   const bridgeHttpUrl = `http://${host}:${actualPort}`;
@@ -690,7 +773,8 @@ export async function createCdpBridgeServer({
     bridgeHttpUrl,
     bridgeWsUrl,
     close: async () => {
-      for (const c of clients) c.close();
+      shuttingDown = true;
+      for (const c of clients) c.close(1001, 'turbo-bridge: shutting down');
       clients.clear();
       try {
         upstreamWs?.close();
@@ -780,6 +864,36 @@ export async function killVerifiedStaleBridge(bridgePort = DEFAULT_BRIDGE_PORT, 
     await new Promise((r) => setTimeout(r, 100));
   }
   return false;
+}
+
+function tcpOpen(host, port, timeoutMs = 400) {
+  return new Promise((resolve) => {
+    const sock = net.connect({ host, port });
+    const done = (ok) => { sock.destroy(); resolve(ok); };
+    sock.setTimeout(timeoutMs, () => done(false));
+    sock.once('connect', () => done(true));
+    sock.once('error', () => done(false));
+  });
+}
+
+/**
+ * Quick (about 1 s worst case) classification of whatever sits on the bridge port:
+ * absent (nothing listening), ok, dead-upstream (bridge answers but Chrome is gone) or hung (port open, no valid answer).
+ * A dead or hung bridge is stopped; a hung one only when it provably is our own daemon (killVerifiedStaleBridge).
+ */
+export async function checkBridgeHealth(bridgePort = DEFAULT_BRIDGE_PORT, host = '127.0.0.1') {
+  const info = await probeBridge(bridgePort, host);
+  if (info) {
+    if (info.upstreamConnected) return { state: 'ok', ...info };
+    let stopped = await stopBridge(bridgePort, host, 1500);
+    if (!stopped) stopped = await killVerifiedStaleBridge(bridgePort, host);
+    return { state: 'dead-upstream', stopped };
+  }
+  if (await tcpOpen(host, bridgePort)) {
+    const stopped = await killVerifiedStaleBridge(bridgePort, host);
+    return { state: 'hung', stopped };
+  }
+  return { state: 'absent' };
 }
 
 /**
@@ -913,10 +1027,22 @@ if (isDirectRun && process.argv.includes('--daemon')) {
   const port = Number(getArg('--port', DEFAULT_BRIDGE_PORT)) || DEFAULT_BRIDGE_PORT;
   const host = getArg('--host', '127.0.0.1');
 
-  createCdpBridgeServer({ upstreamUrl, port, host })
+  // Distinct exit codes: 0 shutdown, 1 failed to start, 3 upstream Chrome gone for good, 4 own server socket lost.
+  // The daemon keeps no pid/port marker files; the listening port is the only state it owns.
+  const log = (m) => console.error(`[turbo-browser-mcp] bridge: ${m}`);
+  createCdpBridgeServer({
+    upstreamUrl,
+    port,
+    host,
+    reconnectMs: 2500,
+    log,
+    onUpstreamLost: () => { setTimeout(() => process.exit(3), 50); },
+    onServerLost: () => { setTimeout(() => process.exit(4), 50); },
+  })
     .then(({ server, bridgeHttpUrl }) => {
       console.log(`[turbo-browser-mcp] CDP Keep-Alive Bridge listening at ${bridgeHttpUrl} -> ${upstreamUrl}`);
-      server.on('close', () => process.exit(0));
+      // Runs after serverLost(): an unexpected close has already scheduled exit code 4; a /shutdown close exits 0.
+      server.on('close', () => setTimeout(() => process.exit(0), 200));
     })
     .catch((err) => {
       console.error(`[turbo-browser-mcp] Bridge daemon failed: ${err.message}`);

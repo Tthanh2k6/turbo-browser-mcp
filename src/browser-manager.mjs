@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ensureCdpBridgeDaemon } from './cdp-bridge.mjs';
+import { checkBridgeHealth, ensureCdpBridgeDaemon } from './cdp-bridge.mjs';
 import { cdpRawCall } from './cdp-raw.mjs';
 import { resolveSafePath } from './dom-engine.mjs';
 import { gotoRetry, navHealth } from './navinfo.mjs';
@@ -190,6 +190,17 @@ export class BrowserManager {
   async _init() {
     const { chromium } = await loadPlaywright();
 
+    // A bridge whose Chrome is gone (or that no longer answers) must not linger or be mistaken for absent:
+    // clear it quickly and remember it so a launch fallback can say why logged-in sites are missing.
+    let bridgeLost = false;
+    if (this.mode === 'auto' && process.env.TURBO_BROWSER_DISABLE_BRIDGE !== 'true' &&
+        (this.bridgePort || this.useBridge || !(Boolean(process.env.NODE_TEST_CONTEXT) || process.execArgv.includes('--test')))) {
+      try {
+        const h = await checkBridgeHealth(this.bridgePort || undefined);
+        bridgeLost = h.state === 'dead-upstream' || h.state === 'hung';
+      } catch { /* health check is best effort */ }
+    }
+
     const activeCdpEndpoint =
       this.mode === 'cdp' || this.mode === 'auto'
         ? await resolveActiveCdpEndpoint(this.cdpUrl, this.userDataDir)
@@ -266,7 +277,9 @@ export class BrowserManager {
       this.connectionType = 'launch';
     }
 
-    if (this.connectionNote && this.connectionType !== 'cdp') {
+    if (bridgeLost && this.connectionType !== 'cdp') {
+      this.connectionNote = `Chrome remote debugging is no longer available (bridge upstream closed); using ${this.headless ? 'a headless' : 'a separate'} browser. Logged-in sites will not be available.`;
+    } else if (this.connectionNote && this.connectionType !== 'cdp') {
       this.connectionNote = `${this.connectionType} fallback (${this.connectionNote})`;
     }
 
