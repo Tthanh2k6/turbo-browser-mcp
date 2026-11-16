@@ -38,7 +38,16 @@ before(async () => {
   manager = new BrowserManager({ mode: 'launch', headless: true });
   ({ page } = await manager.getPage());
 });
-beforeEach(async () => { await page.goto(base); requests.length = 0; });
+// A navigation started by the previous test (e.g. a delayed /receipt) can still be in flight under load.
+beforeEach(async () => {
+  for (let i = 0; i < 3; i += 1) {
+    try { await page.goto(base); break; } catch (e) {
+      if (!/interrupted by another navigation/.test(String(e)) || i === 2) throw e;
+      await page.waitForLoadState('load').catch(() => {});
+    }
+  }
+  requests.length = 0;
+});
 after(async () => {
   await manager?.close();
   await new Promise(resolve => server.close(resolve));

@@ -804,7 +804,7 @@ export class BrowserManager {
     return { name: contextName, ctx: isoCtx };
   }
 
-  async tabsBatch(operations = []) {
+  async tabsBatch(operations = [], { includeTabs } = {}) {
     const batchStart = Date.now();
     await this.ensureReady();
     this._syncOpenPages();
@@ -834,7 +834,7 @@ export class BrowserManager {
       }
 
       if (action === 'list') {
-        results.push({ action: 'list', tabs: await this.listTabs() });
+        results.push(includeTabs === false ? { action: 'list' } : { action: 'list', tabs: await this.listTabs() });
         continue;
       }
 
@@ -1090,8 +1090,8 @@ export class BrowserManager {
 
     // Echo the tab list only when asked (list/open_many/close) or when it changed in a way the
     // caller did not request (popup opened, tab crashed). open/navigate/etc. return their own tabId.
-    let echoTabs = tabsRequested;
-    if (!echoTabs) {
+    let echoTabs = includeTabs === true ? true : tabsRequested;
+    if (!echoTabs && includeTabs !== false) {
       const expected = new Set(tabsBefore);
       for (const r of results) {
         if (r.action === 'open' && r.tabId !== undefined && r.tabId !== null) expected.add(r.tabId);
@@ -1106,7 +1106,7 @@ export class BrowserManager {
       activeTabId: this.activeTabId,
       elapsedMs: Date.now() - batchStart,
       results,
-      ...(echoTabs ? { tabs: await this.listTabs() } : {}),
+      ...(echoTabs && includeTabs !== false ? { tabs: await this.listTabs() } : {}),
     };
   }
 

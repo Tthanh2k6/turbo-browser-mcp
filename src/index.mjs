@@ -89,6 +89,10 @@ export const TOOL_DEFINITIONS = [
     inputSchema: {
       type: 'object',
       properties: {
+        includeTabs: {
+          type: 'boolean',
+          description: 'true always returns the tab list; false never does. Default: only when listed, tabs closed/opened in bulk, or unexpectedly changed.',
+        },
         operations: {
           type: 'array',
           description: 'List of tab operations executed in order.',
@@ -365,7 +369,7 @@ export const TOOL_DEFINITIONS = [
         tabId: { type: 'integer' },
         steps: {
           type: 'array',
-          description: 'act_fast or smart_fill_form steps; also {action:"navigate",url} (GET only), {action:"extract",format:"text"|"markdown",selector?,maxChars?}.',
+          description: 'act_fast or smart_fill_form steps; also {action:"navigate",url} (GET only), {action:"extract",format:"text"|"markdown",selector?,maxChars?}, {action:"collect",selector,scrolls?:5,waitMs?:400,maxItems?:100,maxChars?:8000,fields?:["text","href","id"]} (scroll, read matching elements each time, dedupe: virtualized feeds).',
           items: { type: 'object' },
         },
         continueOnError: { type: 'boolean', default: false },
@@ -428,7 +432,7 @@ export const TOOL_DEFINITIONS = [
         arg: {},
         savePath: {
           type: 'string',
-          description: 'File under cwd or TURBO_BROWSER_SAVE_ROOT.',
+          description: 'File under cwd or TURBO_BROWSER_SAVE_ROOT. Full result goes to the file; the reply has only savePath, bytes and a 300-char preview.',
         },
       },
     },
@@ -580,7 +584,7 @@ export async function dispatchToolCall(manager, name, rawArgs = {}) {
   const args = rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs) ? rawArgs : {};
   switch (name) {
     case 'tabs_batch': {
-      const res = await manager.tabsBatch(args.operations || []);
+      const res = await manager.tabsBatch(args.operations || [], { includeTabs: args.includeTabs });
       return { text: JSON.stringify(res) };
     }
     case 'inspect_compact': {
@@ -642,7 +646,9 @@ export async function dispatchToolCall(manager, name, rawArgs = {}) {
     case 'evaluate_js': {
       const { tabId, page } = await manager.getPage(args.tabId);
       const res = await evaluateJs(page, args);
-      const encoded = JSON.stringify({ tabId, ...res });
+      // With savePath the full result lives in the file: return only its location, size and a short preview.
+      const { result: fullResult, ...rest } = res;
+      const encoded = JSON.stringify(res.savePath ? { tabId, ...rest } : { tabId, ...res });
       return {
         text: encoded.length > 20000
           ? `${encoded.slice(0, 19980)}... [truncated]`

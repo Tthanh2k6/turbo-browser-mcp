@@ -1757,6 +1757,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
             const FIELD_SEL =
               'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="image"]):not([type="reset"]), textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="combobox"]';
             let cur = el;
+            let prevChild = el;
             for (let up = 0; up < 4 && cur.parentElement; up++) {
               cur = cur.parentElement;
               let fields = 0;
@@ -1768,12 +1769,19 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
               for (const c of cur.querySelectorAll('label, [class*="label" i]')) {
                 if (c.contains(el) || !(c.compareDocumentPosition(el) & 4)) continue;
                 const forId = c.getAttribute?.('for');
-                if (forId && forId !== el.id) continue;
+                if (forId && forId !== el.id && document.getElementById(forId)) continue;
                 if (c.querySelector('input, select, textarea, button')) continue;
-                const t = clean(c.innerText || c.textContent);
+                const t = clean(c.innerText || c.textContent).replace(/\s*[*\uFF0A]+$/, '');
                 if (t && t.length <= 80 && /[\p{L}\p{N}]/u.test(t)) best = t;
               }
               if (best) return best;
+              // Plain sibling block before the field (no label element): "First Name*" in a <div>.
+              const sib = up < 3 ? prevChild.previousElementSibling : null;
+              if (sib && !sib.matches(FIELD_SEL) && !sib.querySelector(FIELD_SEL) && !sib.querySelector('button, a')) {
+                const t = clean(sib.innerText || sib.textContent).replace(/\s*[*\uFF0A]+$/, '');
+                if (t && t.length <= 60 && /[\p{L}\p{N}]/u.test(t)) return t;
+              }
+              prevChild = cur;
             }
             return '';
           };
@@ -1787,7 +1795,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
                 .map((l) => composedText(l) || clean(l.innerText))
                 .filter(Boolean)
                 .join(' ');
-              if (lblText) return lblText.slice(0, 80);
+              if (lblText) return lblText.replace(/\s*[*\uFF0A]+$/, '').slice(0, 80);
             }
 
             const lby = el.getAttribute('aria-labelledby');
@@ -1806,7 +1814,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
             const wrapLabel = closestComposed(el, 'label');
             const wrapTxt = wrapLabel ? (composedText(wrapLabel) || clean(wrapLabel.innerText)) : '';
             if (wrapTxt) {
-              return wrapTxt.slice(0, 80);
+              return wrapTxt.replace(/\s*[*\uFF0A]+$/, '').slice(0, 80);
             }
 
             const tag = el.tagName;
@@ -2039,6 +2047,21 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
     }
   }
 
+  // A full snapshot renumbers refs from e1. If a ref now points at a different element than in the previous
+  // snapshot of the same page (an input was inserted above), earlier refs are stale: say so once.
+  let shiftedNote = '';
+  if (!preserveRefs && baseline && sameScope && baseline.refs.size > 0) {
+    const sigToRef = new Map();
+    for (const [r, sg] of nextRefs) if (!sigToRef.has(sg)) sigToRef.set(sg, r);
+    let moved = 0;
+    for (const [r, sg] of baseline.refs) {
+      const now = nextRefs.get(r);
+      if (now !== undefined && now !== sg && sigToRef.has(sg) && sigToRef.get(sg) !== r) moved++;
+    }
+    if (moved > 0) shiftedNote = `refs shifted (${moved} moved since the last snapshot): use only refs from this snapshot
+`;
+  }
+
   if (previousLinesSet && !query && !rootSelector) {
     previousLinesSet.clear();
     previousLinesSet.add(urlKey);
@@ -2057,7 +2080,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
   const urlChangedNote = onlyChanged && hadBaseline && !sameUrlAsBaseline
     ? 'URL changed: full snapshot\n'
     : '';
-  const header = `URL: ${page.url()}\nTitle: ${title}\nMode: ${mode} | Frames: ${frames.length} | Elements: ${totalMatched}${filterNote}\n${urlChangedNote}`;
+  const header = `URL: ${page.url()}\nTitle: ${title}\nMode: ${mode} | Frames: ${frames.length} | Elements: ${totalMatched}${filterNote}\n${urlChangedNote}${shiftedNote}`;
   let body = '';
   let shownCount = 0;
   let truncated = false;
@@ -2551,6 +2574,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             const FIELD_SEL =
               'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="image"]):not([type="reset"]), textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="combobox"]';
             let cur = el;
+            let prevChild = el;
             for (let up = 0; up < 4 && cur.parentElement; up++) {
               cur = cur.parentElement;
               let fields = 0;
@@ -2562,12 +2586,19 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
               for (const c of cur.querySelectorAll('label, [class*="label" i]')) {
                 if (c.contains(el) || !(c.compareDocumentPosition(el) & 4)) continue;
                 const forId = c.getAttribute?.('for');
-                if (forId && forId !== el.id) continue;
+                if (forId && forId !== el.id && document.getElementById(forId)) continue;
                 if (c.querySelector('input, select, textarea, button')) continue;
-                const t = clean(c.innerText || c.textContent);
+                const t = clean(c.innerText || c.textContent).replace(/\s*[*\uFF0A]+$/, '');
                 if (t && t.length <= 80 && /[\p{L}\p{N}]/u.test(t)) best = t;
               }
               if (best) return best;
+              // Plain sibling block before the field (no label element): "First Name*" in a <div>.
+              const sib = up < 3 ? prevChild.previousElementSibling : null;
+              if (sib && !sib.matches(FIELD_SEL) && !sib.querySelector(FIELD_SEL) && !sib.querySelector('button, a')) {
+                const t = clean(sib.innerText || sib.textContent).replace(/\s*[*\uFF0A]+$/, '');
+                if (t && t.length <= 60 && /[\p{L}\p{N}]/u.test(t)) return t;
+              }
+              prevChild = cur;
             }
             return '';
           };
@@ -4727,6 +4758,139 @@ function watchActionNavigation(page, timeout) {
   };
 }
 
+/**
+ * Scroll-and-collect for virtualized feeds: reads innerText of every element matching `selector`, scrolls (the
+ * nearest scrollable ancestor of the first match, else the window), repeats, and returns the unique items.
+ * One round trip; the loop runs inside the page. Dedupe is by a cheap text hash.
+ */
+export async function collectItems(page, step = {}) {
+  const selector = String(step.selector || '');
+  if (!selector) throw new Error('collect requires selector.');
+  const scrolls = Math.min(60, Math.max(0, Number.isFinite(Number(step.scrolls)) ? Number(step.scrolls) : 5));
+  const waitMs = Math.min(5000, Math.max(0, Number.isFinite(Number(step.waitMs)) ? Number(step.waitMs) : 400));
+  const maxItems = Math.min(2000, Math.max(1, Number(step.maxItems) || 100));
+  const maxChars = Math.max(200, Number(step.maxChars) || 8000);
+  const fields = Array.isArray(step.fields) ? step.fields.filter((f) => f === 'text' || f === 'href' || f === 'id') : [];
+  const t0 = Date.now();
+  const r = await page.evaluate(
+    async ({ sel, scrolls: nScrolls, waitMs: wait, maxItems: cap, maxChars: charCap, fields: want }) => {
+      const hash = (s) => {
+        let h = 5381;
+        for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) | 0;
+        return `${s.length}:${h}`;
+      };
+      const seen = new Set();
+      const items = [];
+      let chars = 0;
+      let full = false;
+      const read = () => {
+        let added = 0;
+        for (const el of document.querySelectorAll(sel)) {
+          if (full) break;
+          const text = (el.innerText || '').replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n').trim().slice(0, 1500);
+          if (!text) continue;
+          const key = hash(text);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          let item = text;
+          if (want.length) {
+            item = {};
+            for (const f of want) {
+              if (f === 'text') item.text = text;
+              else if (f === 'id') item.id = el.id || el.getAttribute('data-id') || undefined;
+              else if (f === 'href') item.href = (el.matches('a[href]') ? el : el.querySelector('a[href]'))?.href;
+            }
+          }
+          const size = typeof item === 'string' ? item.length : JSON.stringify(item).length;
+          if (items.length >= cap || chars + size > charCap) {
+            full = true;
+            break;
+          }
+          items.push(item);
+          chars += size;
+          added++;
+        }
+        return added;
+      };
+      const scroller = () => {
+        const first = document.querySelector(sel);
+        for (let p = first?.parentElement; p && p !== document.body; p = p.parentElement) {
+          const st = getComputedStyle(p);
+          if (/(auto|scroll)/.test(st.overflowY) && p.scrollHeight > p.clientHeight + 4) return p;
+        }
+        return null;
+      };
+      read();
+      let done = 0;
+      let idle = 0;
+      for (let i = 0; i < nScrolls && !full; i++) {
+        const box = scroller();
+        const before = box ? box.scrollTop : window.scrollY;
+        const step = Math.max(200, Math.floor((box ? box.clientHeight : window.innerHeight) * 0.9));
+        if (box) box.scrollTop = before + step;
+        else window.scrollBy(0, step);
+        done++;
+        // Wait for two frames (scroll handlers render on the next frame), then waitMs.
+        await new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)));
+        await new Promise((res) => setTimeout(res, wait));
+        const moved = (box ? box.scrollTop : window.scrollY) !== before;
+        let added = read();
+        // Slow renderers (busy page, slow device) may not have swapped items in yet: give them one more wait
+        // before scrolling again, otherwise the next scroll skips the items that were about to appear.
+        if (moved && added === 0) {
+          await new Promise((res) => setTimeout(res, Math.max(wait, 150)));
+          added = read();
+        }
+        idle = added === 0 && !moved ? idle + 1 : added === 0 ? idle : 0;
+        if (idle >= 1) break;
+      }
+      return { items, scrolls: done, truncated: full };
+    },
+    { sel: selector, scrolls, waitMs, maxItems, maxChars, fields }
+  );
+  return { ok: true, action: 'collect', count: r.items.length, scrolls: r.scrolls, truncated: r.truncated, items: r.items, elapsedMs: Date.now() - t0 };
+}
+
+const APPLY_HOST_PATH_RE =/apply|careers|jobs|greenhouse|lever|ashby|workable|freshteam|zohorecruit|smartrecruiters|recruitee|breezy/i;
+const STATIC_EXT_RE = /\.(?:js|mjs|css|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|map|json|xml)(?:[?#]|$)/i;
+
+/**
+ * Up to 3 absolute URLs on a different host that look like an application/ATS page, from anchors and inline
+ * JSON/HTML. Used only when an "apply" click did nothing visible (button opens a modal, link lives in page data).
+ */
+export async function findOutboundApplyLinks(page) {
+  let raw = [];
+  try {
+    raw = await page.evaluate(() => {
+      const out = [];
+      for (const a of document.querySelectorAll('a[href]')) out.push(a.href);
+      const BS = String.fromCharCode(92);
+      const html = document.documentElement.innerHTML.split(BS + 'u002F').join('/').split(BS + '/').join('/');
+      const m = html.match(/https?:\/\/[^\s"'<>\\\)]+/g);
+      if (m) for (const u of m.slice(0, 4000)) out.push(u);
+      return out;
+    });
+  } catch {
+    return [];
+  }
+  let here = '';
+  try { here = new URL(page.url()).host; } catch { return []; }
+  const seen = new Set();
+  const found = [];
+  for (const u of raw) {
+    let url;
+    try { url = new URL(u.replace(/[.,;]+$/, '')); } catch { continue; }
+    if (!/^https?:$/.test(url.protocol) || url.host === here || STATIC_EXT_RE.test(url.pathname)) continue;
+    if (!APPLY_HOST_PATH_RE.test(url.host) && !APPLY_HOST_PATH_RE.test(url.pathname)) continue;
+    const key = url.origin + url.pathname;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    found.push(url.href);
+    if (found.length >= 3) break;
+  }
+  return found;
+}
+
 async function executeSingleAction(page, params = {}) {
   const silentState = { count: 0 };
   const enabled = params.observeAftermath ?? (process.env.TURBO_BROWSER_OBSERVE_AFTERMATH === 'true');
@@ -4735,6 +4899,11 @@ async function executeSingleAction(page, params = {}) {
     ? watchActionNavigation(page, Number(params.timeoutMs) || DEFAULT_TIMEOUT_MS) : null;
   // One shared settle step replaces fixed sleeps; listeners stay attached until it is done.
   const activity = observer || navigation ? watchActivity(page) : null;
+  const beforeApplyUrl = page.url();
+  let openedTab = false;
+  const onNewPage = () => { openedTab = true; };
+  const ctxForTabs = ['click'].includes(params.action) ? page.context() : null;
+  ctxForTabs?.on('page', onNewPage);
   let res;
   try {
     try {
@@ -4749,7 +4918,16 @@ async function executeSingleAction(page, params = {}) {
       if (activity && res && typeof res === 'object') res.outcome = activity.outcome();
     }
     await observer?.finish(res, resolveAllowSubmit(params.allowSubmit));
+    if (res && res._applyLike) {
+      if (!activity) await new Promise((r) => setTimeout(r, 600));
+      if (!openedTab && page.url() === beforeApplyUrl) {
+        const links = await findOutboundApplyLinks(page);
+        if (links.length) res.outboundLinks = links;
+      }
+    }
   } finally {
+    ctxForTabs?.off('page', onNewPage);
+    if (res && res._applyLike !== undefined) delete res._applyLike;
     observer?.remove();
     navigation?.remove();
     activity?.remove();
@@ -5748,6 +5926,12 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
       }
     }
     const isSafeClick = isSafeLocatorClick || isSafePointClick;
+    let applyLike = /apply/i.test(String(params.text || ''));
+    if (!applyLike && action === 'click' && !params.text) {
+      applyLike = await locator
+        .evaluate((el) => /apply/i.test((el.innerText || el.getAttribute('aria-label') || el.value || '').slice(0, 60)))
+        .catch(() => false);
+    }
     const clickOpts = {
       timeout,
       button,
@@ -5768,7 +5952,7 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
           }
         : null,
     );
-    return { ok: true, action, frameIdx, button, ...(modifiers.length ? { modifiers } : {}) };
+    return { ok: true, action, frameIdx, button, ...(modifiers.length ? { modifiers } : {}), ...(applyLike ? { _applyLike: true } : {}) };
   }
 
   if (action === 'hover') {
@@ -6294,6 +6478,8 @@ async function batchActionsCore(page, stepList, options, previousLinesSet, guard
         stepResult = { ok: true, action: 'navigate', url: page.url(), ...(await navHealth(page, navResp, url.href, navTitle)) };
       } else if (step.action === 'extract') {
         stepResult = await extractCleanText(page, step);
+      } else if (step.action === 'collect') {
+        stepResult = await collectItems(page, step);
       } else {
         stepResult = await executeSingleAction(page, {
           ...step,
@@ -6352,6 +6538,54 @@ async function batchActionsCore(page, stepList, options, previousLinesSet, guard
 
   out.elapsedMs = Date.now() - t0;
   return out;
+}
+
+const INVISIBLE_RE = /[\u200B-\u200F\u2060\u2062-\u2064\uFEFF\u034F\u00AD]/g;
+
+/**
+ * Cheap generic noise filter for extracted text (anti-scrape watermarks as on Facebook): strips zero-width
+ * characters, drops lines that were only 1-2 visible chars once those were removed (obfuscation fragments),
+ * and collapses runs of the same short token ("Facebook" x33) into one with a count.
+ */
+export function denoiseText(text) {
+  if (!text) return text;
+  const hasInvisible = /[\u200B-\u200F\u2060\u2062-\u2064\uFEFF\u034F\u00AD]/.test(text);
+  const lines = text.split('\n');
+  const out = [];
+  let runLine = null;
+  let runCount = 0;
+  const flush = () => {
+    if (runLine === null) return;
+    out.push(runCount >= 3 ? `${runLine} (x${runCount})` : Array(runCount).fill(runLine).join('\n'));
+    runLine = null;
+    runCount = 0;
+  };
+  for (const raw of lines) {
+    let line = raw;
+    if (hasInvisible && INVISIBLE_RE.test(line)) {
+      INVISIBLE_RE.lastIndex = 0;
+      line = line.replace(INVISIBLE_RE, '');
+      if (line.replace(/[\s|]/g, '').length <= 2) continue;
+    }
+    INVISIBLE_RE.lastIndex = 0;
+    if (line.length >= 12 && line.length <= 4000) {
+      // "FacebookFacebookFacebook..." or "Facebook Facebook Facebook ..." inside one line
+      line = line.replace(/((?=\S*\p{L})\S{3,20}?)(?:\s*\1){3,}/gu, '$1');
+    }
+    if (line.length > 0 && line.length <= 30 && line === runLine) {
+      runCount += 1;
+      continue;
+    }
+    flush();
+    if (line.length > 0 && line.length <= 30) {
+      runLine = line;
+      runCount = 1;
+    } else {
+      out.push(line);
+    }
+  }
+  flush();
+  return out.join('\n');
 }
 
 /**
@@ -6423,6 +6657,13 @@ export async function extractCleanText(page, options = {}) {
               const st = getComputedStyle(cur);
               if (st.display === 'none' || Number(st.opacity) === 0 || st.contentVisibility === 'hidden') {
                 return true;
+              }
+              // sr-only / offscreen text (clip pattern, 1px boxes, parked left of the page) is not rendered visibly.
+              if (st.position === 'absolute' || st.position === 'fixed') {
+                const rc = cur.getBoundingClientRect();
+                if ((rc.width <= 1 && rc.height <= 1 && st.overflow !== 'visible') || rc.right <= 0 || rc.bottom <= 0 && st.position === 'fixed') {
+                  return true;
+                }
               }
             } catch {
               // ignore
@@ -6749,7 +6990,7 @@ export async function extractCleanText(page, options = {}) {
           if (rescued.t.length > res.t.length) res = rescued;
         }
       }
-      part = res.o ? `${res.o}\n${res.t}` : res.t;
+      part = denoiseText(res.o ? `${res.o}\n${res.t}` : res.t);
     } catch {
       part = '';
     }
@@ -7050,7 +7291,13 @@ export async function evaluateJs(page, { expression, frameIdx = 0, arg, ref, sel
   const normalizedResult = result === undefined ? null : result;
   const serialized = typeof normalizedResult === 'string' ? normalizedResult : JSON.stringify(normalizedResult, null, 2);
   const savedPath = writeSaveFile(savePath, serialized ?? 'null');
-  return { frameIdx: resolvedFrameIdx, result: normalizedResult, savePath: savedPath };
+  const out = { frameIdx: resolvedFrameIdx, result: normalizedResult, savePath: savedPath };
+  if (savedPath) {
+    const body = serialized ?? 'null';
+    out.bytes = Buffer.byteLength(body, 'utf8');
+    out.preview = body.slice(0, 300);
+  }
+  return out;
 }
 
 /**

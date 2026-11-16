@@ -610,8 +610,8 @@ describe('sim-scraping-session-rpc: SPA scraping, evaluateJs edge cases, browser
         expression: '"X".repeat(25000)',
         savePath: saveEvalFile,
       });
-      assert.ok(hugeMcpOut.text.length <= 20000, 'MCP evaluate_js text output must be capped at <= 20000 chars');
-      assert.match(hugeMcpOut.text, /\.\.\. \[truncated\]$/, 'huge evaluate_js output must end with ... [truncated]');
+      assert.ok(hugeMcpOut.text.length <= 1000, 'MCP evaluate_js with savePath returns only path, bytes and preview');
+      assert.equal(JSON.parse(hugeMcpOut.text).bytes, 25000);
       assert.equal(fs.existsSync(saveEvalFile), true, 'savePath file must be written for huge evaluate_js');
       assert.equal(fs.readFileSync(saveEvalFile, 'utf8').length, 25000, 'savePath must store the full untruncated 25000 chars');
 
