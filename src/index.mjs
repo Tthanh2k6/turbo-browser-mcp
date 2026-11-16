@@ -1067,13 +1067,20 @@ export function startStdioServer(manager = new BrowserManager()) {
     drainBuffer();
   });
 
+  let shuttingDown = false;
   const shutdown = async () => {
-    await rpcChain.catch(() => {});
+    if (shuttingDown) return;
+    shuttingDown = true;
+    // Whole cleanup is bounded: a stuck RPC or browser must not keep the process (and its tabs) alive.
+    const hardStop = setTimeout(() => process.exit(0), 4000);
+    await Promise.race([rpcChain.catch(() => {}), new Promise((r) => setTimeout(r, 1000))]);
     await manager.close().catch(() => {});
+    clearTimeout(hardStop);
     process.exit(0);
   };
 
   process.stdin.on('end', () => void shutdown());
+  process.stdin.on('close', () => void shutdown());
   process.on('SIGINT', () => void shutdown());
   process.on('SIGTERM', () => void shutdown());
 }

@@ -5203,7 +5203,12 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
         return '';
       };
       const frames = getAllFrames(page);
-      await Promise.all(frames.map((f) => f.frame.evaluate(scan, [needles, key, true]).catch(() => '')));
+      if (params._freshDocument) {
+        // Right after navigate/reload/back/forward in the same batch: everything on the new document is new.
+        await Promise.all(frames.map((f) => f.frame.evaluate((k) => { window[k] = new WeakSet(); }, key).catch(() => '')));
+      } else {
+        await Promise.all(frames.map((f) => f.frame.evaluate(scan, [needles, key, true]).catch(() => '')));
+      }
       const deadline = Date.now() + timeout;
       try {
         while (Date.now() <= deadline) {
@@ -6779,9 +6784,12 @@ async function batchActionsCore(page, stepList, options, previousLinesSet, guard
   const defaultAllowSubmit = resolveAllowSubmit(options.allowSubmit);
   let lastNavBad = '';
   const results = [];
+  let prevWasNav = false;
 
   for (let i = 0; i < stepList.length; i++) {
     const step = stepList[i];
+    const afterNav = prevWasNav;
+    prevWasNav = ['navigate', 'reload', 'back', 'forward'].includes(step?.action);
     try {
       if (!step || typeof step !== 'object') {
         throw new Error('Invalid batch step: expected an action object.');
@@ -6839,6 +6847,7 @@ async function batchActionsCore(page, stepList, options, previousLinesSet, guard
         lastNavBad = '';
         stepResult = await executeSingleAction(page, {
           ...step,
+          ...(afterNav && step.action === 'wait' && step.textNew ? { _freshDocument: true } : {}),
           returnSnapshot: options.returnSnapshot || step.returnSnapshot,
           observeAftermath: step.observeAftermath ?? options.observeAftermath,
           allowSubmit: options.allowSubmit === false ? false : (step.allowSubmit ?? defaultAllowSubmit),

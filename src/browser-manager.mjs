@@ -110,6 +110,7 @@ export class BrowserManager {
     this.activeTabId = null;
     this.tabs = new Map();
     this.isolatedContexts = new Map();
+    this._foreignPages = new WeakSet();
     this.tabContextName = new Map();
     this.pageToId = new WeakMap();
     this.attachedPages = new WeakSet();
@@ -858,9 +859,45 @@ export class BrowserManager {
     return this._ensureDiagState(page).lastSnapshotLines;
   }
 
+  // CDP only: Playwright files every page of a context it did not create under the default context, so a
+  // tab another process opened in its isolated context would be listed as "default". Ask Chrome which context
+  // each unchecked default-context page really lives in; non-default ones are labeled "other".
+  async _labelForeignContextPages() {
+    if (this.connectionType !== 'cdp' || !this.browser || !this.context) return;
+    this._ctxChecked ||= new WeakSet();
+    let pages;
+    try { pages = this.context.pages().filter((p) => !p.isClosed() && !this._ctxChecked.has(p)); } catch { return; }
+    if (pages.length > 0) {
+      const work = (async () => {
+        const root = await this.browser.newBrowserCDPSession();
+        try {
+          const res = await root.send('Target.getBrowserContexts');
+          const nonDefault = new Set(res?.browserContextIds || []);
+          if (nonDefault.size === 0) { for (const p of pages) this._ctxChecked.add(p); return; }
+          await Promise.all(pages.map(async (p) => {
+            let s;
+            try {
+              s = await this.context.newCDPSession(p);
+              const info = (await s.send('Target.getTargetInfo'))?.targetInfo;
+              this._ctxChecked.add(p);
+              if (info?.browserContextId && nonDefault.has(info.browserContextId)) this._foreignPages.add(p);
+            } catch { /* leave unchecked, retried next listing */ } finally { await s?.detach().catch(() => {}); }
+          }));
+        } finally { await root.detach().catch(() => {}); }
+      })().catch(() => {});
+      let timer;
+      await Promise.race([work, new Promise((r) => { timer = setTimeout(r, 2000); })]);
+      clearTimeout(timer);
+    }
+    for (const [tabId, p] of this.tabs) {
+      if (this._foreignPages.has(p) && (this.tabContextName.get(tabId) || 'default') === 'default') this.tabContextName.set(tabId, 'other');
+    }
+  }
+
   async listTabs() {
     await this.ensureReady();
     this._syncOpenPages();
+    await this._labelForeignContextPages();
     const results = [];
     // Re-probe the main world of every tab in parallel (1.5 s cap): marks tabs that got stuck after
     // attach and clears marks on tabs that answer again.
@@ -1654,9 +1691,15 @@ export class BrowserManager {
   }
 
   async close() {
-    for (const ctx of this.isolatedContexts.values()) {
-      await ctx.close().catch(() => {});
-    }
+    // Contexts this process created (never the default/user context): close them so their pages go too.
+    // Bounded, so a wedged browser cannot hang shutdown.
+    const isoCloses = [...this.isolatedContexts.values()].map((ctx) => ctx.close().catch(() => {}));
+    let isoTimer;
+    await Promise.race([
+      Promise.all(isoCloses),
+      new Promise((resolve) => { isoTimer = setTimeout(resolve, 2000); }),
+    ]);
+    clearTimeout(isoTimer);
     this.isolatedContexts.clear();
     this.tabContextName.clear();
 

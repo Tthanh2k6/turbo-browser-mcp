@@ -283,7 +283,30 @@ export async function createCdpBridgeServer({
       });
   }
 
+  // Browser contexts a client created through the bridge die with that client, unless another client
+  // already works inside them (then that client inherits them). The default context is never touched.
+  function contextInUseByOther(client, ctxId) {
+    for (const other of clients) {
+      if (other === client || other.closed) continue;
+      for (const tid of other.attachedTargetIds) {
+        const info = discoveredTargets.get(tid) || [...bridgeAttached.values()].find((p) => p.targetInfo?.targetId === tid)?.targetInfo;
+        if (info?.browserContextId === ctxId) return other;
+      }
+    }
+    return null;
+  }
+
+  function disposeClientContexts(client) {
+    for (const ctxId of [...client.createdContexts]) {
+      client.createdContexts.delete(ctxId);
+      const heir = contextInUseByOther(client, ctxId);
+      if (heir) heir.createdContexts.add(ctxId);
+      else void callUpstreamInternal('Target.disposeBrowserContext', { browserContextId: ctxId });
+    }
+  }
+
   function releaseClient(client) {
+    disposeClientContexts(client);
     for (const sid of client.sessions) {
       owners.delete(sid);
       void callUpstreamInternal('Target.detachFromTarget', { sessionId: sid });
@@ -340,8 +363,14 @@ export async function createCdpBridgeServer({
                 pending.internalResolve(msg.result ?? null);
                 return;
               }
+              if (pending.method === 'Target.createBrowserContext' && msg.result?.browserContextId) {
+                if (pending.client && !pending.client.closed) pending.client.createdContexts.add(msg.result.browserContextId);
+                else if (pending.client) void callUpstreamInternal('Target.disposeBrowserContext', { browserContextId: msg.result.browserContextId });
+              } else if (pending.method === 'Target.disposeBrowserContext' && !msg.error && pending.contextId) {
+                pending.client?.createdContexts.delete(pending.contextId);
+              }
               if (pending.client && !pending.client.closed) {
-                if (pending.method === 'Target.attachToTarget' && msg.result?.sessionId) {
+                if ((pending.method === 'Target.attachToTarget' || pending.method === 'Target.attachToBrowserTarget') && msg.result?.sessionId) {
                   owners.set(msg.result.sessionId, { client: pending.client, targetId: pending.targetId, root: false });
                   pending.client.sessions.add(msg.result.sessionId);
                 } else if (pending.method === 'Target.detachFromTarget' && pending.detachSessionId) {
@@ -533,6 +562,7 @@ export async function createCdpBridgeServer({
     client.sessions = new Set();
     client.tasks = new Set();
     client.attachedTargetIds = new Set();
+    client.createdContexts = new Set();
     clients.add(client);
 
     const reply = (id, result, sessionId) =>
@@ -615,6 +645,7 @@ export async function createCdpBridgeServer({
         internalResolve: null,
         method: parsed.method,
         targetId: parsed.params?.targetId,
+        contextId: parsed.method === 'Target.disposeBrowserContext' ? parsed.params?.browserContextId : undefined,
         detachSessionId: parsed.method === 'Target.detachFromTarget' ? parsed.params?.sessionId : undefined,
       });
       sendUpstreamRaw({ ...parsed, id: upstreamId });
