@@ -5576,9 +5576,14 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
         ? params.text.split('|').map((x) => x.trim()).filter(Boolean)
         : [];
       const altMode = textAlts.length > 1;
-      const altRe = altMode
-        ? new RegExp(textAlts.map((x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'i')
-        : null;
+      // A plain word ("Error") must not match inside another word ("errors"); phrases and punctuation stay substrings.
+      const altSource = (x) => {
+        const esc = x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        return /^[\p{L}\p{N}_]+$/u.test(x) ? `(?<![\\p{L}\\p{N}_])${esc}(?![\\p{L}\\p{N}_])` : esc;
+      };
+      const altRe = altMode ? new RegExp(textAlts.map(altSource).join('|'), 'iu') : null;
+      const altRes = altMode ? textAlts.map((x) => ({ x, re: new RegExp(altSource(x), 'iu') })) : [];
+      let matchedSnippet = '';
       const makeListLoc = (f) =>
         params.selector
           ? f.frame.locator(params.selector)
@@ -5634,8 +5639,11 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
             if (await list.nth(i).isVisible().catch(() => false)) {
               foundVisible = true;
               if (altMode) {
-                const hay = ((await list.nth(i).textContent().catch(() => '')) || '').toLowerCase();
-                matchedAlt = textAlts.find((x) => hay.includes(x.toLowerCase()));
+                const hay = (await list.nth(i).textContent().catch(() => '')) || '';
+                const hit = altRes.find((a) => a.re.test(hay));
+                matchedAlt = hit?.x;
+                const at = hit ? hay.search(hit.re) : -1;
+                if (at >= 0) matchedSnippet = hay.slice(Math.max(0, at - 30), at + 50).replace(/\s+/g, ' ').trim();
               }
               break;
             }
@@ -5674,7 +5682,7 @@ ${el.value || ''}`.toLowerCase();
       if (!foundVisible) {
         throw new Error(`Timed out after ${timeout}ms waiting for "${params.selector || params.text}" to become ${desiredState}.`);
       }
-      return { ok: true, action, waitedFor: params.selector || params.text, ...(matchedAlt ? { matched: matchedAlt } : {}) };
+      return { ok: true, action, waitedFor: params.selector || params.text, ...(matchedAlt ? { matched: matchedAlt, ...(matchedSnippet ? { snippet: matchedSnippet } : {}) } : {}) };
     }
     const wantMs = Number(params.ms) || 500;
     const ms = Math.min(wantMs, 15000);

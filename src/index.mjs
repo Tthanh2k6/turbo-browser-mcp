@@ -137,6 +137,7 @@ export const TOOL_DEFINITIONS = [
                 description: 'Max concurrent tabs opened per batch for open_many (1-10).',
               },
               tabId: { type: 'integer' },
+              force: { type: 'boolean', description: 'close: allow closing the last tab of an attached browser (this closes the browser).' },
               activate: { type: 'boolean' },
               isolatedContext: {
                 type: 'string',

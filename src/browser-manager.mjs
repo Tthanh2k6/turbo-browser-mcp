@@ -137,6 +137,7 @@ export class BrowserManager {
   }
 
   _resetBrowserState() {
+    if (this.connectionType === 'cdp') this._lostCdp = true;
     this.context = null;
     this.browser = null;
     this.connectionType = null;
@@ -287,7 +288,10 @@ export class BrowserManager {
       this.connectionNote = `Chrome remote debugging is no longer available (bridge upstream closed); using ${this.headless ? 'a headless' : 'a separate'} browser. Logged-in sites will not be available.`;
     } else if (this.connectionNote && this.connectionType !== 'cdp') {
       this.connectionNote = `${this.connectionType} fallback (${this.connectionNote})`;
+    } else if (this._lostCdp && this.connectionType !== 'cdp') {
+      this.connectionNote = `The attached Chrome is gone (closed or disconnected); using ${this.headless ? 'a headless' : 'a separate'} ${this.connectionType} browser. Logged-in sites will not be available.`;
     }
+    if (this.connectionType === 'cdp') this._lostCdp = false;
 
     const currentBrowser = this.browser;
     const currentContext = this.context;
@@ -1433,6 +1437,10 @@ export class BrowserManager {
 
       if (action === 'close') {
         const { tabId, page } = await this.getPage(op.tabId);
+        // Closing the last page of an attached browser closes the whole browser (the owner's Chrome).
+        if (this.connectionType === 'cdp' && op.force !== true && this.context.pages().filter((p) => !p.isClosed()).length <= 1) {
+          throw new Error('Refusing to close the last tab of the attached browser: that closes Chrome. Open about:blank first, or pass force:true.');
+        }
         await page.close();
         this.tabs.delete(tabId);
         this._syncOpenPages();
