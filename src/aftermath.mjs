@@ -66,6 +66,9 @@ export function watchActivity(page) {
 // (one line per page) and attached once to the next tool result on that tab.
 const lateNotes = new WeakMap();
 const LATE_MS = 2000;
+export function parkLate(page, text) {
+  if (page && !lateNotes.has(page)) lateNotes.set(page, text);
+}
 export function takeLate(page) {
   const n = page && lateNotes.get(page);
   if (n) lateNotes.delete(page);

@@ -249,6 +249,10 @@ A label-based guard has three gaps, and each has an opt-in answer. `expect`, `su
 
 Every blocked result says which mechanism stopped it: `blockedBy` is `label`, `modal`, `network` or `ledger`.
 
+   - Second check, report only: a click that starts a `POST`/`PUT`/`PATCH`/`DELETE` fetch or XHR (analytics and telemetry endpoints excluded) while `allowSubmit` is not true gets `possibleSubmit: true` and `request: "POST host"`, because an icon-only button outside a form passes the label and form checks. A request that starts up to 800 ms after the result is attached to the next tool result as `possibleSubmit: ...`. Nothing is blocked after the fact.
+
+Navigation results carry `blocked: "thin"` when the page is a near-empty stub (under 40 words, no login form) that came with HTTP 403/429 or a `noindex` robots meta: a normal browser may see a full page that this one was not given. A normal tiny 200 page is not flagged.
+
 Limits:
 
 - The network guard watches the action plus `networkGuardSettleMs` (250 ms) afterwards, so a commit fired later by a timer is not caught. WebSocket messages, service-worker requests and cross-site `fetch` POSTs are not inspected (cross-site navigations are). Patterns in `TURBO_BROWSER_NETWORK_GUARD_ALLOW` are split on commas, so a pattern cannot contain one.

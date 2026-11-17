@@ -61,6 +61,7 @@ it('does not interpret hash changes as different paths', async () => {
   assert.equal(result.aftermath.navigated, false);
 });
 it('keeps the label guard and removes listeners for blocked or failed clicks', async () => {
+  await new Promise((r) => setTimeout(r, 900)); // the previous click's 800 ms request watch has ended
   const requests = page.listenerCount('request'), navigations = page.listenerCount('framenavigated');
   const result = await actFast(page, { action: 'click', selector: '#final', observeAftermath: true });
   assert.equal(result.blocked, true);

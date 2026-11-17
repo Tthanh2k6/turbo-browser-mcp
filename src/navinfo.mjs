@@ -116,6 +116,21 @@ export async function navHealth(page, response, requestedUrl, title, opts = {}) 
       }
     }
   }
+  // Near-empty page that a normal browser would see in full: 403/429, or a noindex stub, with under ~40 words and no login form.
+  if (!blocked) {
+    const suspect = status === 403 || status === 429;
+    const thin = await Promise.race([
+      page.evaluate((statusHit) => {
+        const noindex = [...document.querySelectorAll('meta[name="robots" i]')].some((m) => /noindex/i.test(m.getAttribute('content') || ''));
+        if (!statusHit && !noindex) return false;
+        const words = (document.body?.innerText || '').trim().split(/\s+/).filter(Boolean).length;
+        const login = [...document.querySelectorAll('input[type=password]')].some((i) => i.getBoundingClientRect().width > 0);
+        return words < 40 && !login;
+      }, suspect),
+      new Promise((r) => setTimeout(() => r(false), 400)),
+    ]).catch(() => false);
+    if (thin) blocked = 'thin';
+  }
   if (blocked) out.blocked = blocked;
   return out;
 }

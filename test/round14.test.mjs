@@ -72,6 +72,6 @@ describe('round 14: authwall detection', () => {
     const a = await call('tabs_batch', { operations: [{ action: 'open', url: `${base()}/forbidden-form` }] });
     assert.equal(a.results[0].blocked, 'authwall', JSON.stringify(a.results[0]));
     const b = await call('tabs_batch', { operations: [{ action: 'open', url: `${base()}/forbidden-plain` }] });
-    assert.equal(b.results[0].blocked, undefined, JSON.stringify(b.results[0]));
+    assert.equal(b.results[0].blocked, 'thin', JSON.stringify(b.results[0])); // a 1-word 403 stub is a thin page, not an authwall
   });
 });

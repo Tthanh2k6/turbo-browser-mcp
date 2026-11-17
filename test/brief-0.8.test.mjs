@@ -99,6 +99,7 @@ it('navigation outcome is navigated and a late commit-like POST is still reporte
 
 it('settle detaches its listeners', async () => {
   await page.setContent('<button id="b">Nothing</button>');
+  await new Promise((r) => setTimeout(r, 900)); // the previous click's 800 ms request watch has ended
   const before = ['request', 'requestfinished', 'requestfailed'].map(e => page.listenerCount(e));
   await actFast(page, { action: 'click', selector: '#b', returnSnapshot: true, observeAftermath: true });
   await new Promise((r) => setTimeout(r, 2300)); // the late-aftermath listeners detach themselves after 2 s

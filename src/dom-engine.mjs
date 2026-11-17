@@ -1,7 +1,10 @@
 import fs from 'node:fs';
 import { gotoRetry, navHealth } from './navinfo.mjs';
+
+// Analytics and telemetry endpoints are not submits.
+const ANALYTICS_RE = /(google-analytics|googletagmanager|doubleclick|segment\.(io|com)|mixpanel|amplitude|sentry\.io|hotjar|clarity\.ms|datadoghq|newrelic|bugsnag|logrocket|fullstory|plausible|posthog|\/(collect|beacon|analytics|telemetry|track|log|events?)(\/|$))/i;
 import { urlDenial, peekBlocked, denyMessage, matchUrl, getPolicy } from './allow-hosts.mjs';
-import { observeClickAftermath, watchActivity } from './aftermath.mjs';
+import { observeClickAftermath, parkLate, watchActivity } from './aftermath.mjs';
 import { armToasts, takeToast } from './toast.mjs';
 import { wrapPage, boundariesEnabled } from './boundaries.mjs';
 import { redactText } from './secrets.mjs';
@@ -5380,6 +5383,25 @@ async function executeSingleAction(page, params = {}) {
   ctxForTabs?.on('page', onNewPage);
   let res;
   silentState.wantKind = Boolean(observer);
+  // Second check behind the label/type/form heuristics: an icon-only button outside a form can still submit.
+  // Mutating fetch/XHR requests started by a click are reported (never blocked); one that starts within ~800 ms
+  // after the result is parked on the next tool result.
+  const clickAction = ['click', 'dblclick'].includes(params.action);
+  const mutating = [];
+  let watchOpen = clickAction;
+  let returned = false;
+  let completed = false;
+  const onMutating = (request) => {
+    if (!watchOpen || !/^(POST|PUT|PATCH|DELETE)$/.test(request.method()) || !['fetch', 'xhr'].includes(request.resourceType())) return;
+    let host = '';
+    let path = '';
+    try { const u = new URL(request.url()); host = u.host; path = u.pathname; } catch { return; }
+    if (ANALYTICS_RE.test(host) || ANALYTICS_RE.test(path)) return;
+    if (returned) parkLate(page, `possibleSubmit: ${request.method()} ${host}${path.slice(0, 60)}`);
+    else mutating.push({ method: request.method(), host });
+  };
+  // With observeAftermath the aftermath report already lists mutating requests (and parks late ones itself).
+  if (clickAction && !observer) page.on('request', onMutating);
   try {
     try {
       res = await executeSingleActionInner(page, params, silentState);
@@ -5409,7 +5431,22 @@ async function executeSingleAction(page, params = {}) {
         if (links.length) res.outboundLinks = links;
       }
     }
+    completed = true;
   } finally {
+    returned = true;
+    if (clickAction) {
+      const ok = completed && res && typeof res === 'object' && !res.blocked;
+      const seen = observer ? (res?.aftermath?.mutatingRequests || []).map((r) => ({ method: r.method, host: (() => { try { return new URL(r.url).host; } catch { return ''; } })() })) : mutating;
+      if (ok && seen.length && params.allowSubmit !== true) {
+        res.possibleSubmit = true;
+        res.request = `${seen[0].method} ${seen[0].host}`;
+      }
+      if (observer || !ok) { watchOpen = false; page.off('request', onMutating); }
+      else {
+        const t = setTimeout(() => { watchOpen = false; page.off('request', onMutating); }, 800);
+        t.unref?.();
+      }
+    }
     ctxForTabs?.off('page', onNewPage);
     if (res && res._applyLike !== undefined) delete res._applyLike;
     observer?.remove();
