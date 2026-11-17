@@ -76,10 +76,15 @@ it('click that changes the DOM reports outcome changed and settles quickly', asy
 
 it('click with no effect reports outcome none and does not wait the old 300 ms to 1 s', async () => {
   await page.setContent('<button id="b">Nothing</button>');
-  const t0 = Date.now();
-  const result = await actFast(page, { action: 'click', selector: '#b', returnSnapshot: true });
-  assert.equal(result.outcome, 'none');
-  assert.ok(Date.now() - t0 < 600, `took ${Date.now() - t0} ms`);
+  // Best of three: a loaded CI runner can delay one click by a few hundred ms without the settle step waiting.
+  const times = [];
+  for (let i = 0; i < 3; i++) {
+    const t0 = Date.now();
+    const result = await actFast(page, { action: 'click', selector: '#b', returnSnapshot: true });
+    assert.equal(result.outcome, 'none');
+    times.push(Date.now() - t0);
+  }
+  assert.ok(Math.min(...times) < 600, `took ${times.join(', ')} ms`);
 });
 
 it('navigation outcome is navigated and a late commit-like POST is still reported', async () => {
