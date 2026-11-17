@@ -894,7 +894,8 @@ describe('sim-carbon-recheck3: Round-5 deep adversarial & regression suite', { c
         document.getElementById('b5').textContent = 'Btn_5_Updated';
       });
       const delta = await inspectCompact(page, { onlyChanged: true }, st);
-      assert.match(delta.text, /\[f0:e6\] <button> "Btn_5_Updated"/);
+      // Numbering continues across documents on one tab (round 19c), so the exact number depends on earlier tests.
+      assert.match(delta.text, /\[f0:e\d+\] <button> "Btn_5_Updated"/);
       assert.ok(!delta.text.includes('"Btn_0"'), delta.text);
     });
 

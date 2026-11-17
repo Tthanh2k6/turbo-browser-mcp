@@ -77,16 +77,20 @@ describe('ref stability within a document', () => {
     assert.match(await clickFails(page, before.get(70)), /not found/i);
   });
 
-  it('3: after a real navigation numbering may restart and old refs fail', async () => {
+  it('3: after a real navigation numbering continues above the old marks and old refs fail with a navigated hint', async () => {
     const html = Array.from({ length: 20 }, (_, i) => `<button>Old ${i}</button>`).join('');
     await page.goto(`data:text/html,<body>${encodeURIComponent(html)}</body>`);
     const state = new Set();
     const first = await inspectCompact(page, { maxChars: 20000 }, state);
     const old = refOf(first.text, 'Old 17');
     assert.ok(old);
-    await page.goto('data:text/html,<body><button>New 0</button><button>New 1</button></body>');
+    // The new document has 40 buttons, so a restarted counter would give "New 17" the same number as the old ref.
+    const html2 = Array.from({ length: 40 }, (_, i) => `<button onclick="document.title='clicked ' + this.textContent">New ${i}</button>`).join('');
+    await page.goto(`data:text/html,<title>t</title><body>${encodeURIComponent(html2)}</body>`);
     const second = await inspectCompact(page, { maxChars: 20000 }, state);
-    assert.ok(maxRef(second.text) <= 2, second.text);
-    assert.match(await clickFails(page, old), /not found/i);
+    assert.notEqual(refOf(second.text, 'New 17'), old);
+    assert.ok(Math.min(...[...second.text.matchAll(/\[f0:e(\d+)\]/g)].map((m) => Number(m[1]))) > Number(/e(\d+)$/.exec(old)[1]));
+    assert.match(await clickFails(page, old), /navigated or re-rendered since this ref was issued/i);
+    assert.equal(await page.title(), 't', 'no button was clicked');
   });
 });

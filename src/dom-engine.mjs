@@ -499,6 +499,9 @@ export async function resolveTarget(page, { ref, selector, text, frameIdx, allow
     }
     if (fallback) return fallback;
     const near = await nearbyRefs(candidates, parsed.refId);
+    if (refWasIssued(page, ref)) {
+      throw new Error(`Element ref "${ref}" not found (page navigated or re-rendered since this ref was issued). ${near ? `Nearest current refs: ${near}. ` : ''}Run inspect_compact again.`);
+    }
     throw new Error(`Element ref "${ref}" not found. ${near ? `Nearest current refs: ${near}. If the page re-rendered, re-run inspect_compact (same query).` : 'Run inspect_compact to refresh refs.'}`);
   }
 
@@ -1535,6 +1538,13 @@ async function isEnterSubmitTarget(page, locator, extra = {}) {
  * assigning deterministic data-tbm-ref IDs and supporting query, onlyChanged delta, boxes, and savePath.
  */
 const snapshotBaselines = new WeakMap();
+// Highest ref number ever issued on a tab, kept in Node so it survives navigations (cross-origin included) and covers
+// every frame: a new document starts numbering above it, so an old ref can only fail, never hit an unrelated element.
+const pageRefHigh = new WeakMap();
+const refWasIssued = (page, ref) => {
+  const n = Number(/e(\d+)$/i.exec(String(ref))?.[1]);
+  return Number.isFinite(n) && n <= (pageRefHigh.get(page) || 0);
+};
 
 // Same label rules the submit guard uses, applied to a snapshot line: `[f0:e3] <button> "Submit"`.
 function isSubmitLikeLine(line) {
@@ -1567,7 +1577,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
   // the per-document high-water mark (window.__tbmRefHigh), so a stale ref can only fail, never hit another element.
   const preserveRefs = true;
   const frames = includeFrames ? allFrames : allFrames.slice(0, 1);
-  let nextRefNum = store?.nextRefNum || 1;
+  let nextRefNum = Math.max(store?.nextRefNum || 1, (pageRefHigh.get(page) || 0) + 1);
   if (allFrames.length > 1) {
     // Keep bare eN unique across frames: start above the highest ref any frame already holds.
     for (const frameInfo of allFrames) {
@@ -2067,6 +2077,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
     if (!chunk) continue;
     scannedFrames.add(`f${frameInfo.frameIdx}`);
     nextRefNum = chunk.nextRef;
+    pageRefHigh.set(page, Math.max(pageRefHigh.get(page) || 0, chunk.nextRef - 1));
     totalMatched += chunk.total;
 
     const frameItems = [];
