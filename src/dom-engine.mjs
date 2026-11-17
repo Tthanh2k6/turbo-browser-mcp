@@ -455,9 +455,12 @@ export function cleanErrorMessage(raw) {
 function conciseActionError(err) {
   const raw = String(err?.message || err);
   const msg = cleanErrorMessage(raw);
-  const m = /(<.{3,300}?>)[^\r\n]*?\s+intercepts pointer events/.exec(raw.replace(ANSI_RE, ''));
+  const m = /(<.{3,300}?>)([^\r\n]*?)\s+intercepts pointer events/.exec(raw.replace(ANSI_RE, ''));
   if (!m) return msg === raw ? err : new Error(msg);
-  const covering = m[1].replace(/\s+/g, ' ').slice(0, 140);
+  // Playwright says "<path ...> from <ext-host id=...> subtree" when the cover lives in another subtree (an
+  // extension's floating widget, a shadow host): name that host, a bare svg path tells nobody anything.
+  const host = /\sfrom\s+(<[^\r\n]{3,300}?>)\s+subtree/.exec(m[2]);
+  const covering = (host ? host[1] : m[1]).replace(/\s+/g, ' ').slice(0, 140);
   return new Error(`Click blocked: ${covering} covers the target. Close or scroll it away, or act on it, then retry.`);
 }
 

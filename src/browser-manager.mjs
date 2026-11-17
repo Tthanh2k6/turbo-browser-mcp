@@ -588,13 +588,74 @@ export class BrowserManager {
     }
   }
 
+  // Page targets as the browser reports them (raw CDP, independent of Playwright's Page objects). [] when unavailable.
+  async _rawPageTargets() {
+    if (this.connectionType !== 'cdp' || !this._cdpEndpoint) return [];
+    try {
+      const r = await cdpRawCall(this._cdpEndpoint, 'Target.getTargets', {}, 2000, { onlyBridge: /^wss?:/i.test(this._cdpEndpoint) });
+      return (r?.targetInfos || []).filter((t) => t.type === 'page');
+    } catch {
+      return [];
+    }
+  }
+
+  // A tab whose Page object went stale (url stays "" after a browser-initiated navigation or a swapped target, e.g.
+  // omnibox from the new-tab page) while the browser lists a real page url nobody here knows. Playwright cannot
+  // re-attach a single Page, so reconnect once and keep every tab's id. Returns true when it reconnected.
+  async _healStalePages() {
+    if (this.connectionType !== 'cdp' || !this.context || this.isolatedContexts.size > 0) return false;
+    let pages;
+    try { pages = this.context.pages().filter((p) => !p.isClosed()); } catch { return false; }
+    const empty = pages.filter((p) => p.url() === '');
+    this._staleFallback = null;
+    if (empty.length === 0 || Date.now() - (this._lastHeal || 0) < 8000) return false;
+    const known = new Set(pages.map((p) => p.url()).filter(Boolean));
+    const lost = (await this._rawPageTargets()).filter((t) => t.url && !known.has(t.url) && !/^(chrome|devtools|about|chrome-untrusted|edge):/i.test(t.url));
+    if (lost.length === 0) return false;
+    this._lastHeal = Date.now();
+    const order = pages.map((p) => this.pageToId.get(p));
+    const oldActive = this.activeTabId;
+    const ctxName = new Map([...this.tabContextName]);
+    const oldBrowser = this.browser;
+    this._resetBrowserState();
+    await oldBrowser?.close().catch(() => {});
+    try {
+      await this.ensureReady();
+    } catch {
+      return false;
+    }
+    const fresh = this.context.pages().filter((p) => !p.isClosed());
+    if (fresh.length === order.length) {
+      this.tabs.clear();
+      this.tabContextName.clear();
+      fresh.forEach((p, i) => {
+        const id = order[i];
+        this.tabs.set(id, p);
+        this.pageToId.set(p, id);
+        this.tabContextName.set(id, ctxName.get(id) || 'default');
+      });
+      this.activeTabId = this.tabs.has(oldActive) ? oldActive : order[0] ?? null;
+    }
+    const still = this.context.pages().filter((p) => !p.isClosed() && p.url() === '');
+    if (still.length === 1 && lost.length === 1) this._staleFallback = { page: still[0], url: lost[0].url, title: lost[0].title || '' };
+    return true;
+  }
+
   async _requireResponsive(page) {
+    // Returns the page to use: after a reconnect (stale Page object) that is the tab's fresh Page, same tabId.
+    const id = this.pageToId.get(page);
+    const renewed = () => (id !== undefined && this.tabs.get(id)) || page;
+    if (page.url() === '' && (await this._healStalePages().catch(() => false))) return renewed();
     // Only pages already marked unresponsive (at attach time or by tabs_batch list) pay for a probe:
     // a short re-check, since the dialog may be gone. Probing every page on every call made slow
     // but healthy pages (heavy scripts mid-load) look blocked.
-    if (!this.isPageUnresponsive(page)) return;
+    if (!this.isPageUnresponsive(page)) return page;
     const ok = await this.probePage(page, Number(process.env.TURBO_BROWSER_PROBE_MS) || 1000);
-    if (!ok) throw new Error('page main world is blocked (open dialog or paused debugger?)');
+    if (!ok) {
+      if (await this._healStalePages().catch(() => false)) return renewed();
+      throw new Error('page main world is blocked (open dialog or paused debugger?)');
+    }
+    return page;
   }
 
   _ensureDiagState(page) {
@@ -850,15 +911,15 @@ export class BrowserManager {
         throw new Error(`Tab ${tabId} not found or closed.`);
       }
       await this._guard(target);
-      await this._requireResponsive(target);
-      return { tabId, page: target };
+      const usable = await this._requireResponsive(target);
+      return { tabId, page: usable };
     }
 
     if (this.activeTabId !== null && this.tabs.has(this.activeTabId)) {
       const activePage = this.tabs.get(this.activeTabId);
       await this._guard(activePage);
-      await this._requireResponsive(activePage);
-      return { tabId: this.activeTabId, page: activePage };
+      const usable = await this._requireResponsive(activePage);
+      return { tabId: this.activeTabId, page: usable };
     }
 
     const page = await this.context.newPage();
@@ -948,6 +1009,7 @@ export class BrowserManager {
   async listTabs() {
     await this.ensureReady();
     this._syncOpenPages();
+    await this._healStalePages().catch(() => {});
     await this._labelForeignContextPages();
     const results = [];
     // Re-probe the main world of every tab in parallel (1.5 s cap): marks tabs that got stuck after
@@ -973,7 +1035,8 @@ export class BrowserManager {
           clearTimeout(timer);
         }
       }
-      const url = page.url();
+      let url = page.url();
+      if (url === '' && this._staleFallback?.page === page) { url = this._staleFallback.url; title = this._staleFallback.title; }
       const entry = {
         tabId,
         url,
