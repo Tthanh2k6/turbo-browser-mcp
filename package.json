@@ -1,6 +1,6 @@
 {
   "name": "turbo-browser-mcp",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "MCP server for browser automation on Playwright. It fills whole forms and runs action lists in one call, returns only changed elements, and blocks final Submit clicks by default.",
   "type": "module",
   "main": "./src/index.mjs",

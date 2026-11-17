@@ -847,7 +847,7 @@ export async function killVerifiedStaleBridge(bridgePort = DEFAULT_BRIDGE_PORT, 
     if (process.platform === 'win32') {
       const ps = `$c = Get-NetTCPConnection -LocalPort ${Number(bridgePort)} -ErrorAction Stop | Where-Object { $_.RemotePort -eq 0 } | Select-Object -First 1; ` +
         '$p = Get-CimInstance Win32_Process -Filter "ProcessId=$($c.OwningProcess)"; "$($p.ProcessId)|$($p.CommandLine)"';
-      const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8', timeout: 6000, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+      const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8', timeout: 15000, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
       [pid, cmd] = [Number(out.split('|')[0]), out.slice(out.indexOf('|') + 1)];
     } else {
       pid = Number(execFileSync('lsof', ['-ti', `tcp:${Number(bridgePort)}`, '-sTCP:LISTEN'], { encoding: 'utf8', timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'] }).split(/\s+/)[0]);
