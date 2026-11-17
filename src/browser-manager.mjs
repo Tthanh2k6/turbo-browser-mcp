@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { checkBridgeHealth, ensureCdpBridgeDaemon } from './cdp-bridge.mjs';
+import { checkBridgeHealth, ensureCdpBridgeDaemon, redactBridgeToken } from './cdp-bridge.mjs';
 import { cdpRawCall } from './cdp-raw.mjs';
 import { resolveSafePath } from './dom-engine.mjs';
 import { gotoRetry, navHealth } from './navinfo.mjs';
@@ -227,6 +227,7 @@ export class BrowserManager {
         const bridged = await ensureCdpBridgeDaemon(targetEndpoint, {
           timeoutMs: this.mode === 'auto' ? Math.max(12000, human ? waitMs + 2000 : 0) : Math.max(this.defaultTimeoutMs, 30000),
           ...(this.bridgePort ? { bridgePort: this.bridgePort } : {}),
+          insecure: process.env.TURBO_BROWSER_BRIDGE_INSECURE === 'true',
           onNote: (n) => { if (/did not start/.test(n)) bridgeTimedOut = true; this._note(n); },
         });
         if (bridged) {
@@ -254,7 +255,7 @@ export class BrowserManager {
         }
         if (this.mode === 'cdp') {
           throw new Error(
-            `Failed to attach via CDP at ${targetEndpoint}. Enable chrome://inspect/#remote-debugging (and click Allow on the prompt) or start Chrome with --remote-debugging-port=9222. (${err.message})`
+            `Failed to attach via CDP at ${redactBridgeToken(targetEndpoint)}. Enable chrome://inspect/#remote-debugging (and click Allow on the prompt) or start Chrome with --remote-debugging-port=9222. (${err.message})`
           );
         }
       }

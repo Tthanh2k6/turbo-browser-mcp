@@ -10,6 +10,65 @@ import { fileURLToPath } from 'node:url';
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 export const DEFAULT_BRIDGE_PORT = Number(process.env.TURBO_BROWSER_BRIDGE_PORT) || 9224;
 
+// ---------- bridge authentication ----------
+// The bridge holds a Chrome connection the owner already approved, so every request needs a random per-start token.
+// The token lives in a state file under the user's profile (mode 0600; on Windows it inherits the profile's ACL) and
+// turbo clients read it from there. Host and Origin are checked as well, so a web page cannot reach the bridge.
+export function bridgeStatePath(port) {
+  return path.join(os.homedir(), '.turbo-browser-mcp', `bridge-${Number(port)}.json`);
+}
+export function readBridgeToken(port) {
+  try {
+    return String(JSON.parse(fs.readFileSync(bridgeStatePath(port), 'utf8')).token || '');
+  } catch {
+    return '';
+  }
+}
+function writeBridgeToken(port, token) {
+  const file = bridgeStatePath(port);
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, JSON.stringify({ token, pid: process.pid, created: new Date().toISOString() }), { mode: 0o600 });
+  try { fs.chmodSync(file, 0o600); } catch { /* not supported on this platform */ }
+}
+/** Add the stored token to a local http(s) bridge url that has none. Other urls pass through unchanged. */
+export function bridgeUrlWithToken(url) {
+  try {
+    const u = new URL(url);
+    if (!/^https?:$/.test(u.protocol) || u.searchParams.has('token') || !['127.0.0.1', 'localhost'].includes(u.hostname)) return url;
+    const token = readBridgeToken(Number(u.port));
+    if (!token) return url;
+    u.searchParams.set('token', token);
+    return u.href;
+  } catch {
+    return url;
+  }
+}
+/** Never print a token: for logs and CLI output. */
+export function redactBridgeToken(text) {
+  return String(text).replace(/([?&]token=)[^&"\s]+/g, '$1***');
+}
+const safeEq = (a, b) => {
+  const ha = crypto.createHash('sha256').update(String(a)).digest();
+  const hb = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+};
+function hostAllowed(hostHeader) {
+  if (!hostHeader) return false;
+  const m = /^(\[[^\]]+\]|[^:]+)(?::\d+)?$/.exec(String(hostHeader).trim());
+  return Boolean(m) && ['localhost', '127.0.0.1', '[::1]'].includes(m[1].toLowerCase());
+}
+// A web page origin is refused; no Origin header (a program) or an extension/DevTools origin is fine.
+function originAllowed(origin) {
+  return origin === undefined || /^(chrome-extension|devtools):\/\//i.test(String(origin));
+}
+function requestToken(req) {
+  const auth = req.headers.authorization;
+  if (typeof auth === 'string' && /^bearer /i.test(auth)) return auth.slice(7).trim();
+  const hdr = req.headers['x-turbo-bridge-token'];
+  if (typeof hdr === 'string') return hdr;
+  try { return new URL(req.url || '/', 'http://localhost').searchParams.get('token') || ''; } catch { return ''; }
+}
+
 /**
  * Encode a UTF-8 string or Buffer into an RFC 6455 WebSocket frame.
  * Set `mask = true` for client-to-server frames, `false` for server-to-client frames.
@@ -188,7 +247,19 @@ export async function createCdpBridgeServer({
   log = null,
   // Called when the bridge's own listening socket errors or closes unexpectedly (not via /shutdown).
   onServerLost = null,
+  // Required by default; a random token is generated when none is given. insecure:true is the explicit opt-out.
+  token = null,
+  insecure = false,
 } = {}) {
+  const authToken = insecure ? '' : (token || crypto.randomBytes(24).toString('hex'));
+  const tokenSuffix = authToken ? `?token=${encodeURIComponent(authToken)}` : '';
+  // Returns [status, reason] for a request that must be refused, else null.
+  const refuse = (req) => {
+    if (!hostAllowed(req.headers.host)) return [403, 'host not allowed'];
+    if (!originAllowed(req.headers.origin)) return [403, 'origin not allowed'];
+    if (authToken && !safeEq(requestToken(req), authToken)) return [401, 'token required'];
+    return null;
+  };
   if (!upstreamUrl || (!upstreamUrl.startsWith('ws://') && !upstreamUrl.startsWith('wss://'))) {
     throw new Error(`createCdpBridgeServer requires a ws:// or wss:// upstreamUrl (got ${upstreamUrl})`);
   }
@@ -558,7 +629,13 @@ export async function createCdpBridgeServer({
   const server = http.createServer((req, res) => {
     const addr = server.address();
     const actualPort = typeof addr === 'object' && addr ? addr.port : port;
-    const wsEndpoint = `ws://${host}:${actualPort}/devtools/browser/turbo-bridge`;
+    const wsEndpoint = `ws://${host}:${actualPort}/devtools/browser/turbo-bridge${tokenSuffix}`;
+    const denied = refuse(req);
+    if (denied) {
+      res.writeHead(denied[0], { 'Content-Type': 'text/plain' });
+      res.end(denied[1]);
+      return;
+    }
 
     if (req.url?.startsWith('/json/version')) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -567,6 +644,7 @@ export async function createCdpBridgeServer({
           ...browserVersionInfo,
           webSocketDebuggerUrl: wsEndpoint,
           turboBridge: true,
+          tokenRequired: Boolean(authToken),
           upstreamUrl,
           upstreamConnected,
         })
@@ -604,7 +682,17 @@ export async function createCdpBridgeServer({
     res.end();
   });
 
+  // Upgraded sockets are no longer tracked by the http server: keep them so close() can end them.
+  const upgradedSockets = new Set();
   server.on('upgrade', (req, socket) => {
+    upgradedSockets.add(socket);
+    socket.once('close', () => upgradedSockets.delete(socket));
+    const denied = refuse(req);
+    if (denied) {
+      socket.on('error', () => {});
+      socket.end(['HTTP/1.1 ' + denied[0] + ' ' + (denied[0] === 401 ? 'Unauthorized' : 'Forbidden'), 'Connection: close', '', ''].join('\r\n'), () => socket.destroy());
+      return;
+    }
     const key = req.headers['sec-websocket-key'];
     if (!key || !upstreamConnected) {
       socket.destroy();
@@ -764,14 +852,17 @@ export async function createCdpBridgeServer({
 
   const addr = server.address();
   const actualPort = typeof addr === 'object' && addr ? addr.port : port;
-  const bridgeHttpUrl = `http://${host}:${actualPort}`;
-  const bridgeWsUrl = `ws://${host}:${actualPort}/devtools/browser/turbo-bridge`;
+  if (authToken) writeBridgeToken(actualPort, authToken);
+  // With a token the url carries it as ?token=: Playwright keeps the query when it asks /json/version.
+  const bridgeHttpUrl = `http://${host}:${actualPort}${authToken ? tokenSuffix.replace('?', '/?') : ''}`;
+  const bridgeWsUrl = `ws://${host}:${actualPort}/devtools/browser/turbo-bridge${tokenSuffix}`;
 
   return {
     server,
     port: actualPort,
     bridgeHttpUrl,
     bridgeWsUrl,
+    token: authToken,
     close: async () => {
       shuttingDown = true;
       for (const c of clients) c.close(1001, 'turbo-bridge: shutting down');
@@ -779,7 +870,10 @@ export async function createCdpBridgeServer({
       try {
         upstreamWs?.close();
       } catch {}
-      await new Promise((r) => server.close(() => r()));
+      const closed = new Promise((r) => server.close(() => r()));
+      server.closeAllConnections?.();
+      for (const sock of upgradedSockets) sock.destroy();
+      await closed;
     },
   };
 }
@@ -787,16 +881,24 @@ export async function createCdpBridgeServer({
 /**
  * Check if a persistent CDP Bridge is already running and connected to the given upstreamUrl.
  */
+function bridgeFetch(bridgePort, host, route, init = {}) {
+  const token = readBridgeToken(bridgePort);
+  return fetch(`http://${host}:${bridgePort}${route}`, {
+    ...init,
+    headers: { ...(token ? { 'x-turbo-bridge-token': token } : {}), ...(init.headers || {}) },
+    signal: init.signal || AbortSignal.timeout(600),
+  });
+}
+
 export async function getRunningBridgeInfo(bridgePort = DEFAULT_BRIDGE_PORT, host = '127.0.0.1') {
   try {
-    const res = await fetch(`http://${host}:${bridgePort}/json/version`, {
-      signal: AbortSignal.timeout(600),
-    });
+    const res = await bridgeFetch(bridgePort, host, '/json/version');
     if (!res.ok) return null;
     const data = await res.json();
     if (data && data.turboBridge && data.upstreamConnected) {
       return {
-        bridgeHttpUrl: `http://${host}:${bridgePort}`,
+        bridgeHttpUrl: bridgeUrlWithToken(`http://${host}:${bridgePort}`),
+        insecure: !data.tokenRequired,
         bridgeWsUrl: data.webSocketDebuggerUrl,
         upstreamUrl: data.upstreamUrl,
       };
@@ -810,11 +912,13 @@ export async function getRunningBridgeInfo(bridgePort = DEFAULT_BRIDGE_PORT, hos
 /** Like getRunningBridgeInfo, but also reports a bridge whose upstream is gone (upstreamConnected false). */
 export async function probeBridge(bridgePort = DEFAULT_BRIDGE_PORT, host = '127.0.0.1') {
   try {
-    const res = await fetch(`http://${host}:${bridgePort}/json/version`, { signal: AbortSignal.timeout(600) });
+    const res = await bridgeFetch(bridgePort, host, '/json/version');
+    // A bridge that refuses our token (state file gone or replaced) is unusable: report it so it gets replaced.
+    if (res.status === 401) return { bridgeHttpUrl: `http://${host}:${bridgePort}`, upstreamUrl: '', upstreamConnected: false, unauthorized: true };
     if (!res.ok) return null;
     const data = await res.json();
     if (data && data.turboBridge) {
-      return { bridgeHttpUrl: `http://${host}:${bridgePort}`, upstreamUrl: data.upstreamUrl, upstreamConnected: Boolean(data.upstreamConnected) };
+      return { bridgeHttpUrl: bridgeUrlWithToken(`http://${host}:${bridgePort}`), upstreamUrl: data.upstreamUrl, upstreamConnected: Boolean(data.upstreamConnected), insecure: !data.tokenRequired };
     }
   } catch {
     // nothing listening
@@ -825,7 +929,7 @@ export async function probeBridge(bridgePort = DEFAULT_BRIDGE_PORT, host = '127.
 /** Ask a running bridge to exit (POST /shutdown) and wait until its port is free. False for daemons too old to know it. */
 export async function stopBridge(bridgePort = DEFAULT_BRIDGE_PORT, host = '127.0.0.1', waitMs = 2500) {
   try {
-    await fetch(`http://${host}:${bridgePort}/shutdown`, { method: 'POST', signal: AbortSignal.timeout(800) });
+    await bridgeFetch(bridgePort, host, '/shutdown', { method: 'POST', signal: AbortSignal.timeout(800) });
   } catch {
     // fall through to the liveness check
   }
@@ -902,16 +1006,17 @@ export async function checkBridgeHealth(bridgePort = DEFAULT_BRIDGE_PORT, host =
  */
 export async function ensureCdpBridgeDaemon(
   upstreamUrl,
-  { bridgePort = DEFAULT_BRIDGE_PORT, host = '127.0.0.1', timeoutMs = 45000, onNote = null } = {}
+  { bridgePort = DEFAULT_BRIDGE_PORT, host = '127.0.0.1', timeoutMs = 45000, onNote = null, insecure = false } = {}
 ) {
   const existing = await probeBridge(bridgePort, host);
-  if (existing && existing.upstreamConnected && existing.upstreamUrl === upstreamUrl) {
+  // A bridge without a token is never reused silently: it is replaced by an authenticated one (unless insecure was asked for).
+  if (existing && existing.upstreamConnected && existing.upstreamUrl === upstreamUrl && !existing.unauthorized && Boolean(existing.insecure) === Boolean(insecure)) {
     return existing.bridgeHttpUrl;
   }
   if (existing) {
     // A daemon from a previous Chrome run still owns the port: replace it instead of waiting for a port that never frees.
     let stopped = await stopBridge(bridgePort, host);
-    let how = 'bridge upstream stale: restarted';
+    let how = existing.insecure && !insecure ? 'bridge without a token replaced by an authenticated one' : 'bridge upstream stale: restarted';
     if (!stopped && (await killVerifiedStaleBridge(bridgePort, host))) {
       stopped = true;
       how = 'bridge from older code (no /shutdown) terminated and restarted';
@@ -924,10 +1029,13 @@ export async function ensureCdpBridgeDaemon(
   }
 
   const selfPath = fileURLToPath(import.meta.url);
+  // The daemon reads its token from this file (a command line or environment would be visible to other processes).
+  if (!insecure) writeBridgeToken(bridgePort, crypto.randomBytes(24).toString('hex'));
+  const insecureArg = insecure ? ' --insecure' : '';
   if (process.platform === 'win32') {
     try {
       // Spawn outside any temporary Job Object on Windows via Win32_Process.Create
-      const cmdLine = `"${process.execPath}" "${selfPath}" --daemon --upstream "${upstreamUrl}" --port ${bridgePort} --host ${host}`;
+      const cmdLine = `"${process.execPath}" "${selfPath}" --daemon --upstream "${upstreamUrl}" --port ${bridgePort} --host ${host}${insecureArg}`;
       const escaped = cmdLine.replace(/'/g, "''");
       // DETACHED_PROCESS (no console) + SW_HIDE: node.exe is a console app, so without them Windows opens a console window.
       const ps = "$si = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0; CreateFlags = [uint32]8 }; " +
@@ -940,7 +1048,7 @@ export async function ensureCdpBridgeDaemon(
     } catch {
       const child = spawn(
         process.execPath,
-        [selfPath, '--daemon', '--upstream', upstreamUrl, '--port', String(bridgePort), '--host', host],
+        [selfPath, '--daemon', '--upstream', upstreamUrl, '--port', String(bridgePort), '--host', host, ...(insecure ? ['--insecure'] : [])],
         { detached: true, stdio: 'ignore', windowsHide: true }
       );
       child.unref();
@@ -948,7 +1056,7 @@ export async function ensureCdpBridgeDaemon(
   } else {
     const child = spawn(
       process.execPath,
-      [selfPath, '--daemon', '--upstream', upstreamUrl, '--port', String(bridgePort), '--host', host],
+      [selfPath, '--daemon', '--upstream', upstreamUrl, '--port', String(bridgePort), '--host', host, ...(insecure ? ['--insecure'] : [])],
       { detached: true, stdio: 'ignore', windowsHide: true }
     );
     child.unref();
@@ -1026,6 +1134,12 @@ if (isDirectRun && process.argv.includes('--daemon')) {
   const upstreamUrl = getArg('--upstream', '');
   const port = Number(getArg('--port', DEFAULT_BRIDGE_PORT)) || DEFAULT_BRIDGE_PORT;
   const host = getArg('--host', '127.0.0.1');
+  const insecure = process.argv.includes('--insecure');
+  const daemonToken = insecure ? '' : readBridgeToken(port);
+  if (!insecure && !daemonToken) {
+    console.error('[turbo-browser-mcp] Bridge daemon refuses to start without a token (pass --insecure to run it open).');
+    process.exit(1);
+  }
 
   // Distinct exit codes: 0 shutdown, 1 failed to start, 3 upstream Chrome gone for good, 4 own server socket lost.
   // The daemon keeps no pid/port marker files; the listening port is the only state it owns.
@@ -1034,13 +1148,15 @@ if (isDirectRun && process.argv.includes('--daemon')) {
     upstreamUrl,
     port,
     host,
+    insecure,
+    token: daemonToken || null,
     reconnectMs: 2500,
     log,
     onUpstreamLost: () => { setTimeout(() => process.exit(3), 50); },
     onServerLost: () => { setTimeout(() => process.exit(4), 50); },
   })
     .then(({ server, bridgeHttpUrl }) => {
-      console.log(`[turbo-browser-mcp] CDP Keep-Alive Bridge listening at ${bridgeHttpUrl} -> ${upstreamUrl}`);
+      console.log(`[turbo-browser-mcp] CDP Keep-Alive Bridge listening at ${redactBridgeToken(bridgeHttpUrl)} -> ${upstreamUrl}`);
       // Runs after serverLost(): an unexpected close has already scheduled exit code 4; a /shutdown close exits 0.
       server.on('close', () => setTimeout(() => process.exit(0), 200));
     })

@@ -3,7 +3,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { getRunningBridgeInfo } from './cdp-bridge.mjs';
+import { bridgeUrlWithToken, getRunningBridgeInfo } from './cdp-bridge.mjs';
 
 let cachedPw = null;
 
@@ -236,7 +236,7 @@ export async function resolveActiveCdpEndpoint(
   cdpUrl = process.env.TURBO_BROWSER_CDP_URL || 'http://127.0.0.1:9222',
   userDataDir = process.env.TURBO_BROWSER_USER_DATA_DIR || ''
 ) {
-  const raw = String(cdpUrl || 'http://127.0.0.1:9222').trim();
+  const raw = bridgeUrlWithToken(String(cdpUrl || 'http://127.0.0.1:9222').trim());
   if (raw.startsWith('ws://') || raw.startsWith('wss://')) {
     try {
       const parsed = new URL(raw);
@@ -251,7 +251,9 @@ export async function resolveActiveCdpEndpoint(
   }
 
   try {
-    const res = await fetch(new URL('/json/version', raw).href, {
+    const versionUrl = new URL('/json/version', raw);
+    versionUrl.search = new URL(raw).search;
+    const res = await fetch(versionUrl.href, {
       signal: AbortSignal.timeout(800),
     });
     if (res.ok) return raw;

@@ -3,6 +3,7 @@
 // track Target.attachToBrowserTarget sessions. Sessionless commands are forwarded upstream by every bridge build.
 import crypto from 'node:crypto';
 import http from 'node:http';
+import { bridgeUrlWithToken } from './cdp-bridge.mjs';
 
 function maskedTextFrame(text) {
   const payload = Buffer.from(text, 'utf8');
@@ -20,7 +21,10 @@ function maskedTextFrame(text) {
 export async function cdpRawCall(endpoint, method, params = {}, timeoutMs = 3000, { onlyBridge = false } = {}) {
   let wsUrl = endpoint;
   if (/^https?:/i.test(endpoint)) {
-    const res = await fetch(new URL('/json/version', endpoint), { signal: AbortSignal.timeout(timeoutMs) });
+    const full = bridgeUrlWithToken(endpoint);
+    const versionUrl = new URL('/json/version', full);
+    versionUrl.search = new URL(full).search;
+    const res = await fetch(versionUrl, { signal: AbortSignal.timeout(timeoutMs) });
     wsUrl = (await res.json()).webSocketDebuggerUrl;
   }
   // A bare Chrome (chrome://inspect mode) asks the owner to Allow every new connection: only talk to a bridge.

@@ -9,6 +9,7 @@ import {
   ensureCdpBridgeDaemon,
   getRunningBridgeInfo,
   launchUnattendedChrome,
+  redactBridgeToken,
 } from './cdp-bridge.mjs';
 import {
   diagnoseEnvironment,
@@ -1107,7 +1108,8 @@ Options:
   -h, --help                 Show this help message
   -v, --version              Print version (${SERVER_INFO.version})
   --doctor                   Check Node, Playwright, Chromium, and CDP availability (JSON)
-  --bridge                   Start/verify the persistent CDP Keep-Alive Bridge daemon (1 approval total)
+  --bridge                   Start/verify the persistent CDP Keep-Alive Bridge daemon (1 approval total; token required)
+  --bridge-insecure          Like --bridge but WITHOUT a token: any local program can then use your approved Chrome session
   --launch-chrome            Launch Chrome with a dedicated profile & --remote-debugging-port=9222 (0 prompts)
   --open-profile [--url <u>] Open the same profile in a normal, non-automated Chrome so a human can log in or
                              pass a bot check first; the agent later reuses the cookies (waits until Chrome exits)
@@ -1164,6 +1166,9 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
       out.doctor = true;
     } else if (flag === '--bridge') {
       out.bridge = true;
+    } else if (flag === '--bridge-insecure') {
+      out.bridge = true;
+      out.bridgeInsecure = true;
     } else if (flag === '--launch-chrome') {
       out.launchChrome = true;
     } else if (flag === '--open-profile') {
@@ -1282,9 +1287,11 @@ async function runCli() {
     process.exit(code === 0 ? 0 : 1);
   }
   if (parsed.bridge) {
+    if (parsed.bridgeInsecure) process.env.TURBO_BROWSER_BRIDGE_INSECURE = 'true';
+    const insecure = process.env.TURBO_BROWSER_BRIDGE_INSECURE === 'true';
     const existing = await getRunningBridgeInfo();
-    if (existing) {
-      process.stdout.write(`${JSON.stringify({ ok: true, reused: true, ...existing }, null, 2)}\n`);
+    if (existing && Boolean(existing.insecure) === insecure) {
+      process.stdout.write(`${redactBridgeToken(JSON.stringify({ ok: true, reused: true, ...existing }, null, 2))}\n`);
       process.exit(0);
     }
     const prevDisable = process.env.TURBO_BROWSER_DISABLE_BRIDGE;
@@ -1302,10 +1309,10 @@ async function runCli() {
       );
       process.exit(rawEndpoint ? 0 : 1);
     }
-    const bridgeHttpUrl = await ensureCdpBridgeDaemon(rawEndpoint, { timeoutMs: 60000 });
+    const bridgeHttpUrl = await ensureCdpBridgeDaemon(rawEndpoint, { timeoutMs: 60000, insecure });
     const info = await getRunningBridgeInfo();
     process.stdout.write(
-      `${JSON.stringify({ ok: Boolean(bridgeHttpUrl), reused: false, ...(info || { bridgeHttpUrl }) }, null, 2)}\n`
+      `${redactBridgeToken(JSON.stringify({ ok: Boolean(bridgeHttpUrl), reused: false, ...(info || { bridgeHttpUrl }) }, null, 2))}\n`
     );
     process.exit(bridgeHttpUrl ? 0 : 1);
   }

@@ -58,7 +58,7 @@ describe('round 13: bridge upstream loss', () => {
     let bm;
     try {
       let stderr = '';
-      daemon = spawn(process.execPath, [BRIDGE_JS, '--daemon', '--upstream', ws, '--port', String(bridgePort)], { stdio: ['ignore', 'ignore', 'pipe'] });
+      daemon = spawn(process.execPath, [BRIDGE_JS, '--daemon', '--upstream', ws, '--port', String(bridgePort), '--insecure'], { stdio: ['ignore', 'ignore', 'pipe'] });
       daemon.stderr.on('data', (d) => { stderr += d; });
       for (let i = 0; i < 60 && !(await probeBridge(bridgePort))?.upstreamConnected; i++) await sleep(150);
       assert.equal((await probeBridge(bridgePort))?.upstreamConnected, true);

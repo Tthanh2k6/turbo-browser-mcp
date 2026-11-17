@@ -20,6 +20,11 @@ This is a one-person project. Reports are handled on a best-effort basis, with n
 - A way out of path confinement: reading or writing a file outside `TURBO_BROWSER_SAVE_ROOT` or the working directory.
 - A way around the network guard when it is enabled.
 - Exposure of the CDP bridge (`--bridge`) to anything other than the local machine.
+- A way to use the CDP bridge without its token, or from a web page (Host or Origin check bypass). Since Round 18 the bridge requires a random per-start token kept in `~/.turbo-browser-mcp/bridge-<port>.json`; before that, any local program could use the bridge, and so the Chrome session behind it. `--bridge-insecure` removes the token on purpose.
+
+## Known limits
+
+- The bridge token protects against other users, web pages and programs that do not run as you. A program running as your own user can read the state file; the bridge cannot stop it.
 
 ## Out of scope
 
