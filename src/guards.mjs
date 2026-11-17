@@ -254,6 +254,43 @@ async function pollConditions(page, conditions, timeoutMs, pollMs, textNewKey = 
   }
 }
 
+// Client-side validation that stopped a submit: browser messages of invalid fields, aria-invalid fields with their
+// described-by text, and visible alerts, each with the field label. [] when nothing is showing.
+async function visibleValidation(page) {
+  try {
+    return await Promise.race([
+      page.mainFrame().evaluate(() => {
+        const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+        const shown = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; };
+        const labelOf = (e) => clean(e.getAttribute('aria-label') || [...(e.labels || [])].map((l) => l.innerText).join(' ') || e.placeholder || e.name || e.id).slice(0, 40);
+        const out = [];
+        const seen = new Set();
+        const add = (field, message) => {
+          const m = clean(message).slice(0, 160);
+          if (!m || seen.has(field + m) || out.length >= 5) return;
+          seen.add(field + m);
+          out.push(field ? { field, message: m } : { message: m });
+        };
+        for (const e of document.querySelectorAll('input, textarea, select')) {
+          if (!shown(e)) continue;
+          const byAria = e.getAttribute('aria-invalid') === 'true'
+            ? clean((e.getAttribute('aria-describedby') || e.getAttribute('aria-errormessage') || '').split(' ').map((id) => document.getElementById(id)?.innerText || '').join(' '))
+            : '';
+          if (byAria) add(labelOf(e), byAria);
+          else if (e.matches(':invalid') && e.validationMessage) add(labelOf(e), e.validationMessage);
+        }
+        for (const e of document.querySelectorAll('[role="alert"], .error, .invalid-feedback, [class*="error-message" i]')) {
+          if (shown(e) && clean(e.innerText).length < 200) add('', e.innerText);
+        }
+        return out;
+      }),
+      new Promise((r) => setTimeout(() => r([]), 1500)),
+    ]);
+  } catch {
+    return [];
+  }
+}
+
 /**
  * After an allowed submit, wait for evidence that the submission registered.
  * "The click landed" is not success: only a URL / text / element on the resulting state counts.
@@ -272,10 +309,12 @@ export async function waitForSubmitEvidence(page, expect = {}, textNewKey = '') 
   if (hit) {
     return { submitVerified: true, evidence: { type: hit.type, value: hit.value }, verifyMs: waitedMs };
   }
+  const validation = await visibleValidation(page);
   return {
     submitVerified: false,
     evidence: null,
     verifyMs: waitedMs,
+    ...(validation.length ? { validation } : {}),
     verifyReason: `No submit evidence within ${timeoutMs} ms (url=${page.url()}). Treat the submission as NOT confirmed; check before retrying.`,
   };
 }

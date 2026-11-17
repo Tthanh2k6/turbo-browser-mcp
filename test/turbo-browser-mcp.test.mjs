@@ -1647,8 +1647,9 @@ describe('turbo-browser-mcp integration', () => {
           { keys: ['work email'], value: 'ignored@example.com' },
         ],
       });
-      assert.equal(skipCheck.filledCount, 0);
-      assert.equal(skipCheck.skipped.length, 3);
+      // color and range keep their no-clobber rule; a text field with a different requested value is replaced (round 17b).
+      assert.equal(skipCheck.filledCount, 1);
+      assert.equal(skipCheck.skipped.length, 2);
 
       const overCheck = await smartFillForm(page, {
         overwrite: true,

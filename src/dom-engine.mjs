@@ -530,6 +530,26 @@ export async function resolveTarget(page, { ref, selector, text, frameIdx, allow
       }
     }
     if (fallback) return fallback;
+    // Text split over child elements (a link of block spans): match the normalized innerText, smallest actionable element first.
+    for (const f of scopedFrames) {
+      const hit = await f.frame.evaluate((want) => {
+        const norm = (v) => String(v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const w = norm(want);
+        if (!w) return false;
+        for (const old of document.querySelectorAll('[data-tbm-text-hit]')) old.removeAttribute('data-tbm-text-hit');
+        const ACT = 'a[href], button, [role="button"], [role="link"], [role="option"], [role="tab"], [role="menuitem"], summary, label, [onclick]';
+        let best = null;
+        let bestLen = Infinity;
+        for (const el of document.querySelectorAll(ACT)) {
+          const t = norm(el.innerText);
+          if (t.includes(w) && t.length < bestLen && el.getBoundingClientRect().width > 0) { best = el; bestLen = t.length; }
+        }
+        if (!best) return false;
+        best.setAttribute('data-tbm-text-hit', '1');
+        return true;
+      }, String(text)).catch(() => false);
+      if (hit) return { frame: f.frame, frameIdx: f.frameIdx, locator: f.frame.locator('[data-tbm-text-hit="1"]').first() };
+    }
     // No visible text matched: fall back to aria-label, then title (exact first, then contains).
     const q = String(text).replace(/["\\\n]/g, (c) => (c === '\n' ? ' ' : '\\' + c));
     for (const attrSel of [`[aria-label="${q}" i]`, `[aria-label*="${q}" i]`, `[title="${q}" i]`, `[title*="${q}" i]`]) {
@@ -1845,9 +1865,9 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
 
           const selectorByMode = {
             interactive:
-              'a[href], button, input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="link"], [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], [role="switch"], [role="tab"], [role="menuitem"], summary',
+              'a[href], button, input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="link"], [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], [role="switch"], [role="tab"], [role="menuitem"], [role="option"], summary',
             forms:
-              'input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], [role="switch"], button, [role="button"]',
+              'input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], [role="switch"], button, [role="button"], [role="option"]',
             article: 'h1, h2, h3, h4, p, li, a[href], button',
             all: 'h1, h2, h3, a[href], button, input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], [role="switch"], p',
           };
@@ -2072,7 +2092,8 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
   const urlChangedNote = onlyChanged && hadBaseline && !sameUrlAsBaseline
     ? 'URL changed: full snapshot\n'
     : '';
-  const header = `URL: ${page.url()}\nTitle: ${title}\nMode: ${mode} | Frames: ${frames.length} | Elements: ${totalMatched}${filterNote}\n${urlChangedNote}`;
+  const popupNote = (await popupOpenIn(allFrames[0].frame)) ? `Note: ${POPUP_NOTE}\n` : '';
+  const header = `URL: ${page.url()}\nTitle: ${title}\nMode: ${mode} | Frames: ${frames.length} | Elements: ${totalMatched}${filterNote}\n${urlChangedNote}${popupNote}`;
   let body = '';
   let shownCount = 0;
   let truncated = false;
@@ -2354,6 +2375,17 @@ async function recheckFilled(page, spec, filled) {
   return n;
 }
 
+// An open popup (select listbox, menu, modal) that marks the rest of the page aria-hidden: snapshots and fills skip
+// every control behind it. Cheap probe on one frame; false on any error.
+const POPUP_NOTE = 'a popup is open and hides the rest of the page: pick an option or press Escape';
+function popupOpenIn(frame) {
+  return frame.evaluate(() => {
+    if (![...document.body.children].some((c) => c.getAttribute('aria-hidden') === 'true' && c.tagName !== 'SCRIPT')) return false;
+    return [...document.querySelectorAll('[role="listbox"], [role="menu"], [role="dialog"], [role="alertdialog"], [aria-modal="true"]')]
+      .some((e) => !e.closest('[aria-hidden="true"]') && e.getBoundingClientRect().width > 0);
+  }).catch(() => false);
+}
+
 // A ref that no longer exists but was in an earlier snapshot: the page re-rendered. Name the live ref with the same
 // label when there is one. Returns '' when the ref was never in a snapshot (typo: keep plain not-found).
 async function staleRefHint(frames, ref, previousLinesSet) {
@@ -2367,6 +2399,11 @@ async function staleRefHint(frames, ref, previousLinesSet) {
       const lm = /^f\d+:<[^>]*> "([^"]*)"/.exec(sig);
       label = lm ? lm[1].split(' | ')[0] : '';
     }
+  }
+  // The element is still in the page, just not usable: a modal popup hiding it is not "stale".
+  for (const f of frames) {
+    const live = await f.frame.evaluate((id) => Boolean(document.querySelector('[data-tbm-ref="' + id + '"]')), m[2]).catch(() => false);
+    if (live) return { reason: 'hidden', hint: (await popupOpenIn(f.frame)) ? POPUP_NOTE : 'ref exists but is hidden or disabled' };
   }
   if (label === null) return '';
   let now = '';
@@ -2389,7 +2426,7 @@ async function staleRefHint(frames, ref, previousLinesSet) {
       if (id) { now = `f${f.frameIdx}:${id}`; break; }
     }
   }
-  return `ref from an older snapshot, page re-rendered; ${now ? `same label now ${now}` : `re-inspect${label ? ` (was "${label.slice(0, 30)}")` : ''}`}`;
+  return { reason: 'stale-ref', hint: `ref from an older snapshot, page re-rendered; ${now ? `same label now ${now}` : `re-inspect${label ? ` (was "${label.slice(0, 30)}")` : ''}`}` };
 }
 
 export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
@@ -3722,7 +3759,9 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
               }
 
               const cur = currentValue(el);
-              if (cur && !overwriteFlag) {
+              // Only an identical value counts as already filled: a different requested value replaces the old one.
+              const sameAsCur = f.value === undefined || clean(String(f.value)) === clean(cur);
+              if (cur && !overwriteFlag && sameAsCur) {
                 claimed.add(el);
                 frameSkipped.push({
                   idx: f._idx,
@@ -3759,7 +3798,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
               if (
                 editRejected ||
                 (strVal !== '' && afterVal === '') ||
-                (overwriteFlag && cur !== '' && clean(afterVal) === clean(cur) && clean(strVal) !== clean(cur))
+                (cur !== '' && clean(afterVal) === clean(cur) && clean(strVal) !== clean(cur))
               ) {
                 frameSkipped.push({
                   idx: f._idx,
@@ -3777,6 +3816,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                 tag: el.isContentEditable ? 'contenteditable' : el.tagName.toLowerCase(),
                 label: describe(el).slice(0, 50),
                 value: strVal.slice(0, 60),
+                ...(cur && !overwriteFlag ? { replaced: true } : {}),
                 ...(el.getRootNode?.() instanceof ShadowRoot ? { _sh: 1 } : {}),
               });
               matchedIndexes.push(f._idx);
@@ -4691,8 +4731,8 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
     if (matchedFieldIndexes.has(f._idx) || reported.has(f._idx)) continue;
     const hasTarget = Boolean(f.ref || f.selector || f.keys);
     if (f.ref && !f.selector && !f.keys) {
-      const hint = await staleRefHint(frames, f.ref, previousLinesSet);
-      if (hint) { skipped.push({ idx: f._idx, reason: 'stale-ref', hint }); continue; }
+      const info = await staleRefHint(frames, f.ref, previousLinesSet);
+      if (info) { skipped.push({ idx: f._idx, reason: info.reason, hint: info.hint }); continue; }
     }
     skipped.push({ idx: f._idx, reason: hasTarget ? 'not-found' : 'no-target' });
   }
@@ -5051,6 +5091,8 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
     for (const e of filled) if (e && e._sh) delete e._sh;
   }
 
+  filled.sort((x, y) => (x?.idx ?? 1e9) - (y?.idx ?? 1e9));
+  skipped.sort((x, y) => (x?.idx ?? 1e9) - (y?.idx ?? 1e9));
   if (!spec._noRecheck) await verifyAfterBlur(page, filled);
 
   const output = {
