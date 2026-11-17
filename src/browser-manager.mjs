@@ -189,6 +189,8 @@ export class BrowserManager {
 
   async _init() {
     const { chromium } = await loadPlaywright();
+    const tm = { t0: Date.now() };
+    const lap = (k) => { tm[k] = Date.now() - (tm.last || tm.t0); tm.last = Date.now(); };
 
     // A bridge whose Chrome is gone (or that no longer answers) must not linger or be mistaken for absent:
     // clear it quickly and remember it so a launch fallback can say why logged-in sites are missing.
@@ -214,6 +216,7 @@ export class BrowserManager {
       const waitMs = cdpConnectWaitMs({ optionMs: this.cdpAutoTimeoutMs, human });
       if (human) process.stderr.write(`waiting for 'Allow' in Chrome (up to ${Math.round(waitMs / 1000)} s)
 `);
+      lap('prep');
       let bridgeTimedOut = false;
       const inNodeTest = this.useBridge ? false : Boolean(process.env.NODE_TEST_CONTEXT) || process.execArgv.includes('--test');
       if (
@@ -230,12 +233,14 @@ export class BrowserManager {
           targetEndpoint = bridged;
         }
       }
+      lap('bridge');
       try {
         // auto falls back to launch, so it must not wait the full 20 s for a permission prompt nobody answers.
         this.browser = await chromium.connectOverCDP(targetEndpoint, {
           // After a bridge that waited the full Allow window, a direct retry would only prompt again: keep it short.
           timeout: this.mode === 'auto' ? (bridgeTimedOut ? 3000 : Math.min(waitMs, 60000)) : Math.max(this.defaultTimeoutMs, 20000),
         });
+        lap('connect');
         this.connectionNote = '';
         this._cdpEndpoint = targetEndpoint;
         this.context = this.browser.contexts()[0] ?? (await this.browser.newContext());
@@ -301,7 +306,14 @@ export class BrowserManager {
     }
 
     this.context.setDefaultTimeout(this.defaultTimeoutMs);
+    lap('launch');
     await this._installContextInitScript(this.context);
+    lap('initScript');
+    if (Date.now() - tm.t0 > 5000) {
+      const parts = ['prep', 'bridge', 'connect', 'launch', 'initScript'].filter((k) => tm[k] > 500).map((k) => `${k} ${(tm[k] / 1000).toFixed(1)}s`);
+      process.stderr.write(`turbo-browser: slow start (${((Date.now() - tm.t0) / 1000).toFixed(1)}s): ${parts.join(', ')}
+`);
+    }
     this.context.on('page', (page) => this._registerPage(page, true));
     for (const page of this.context.pages()) {
       this._registerPage(page, this.activeTabId === null);
@@ -565,19 +577,46 @@ export class BrowserManager {
     return !!this._unresponsivePages?.has(page);
   }
 
+  // Page.setWebLifecycleState through a short-lived session. False when the page does not take it.
+  async _thaw(page, state) {
+    let sess;
+    try {
+      sess = await page.context().newCDPSession(page);
+      await Promise.race([sess.send('Page.setWebLifecycleState', { state }), new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 1000))]);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      await sess?.detach().catch(() => {});
+    }
+  }
+
   /**
    * Quick liveness probe of the page main world. Marks the page unresponsive when it does not
    * answer within capMs, clears the mark when it answers again. Returns true when responsive.
    */
-  async probePage(page, capMs = 2000) {
+  async probePage(page, capMs = 2000, { restoreFrozen = false } = {}) {
     let timer;
     try {
-      const ok = await Promise.race([
+      const ask = () => Promise.race([
         page.mainFrame().evaluate('1').then(() => true, () => true),
         new Promise((resolve) => {
           timer = setTimeout(() => resolve(false), capMs);
         }),
       ]);
+      let ok = await ask();
+      if (ok) this._frozenPages?.delete(page);
+      // Chrome freezes hidden tabs (Memory Saver): their main world answers nothing until resumed. Resume it; if it then
+      // answers it was frozen, not blocked. A listing puts the freeze back so it does not wake the owner's tabs for good.
+      if (!ok && (await this._thaw(page, 'active'))) {
+        clearTimeout(timer);
+        ok = await ask();
+        if (ok) {
+          if (!this._frozenPages) this._frozenPages = new WeakSet();
+          this._frozenPages.add(page);
+          if (restoreFrozen) await this._thaw(page, 'frozen');
+        }
+      }
       if (ok) this._unresponsivePages?.delete(page);
       else this.markPageUnresponsive(page);
       return ok;
@@ -649,7 +688,7 @@ export class BrowserManager {
     // Only pages already marked unresponsive (at attach time or by tabs_batch list) pay for a probe:
     // a short re-check, since the dialog may be gone. Probing every page on every call made slow
     // but healthy pages (heavy scripts mid-load) look blocked.
-    if (!this.isPageUnresponsive(page)) return page;
+    if (!this.isPageUnresponsive(page) && !this._frozenPages?.has(page)) return page;
     const ok = await this.probePage(page, Number(process.env.TURBO_BROWSER_PROBE_MS) || 1000);
     if (!ok) {
       if (await this._healStalePages().catch(() => false)) return renewed();
@@ -1014,13 +1053,13 @@ export class BrowserManager {
     const results = [];
     // Re-probe the main world of every tab in parallel (1.5 s cap): marks tabs that got stuck after
     // attach and clears marks on tabs that answer again.
-    await Promise.all([...this.tabs.values()].map((p) => this.probePage(p, 1500)));
+    await Promise.all([...this.tabs.values()].map((p) => this.probePage(p, 1500, { restoreFrozen: true })));
     // Titles in parallel, and never waited for on a stuck tab (title reads the blocked main world): sequential
     // 1.5 s waits made a listing with many such tabs take 15-20 s.
     const entries = await Promise.all([...this.tabs.entries()].map(async ([tabId, page]) => {
       let title = '';
       const stuck = this.isPageUnresponsive(page);
-      if (!stuck) {
+      if (!stuck && !this._frozenPages?.has(page)) {
         let timer;
         try {
           title = await Promise.race([
@@ -1045,7 +1084,8 @@ export class BrowserManager {
         isolatedContext: this.tabContextName.get(tabId) || 'default',
       };
       // A tab with no committed document yet (empty url) has nothing to be stuck on.
-      if (stuck && url) entry.unresponsive = true;
+      if (this._frozenPages?.has(page) && !stuck) entry.frozen = true;
+      else if (stuck && url) entry.unresponsive = true;
       return entry;
     }));
     results.push(...entries);

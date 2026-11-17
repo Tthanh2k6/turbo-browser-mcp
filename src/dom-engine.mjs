@@ -5333,6 +5333,10 @@ async function executeSingleAction(page, params = {}) {
         const toast = await takeToast(page);
         if (toast) res.toast = toast;
       }
+      // An SPA route change leaves no navigation event: say where the click ended up.
+      if (['click', 'dblclick'].includes(params.action) && res && typeof res === 'object' && res.url === undefined && !res.outcome && page.url() !== beforeApplyUrl) {
+        res.url = page.url();
+      }
     }
     await observer?.finish(res, resolveAllowSubmit(params.allowSubmit));
     if (res && res._applyLike) {
@@ -7668,6 +7672,23 @@ export async function extractCleanText(page, options = {}) {
       await runAll();
     }
     if (sections.length === 0) note = 'page has no text yet';
+  }
+  // Only a sliver of text (a footer) while an SPA route is still rendering: poll until it grows or holds still ~0.6 s.
+  const emptyRoot = !selector && sections.length > 0 && sections.join('').length < 400
+    ? await page.mainFrame().evaluate(() => [...document.querySelectorAll('#app, #root, #__next, #app-root, main, [role="main"]')].some((e) => !(e.innerText || '').trim())).catch(() => false)
+    : false;
+  if (emptyRoot) {
+    const until = Date.now() + 3000;
+    let last = sections.join('').length;
+    let still = 0;
+    while (still < 5 && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 200));
+      await runAll();
+      const len = sections.join('').length;
+      if (len >= 400) break;
+      still = len === last ? still + 1 : 0;
+      last = len;
+    }
   }
 
   const title = await page.title().catch(() => '');
