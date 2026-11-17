@@ -86,6 +86,7 @@ it('same-URL reload is detected by its main-frame request', async () => {
 });
 
 it('navigation waits respect timeout and remove listeners on failure and blocked clicks', async () => {
+  await new Promise((r) => setTimeout(r, 900)); // the previous click's 800 ms request watch has ended
   const events = ['request', 'domcontentloaded', 'framenavigated'];
   const counts = events.map(event => page.listenerCount(event));
   await assert.rejects(actFast(page, {

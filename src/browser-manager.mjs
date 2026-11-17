@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { checkBridgeHealth, ensureCdpBridgeDaemon, redactBridgeToken } from './cdp-bridge.mjs';
+import { checkBridgeHealth, DEFAULT_BRIDGE_PORT, ensureCdpBridgeDaemon, probeBridge, redactBridgeToken } from './cdp-bridge.mjs';
 import { cdpRawCall } from './cdp-raw.mjs';
 import { resolveSafePath } from './dom-engine.mjs';
 import { gotoRetry, navHealth } from './navinfo.mjs';
@@ -121,6 +121,7 @@ export class BrowserManager {
     this.connectionNote = '';
     this.bridgePort = options.bridgePort;
     this.cdpAutoTimeoutMs = options.cdpAutoTimeoutMs;
+    this.bridgeRetryMs = options.bridgeRetryMs;
     // Tests inject a fake endpoint; node:test normally disables the bridge daemon.
     this.useBridge = options.useBridge;
   }
@@ -219,6 +220,7 @@ export class BrowserManager {
 `);
       lap('prep');
       let bridgeTimedOut = false;
+      let usedBridge = false;
       const inNodeTest = this.useBridge ? false : Boolean(process.env.NODE_TEST_CONTEXT) || process.execArgv.includes('--test');
       if (
         !inNodeTest &&
@@ -233,21 +235,36 @@ export class BrowserManager {
         });
         if (bridged) {
           targetEndpoint = bridged;
+          usedBridge = true;
         }
       }
       lap('bridge');
       try {
         // auto falls back to launch, so it must not wait the full 20 s for a permission prompt nobody answers.
-        this.browser = await chromium.connectOverCDP(targetEndpoint, {
+        const attach = (timeout) => chromium.connectOverCDP(targetEndpoint, { timeout });
+        try {
           // After a bridge that waited the full Allow window, a direct retry would only prompt again: keep it short.
-          timeout: this.mode === 'auto' ? (bridgeTimedOut ? 3000 : Math.min(waitMs, 60000)) : Math.max(this.defaultTimeoutMs, 20000),
-        });
+          this.browser = await attach(this.mode === 'auto' ? (bridgeTimedOut ? 3000 : Math.min(waitMs, 60000)) : Math.max(this.defaultTimeoutMs, 20000));
+        } catch (firstErr) {
+          // A live bridge is the owner's signed-in Chrome: attaching through it can be slow (every tab is attached on
+          // the first client), so give it one longer try, and never swap it for a signed-out browser.
+          const bridgePort = this.bridgePort || DEFAULT_BRIDGE_PORT;
+          const alive = usedBridge && this.mode === 'auto' && (await probeBridge(bridgePort).catch(() => null))?.upstreamConnected === true;
+          if (!alive) throw firstErr;
+          const retryMs = this.bridgeRetryMs || 45000;
+          try {
+            this.browser = await attach(retryMs);
+          } catch (retryErr) {
+            throw new Error(`The CDP bridge on port ${bridgePort} is running but attaching through it failed (step: connect to the bridge, tried ${Math.round(waitMs / 1000)} s then ${Math.round(retryMs / 1000)} s: ${String(retryErr?.message || retryErr).split(String.fromCharCode(10))[0].slice(0, 120)}). Not opening a separate signed-out browser. Try again, or set TURBO_BROWSER_MODE=launch to use a fresh browser on purpose.`);
+          }
+        }
         lap('connect');
         this.connectionNote = '';
         this._cdpEndpoint = targetEndpoint;
         this.context = this.browser.contexts()[0] ?? (await this.browser.newContext());
         this.connectionType = 'cdp';
       } catch (err) {
+        if (/^The CDP bridge on port/.test(String(err?.message))) throw err;
         if (this.mode === 'auto') {
           const m = String(err?.message || err);
           this._note(/timeout/i.test(m)

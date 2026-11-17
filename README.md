@@ -325,6 +325,7 @@ This reports an action that has already happened. It cannot prevent a commit or 
 | - | `TURBO_BROWSER_NETWORK_GUARD_ALLOW` | `""` | Comma-separated URL regexes the network guard lets through |
 | - | `TURBO_BROWSER_OBSERVE_AFTERMATH` | `false` | Report navigation and mutating requests after each click (see [Click aftermath](#click-aftermath-reporting)) |
 | - | `TURBO_BROWSER_LEDGER` | `~/.turbo-browser-mcp/submissions.jsonl` | Submission ledger used by `submissionKey` |
+| - | `TURBO_BROWSER_HOME` | `~/.turbo-browser-mcp` | State folder: bridge token files, default ledger, default Chrome profile (`npm test` points it at a temp folder) |
 | `--version` / `-v` | - | - | Print the server version |
 | `--help` / `-h` | - | - | Print CLI usage |
 | - | `TURBO_BROWSER_SAVE_ROOT` | `process.cwd()` | Root directory for `savePath` and `storageState` files |

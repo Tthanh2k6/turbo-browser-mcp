@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { turboHome } from './home.mjs';
 import { fileURLToPath } from 'node:url';
 import { BrowserManager } from './browser-manager.mjs';
 import {
@@ -1260,7 +1261,7 @@ async function runCli() {
       process.exit(1);
     }
     const userDataDir =
-      process.env.TURBO_BROWSER_USER_DATA_DIR || path.join(os.homedir(), '.turbo-browser-mcp', 'chrome-profile');
+      process.env.TURBO_BROWSER_USER_DATA_DIR || path.join(turboHome(), 'chrome-profile');
     fs.mkdirSync(userDataDir, { recursive: true });
     // Plain user launch: no --remote-debugging-port, no automation flags.
     const chromeArgs = [`--user-data-dir=${userDataDir}`, '--no-first-run', '--no-default-browser-check'];

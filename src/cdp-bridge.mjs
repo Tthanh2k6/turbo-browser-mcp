@@ -6,6 +6,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { turboHome } from './home.mjs';
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 export const DEFAULT_BRIDGE_PORT = Number(process.env.TURBO_BROWSER_BRIDGE_PORT) || 9224;
@@ -15,7 +16,7 @@ export const DEFAULT_BRIDGE_PORT = Number(process.env.TURBO_BROWSER_BRIDGE_PORT)
 // The token lives in a state file under the user's profile (mode 0600; on Windows it inherits the profile's ACL) and
 // turbo clients read it from there. Host and Origin are checked as well, so a web page cannot reach the bridge.
 export function bridgeStatePath(port) {
-  return path.join(os.homedir(), '.turbo-browser-mcp', `bridge-${Number(port)}.json`);
+  return path.join(turboHome(), `bridge-${Number(port)}.json`);
 }
 export function readBridgeToken(port) {
   try {
@@ -1031,7 +1032,10 @@ export async function ensureCdpBridgeDaemon(
   const selfPath = fileURLToPath(import.meta.url);
   // The daemon reads its token from this file (a command line or environment would be visible to other processes).
   if (!insecure) writeBridgeToken(bridgePort, crypto.randomBytes(24).toString('hex'));
-  const insecureArg = insecure ? ' --insecure' : '';
+  // A detached daemon does not inherit the environment on Windows: hand it the state folder explicitly.
+  const homeArg = process.env.TURBO_BROWSER_HOME ? ` --home "${turboHome()}"` : '';
+  const homeArgv = process.env.TURBO_BROWSER_HOME ? ['--home', turboHome()] : [];
+  const insecureArg = (insecure ? ' --insecure' : '') + homeArg;
   if (process.platform === 'win32') {
     try {
       // Spawn outside any temporary Job Object on Windows via Win32_Process.Create
@@ -1048,7 +1052,7 @@ export async function ensureCdpBridgeDaemon(
     } catch {
       const child = spawn(
         process.execPath,
-        [selfPath, '--daemon', '--upstream', upstreamUrl, '--port', String(bridgePort), '--host', host, ...(insecure ? ['--insecure'] : [])],
+        [selfPath, '--daemon', '--upstream', upstreamUrl, '--port', String(bridgePort), '--host', host, ...(insecure ? ['--insecure'] : []), ...homeArgv],
         { detached: true, stdio: 'ignore', windowsHide: true }
       );
       child.unref();
@@ -1056,7 +1060,7 @@ export async function ensureCdpBridgeDaemon(
   } else {
     const child = spawn(
       process.execPath,
-      [selfPath, '--daemon', '--upstream', upstreamUrl, '--port', String(bridgePort), '--host', host, ...(insecure ? ['--insecure'] : [])],
+      [selfPath, '--daemon', '--upstream', upstreamUrl, '--port', String(bridgePort), '--host', host, ...(insecure ? ['--insecure'] : []), ...homeArgv],
       { detached: true, stdio: 'ignore', windowsHide: true }
     );
     child.unref();
@@ -1079,7 +1083,7 @@ export async function ensureCdpBridgeDaemon(
 export async function launchUnattendedChrome({
   executablePath,
   port = 9222,
-  userDataDir = path.join(os.homedir(), '.turbo-browser-mcp', 'chrome-profile'),
+  userDataDir = path.join(turboHome(), 'chrome-profile'),
   headless = false,
 } = {}) {
   fs.mkdirSync(userDataDir, { recursive: true });
@@ -1134,6 +1138,8 @@ if (isDirectRun && process.argv.includes('--daemon')) {
   const upstreamUrl = getArg('--upstream', '');
   const port = Number(getArg('--port', DEFAULT_BRIDGE_PORT)) || DEFAULT_BRIDGE_PORT;
   const host = getArg('--host', '127.0.0.1');
+  const homeArg = getArg('--home', '');
+  if (homeArg) process.env.TURBO_BROWSER_HOME = homeArg;
   const insecure = process.argv.includes('--insecure');
   const daemonToken = insecure ? '' : readBridgeToken(port);
   if (!insecure && !daemonToken) {

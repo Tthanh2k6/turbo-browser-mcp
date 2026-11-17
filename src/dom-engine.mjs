@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import { gotoRetry, navHealth } from './navinfo.mjs';
 
 // Analytics and telemetry endpoints are not submits.
-const ANALYTICS_RE = /(google-analytics|googletagmanager|doubleclick|segment\.(io|com)|mixpanel|amplitude|sentry\.io|hotjar|clarity\.ms|datadoghq|newrelic|bugsnag|logrocket|fullstory|plausible|posthog|\/(collect|beacon|analytics|telemetry|track|log|events?)(\/|$))/i;
+const ANALYTICS_RE = /(^adsapi\.|(^|\.)ads?\.|google-analytics|googletagmanager|googlesyndication|doubleclick|daily\.dev|segment\.(io|com)|mixpanel|amplitude|sentry|honeybadger|hotjar|clarity\.ms|datadoghq|newrelic|bugsnag|logrocket|fullstory|plausible|posthog|\/(ads?|collect|beacon|analytics|telemetry|track|log|events?|metrics|publishers)(\/|$))/i;
 import { urlDenial, peekBlocked, denyMessage, matchUrl, getPolicy } from './allow-hosts.mjs';
 import { observeClickAftermath, parkLate, watchActivity } from './aftermath.mjs';
 import { armToasts, takeToast } from './toast.mjs';
@@ -5397,6 +5397,8 @@ async function executeSingleAction(page, params = {}) {
     let path = '';
     try { const u = new URL(request.url()); host = u.host; path = u.pathname; } catch { return; }
     if (ANALYTICS_RE.test(host) || ANALYTICS_RE.test(path)) return;
+    // An allowed submit was the point of the click: the agent knows it submitted, no late warning.
+    if (returned && params.allowSubmit === true) return;
     if (returned) parkLate(page, `possibleSubmit: ${request.method()} ${host}${path.slice(0, 60)}`);
     else mutating.push({ method: request.method(), host });
   };

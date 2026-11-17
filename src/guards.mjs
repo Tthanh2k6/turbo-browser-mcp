@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { turboHome } from './home.mjs';
 
 /**
  * Commit-safety helpers added after Show HN / dev.to feedback (v0.5.0):
@@ -323,7 +324,7 @@ export async function waitForSubmitEvidence(page, expect = {}, textNewKey = '') 
 
 export function defaultLedgerPath() {
   if (process.env.TURBO_BROWSER_LEDGER) return path.resolve(process.env.TURBO_BROWSER_LEDGER);
-  return path.join(os.homedir(), '.turbo-browser-mcp', 'submissions.jsonl');
+  return path.join(turboHome(), 'submissions.jsonl');
 }
 
 export function readLedger(ledgerPath) {
