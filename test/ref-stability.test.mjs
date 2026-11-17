@@ -90,7 +90,7 @@ describe('ref stability within a document', () => {
     const second = await inspectCompact(page, { maxChars: 20000 }, state);
     assert.notEqual(refOf(second.text, 'New 17'), old);
     assert.ok(Math.min(...[...second.text.matchAll(/\[f0:e(\d+)\]/g)].map((m) => Number(m[1]))) > Number(/e(\d+)$/.exec(old)[1]));
-    assert.match(await clickFails(page, old), /navigated or re-rendered since this ref was issued/i);
+    assert.match(await clickFails(page, old), /navigated or re-rendered since this ref was issued|belongs to a previous document/i);
     assert.equal(await page.title(), 't', 'no button was clicked');
   });
 });

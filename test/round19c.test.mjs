@@ -21,7 +21,7 @@ describe('round 19c', () => {
     const second = await inspectCompact(page, { maxChars: 20000 }, state);
     const nums = [...second.text.matchAll(/\[f1:e(\d+)\] <button> "B/g)].map((x) => Number(x[1]));
     assert.ok(nums.length >= 30 && Math.min(...nums) > Number(old.split('e')[1]), second.text.slice(0, 300));
-    await assert.rejects(actFast(page, { action: 'click', ref: old }), /not found/i);
+    await assert.rejects(actFast(page, { action: 'click', ref: old }), /not found|previous document/i);
     assert.doesNotMatch(await page.title(), /hit/);
   });
 });

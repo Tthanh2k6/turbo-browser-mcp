@@ -2,7 +2,7 @@
 // QUIET_MS and no request younger than INFLIGHT_MS is pending, or at capMs. Listeners stay
 // attached until remove() so a late request is still seen by the guards that share this page.
 const QUIET_MS = 80, INFLIGHT_MS = 1500, POLL_MS = 20;
-const IGNORED_RESOURCES = new Set(['websocket', 'eventsource', 'media', 'ping']);
+const IGNORED_RESOURCES = new Set(['websocket', 'eventsource', 'media', 'ping', 'beacon']);
 // A JS dialog freezes page.evaluate; give up on the DOM probe instead of hanging the action.
 const probe = (promise, ms = 250) => Promise.race([promise, new Promise((r) => setTimeout(() => r(null), ms))]).catch(() => null);
 export function watchActivity(page) {

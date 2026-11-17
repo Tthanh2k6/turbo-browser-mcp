@@ -2,7 +2,26 @@ import fs from 'node:fs';
 import { gotoRetry, navHealth } from './navinfo.mjs';
 
 // Analytics and telemetry endpoints are not submits.
-const ANALYTICS_RE = /(^adsapi\.|(^|\.)ads?\.|google-analytics|googletagmanager|googlesyndication|doubleclick|daily\.dev|segment\.(io|com)|mixpanel|amplitude|sentry|honeybadger|hotjar|clarity\.ms|datadoghq|newrelic|bugsnag|logrocket|fullstory|plausible|posthog|\/(ads?|collect|beacon|analytics|telemetry|track|log|events?|metrics|publishers)(\/|$))/i;
+const ANALYTICS_HOST_RE = /(^adsapi\.|(^|\.)ads?\.|google-analytics|googletagmanager|googlesyndication|doubleclick|daily\.dev|segment\.(io|com)|mixpanel|amplitude|sentry|honeybadger|hotjar|clarity\.ms|datadoghq|newrelic|bugsnag|logrocket|fullstory|plausible|posthog)/i;
+const ANALYTICS_PATH_RE = /\/(ads?|page_?views?|collect|beacon|analytics|telemetry|track|log|events?|metrics|publishers)(\/|$)/i;
+const ANALYTICS_RE = new RegExp(`${ANALYTICS_HOST_RE.source}|${ANALYTICS_PATH_RE.source}`, 'i');
+
+function isAnalyticsRequest(request, host, reqPath) {
+  if (ANALYTICS_HOST_RE.test(host)) return true;
+  if (!ANALYTICS_PATH_RE.test(reqPath)) return false;
+  try {
+    const ct = String(request.headers?.()['content-type'] || '').toLowerCase();
+    if (ct.includes('multipart/form-data') || ct.includes('application/x-www-form-urlencoded')) return false;
+    const buf = typeof request.postDataBuffer === 'function' ? request.postDataBuffer() : null;
+    const body = buf ? buf.toString('utf8') : (typeof request.postData === 'function' ? request.postData() || '' : '');
+    const bytes = buf ? buf.length : Buffer.byteLength(body, 'utf8');
+    if (bytes >= 2048) return false;
+    if (/^--[-\w]+\r?\nContent-Disposition:\s*form-data/i.test(body)) return false;
+    return true;
+  } catch {
+    return true;
+  }
+}
 import { urlDenial, peekBlocked, denyMessage, matchUrl, getPolicy } from './allow-hosts.mjs';
 import { observeClickAftermath, parkLate, watchActivity } from './aftermath.mjs';
 import { armToasts, takeToast } from './toast.mjs';
@@ -351,6 +370,152 @@ function parseRefString(refStr) {
   return null;
 }
 
+const pageLoaders = new WeakMap();
+
+function flattenCdpFrameTree(node, out = []) {
+  if (!node?.frame) return out;
+  out.push(node.frame);
+  for (const child of node.childFrames || []) flattenCdpFrameTree(child, out);
+  return out;
+}
+
+async function syncFrameTree(st) {
+  if (!st?.sess) return false;
+  try {
+    let timer;
+    const res = await Promise.race([
+      st.sess.send('Page.getFrameTree'),
+      new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('timeout')), 1000); }),
+    ]).finally(() => clearTimeout(timer));
+    const list = flattenCdpFrameTree(res?.frameTree);
+    if (list.length > 0) {
+      st.byId.clear();
+      st.ordered = list.map((f) => {
+        const entry = {
+          id: f.id,
+          parentId: f.parentId || '',
+          loaderId: f.loaderId || '',
+          name: f.name || '',
+          url: f.url || '',
+        };
+        st.byId.set(f.id, entry);
+        return entry;
+      });
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+async function getPageLoaderState(page) {
+  if (!page || typeof page.context !== 'function') return null;
+  let st = pageLoaders.get(page);
+  if (!st) {
+    st = { sess: null, byId: new Map(), ordered: [], refs: new Map(), ready: null, failed: false };
+    pageLoaders.set(page, st);
+    st.ready = (async () => {
+      const ctx = page.context();
+      if (!ctx || typeof ctx.newCDPSession !== 'function') {
+        st.failed = true;
+        return null;
+      }
+      const sess = await ctx.newCDPSession(page);
+      st.sess = sess;
+      if (typeof sess.on === 'function') {
+        sess.on('Page.frameNavigated', (ev) => {
+          const f = ev?.frame;
+          if (!f?.id || !f?.loaderId) return;
+          const entry = {
+            id: f.id,
+            parentId: f.parentId || '',
+            loaderId: f.loaderId,
+            name: f.name || '',
+            url: f.url || '',
+          };
+          st.byId.set(f.id, entry);
+          const idx = st.ordered.findIndex((x) => x.id === f.id);
+          if (idx >= 0) st.ordered[idx] = entry;
+          else if (!f.parentId) st.ordered[0] = entry;
+          else st.ordered.push(entry);
+        });
+        sess.on('Page.frameDetached', (ev) => {
+          if (ev?.frameId) {
+            st.byId.delete(ev.frameId);
+            st.ordered = st.ordered.filter((x) => x.id !== ev.frameId);
+          }
+        });
+      }
+      await sess.send('Page.enable').catch(() => {});
+      await syncFrameTree(st);
+      return st;
+    })().catch(() => {
+      st.failed = true;
+      return null;
+    });
+  }
+  await st.ready;
+  if (st.failed || !st.sess) return null;
+  return st;
+}
+
+function matchCdpFrame(st, frames, frameIdx) {
+  if (!st || st.ordered.length === 0) return null;
+  if (frameIdx === 0) return st.ordered.find((f) => !f.parentId) || st.ordered[0] || null;
+  const info = frames.find((f) => f.frameIdx === frameIdx);
+  const direct = st.ordered[frameIdx];
+  if (direct && direct.parentId) {
+    if (!info || st.ordered.length === frames.length || ((direct.name || '') === info.name && (direct.url === info.url || !info.url))) {
+      return direct;
+    }
+  }
+  if (info) {
+    if (info.name) {
+      const byNameUrl = st.ordered.find((f, i) => i > 0 && f.name === info.name && f.url === info.url);
+      if (byNameUrl) return byNameUrl;
+      const byName = st.ordered.find((f, i) => i > 0 && f.name === info.name);
+      if (byName) return byName;
+    }
+    if (info.url) {
+      const byUrl = st.ordered.filter((f, i) => i > 0 && f.url === info.url);
+      if (byUrl.length === 1) return byUrl[0];
+    }
+  }
+  return direct || null;
+}
+
+async function isRefFromPreviousDocument(page, frames, parsed) {
+  if (!parsed) return false;
+  const st = pageLoaders.get(page);
+  if (!st) return false;
+  await st.ready;
+  if (st.failed || !st.sess) return false;
+  const key = parsed.frameIdx !== null
+    ? `f${parsed.frameIdx}:${parsed.refId.toLowerCase()}`
+    : parsed.refId.toLowerCase();
+  const stamp = st.refs.get(key);
+  if (!stamp || !stamp.loaderId) return false;
+  await syncFrameTree(st);
+  const byId = stamp.frameId ? st.byId.get(stamp.frameId) : null;
+  const cur = byId?.loaderId || matchCdpFrame(st, frames, parsed.frameIdx ?? stamp.frameIdx)?.loaderId || '';
+  if (!cur) {
+    if (stamp.mainLoaderId) {
+      const mainCur = (st.ordered.find((f) => !f.parentId) || st.ordered[0])?.loaderId || '';
+      if (mainCur && mainCur !== stamp.mainLoaderId) return true;
+    }
+    return false;
+  }
+  return cur !== stamp.loaderId;
+}
+
+async function assertCurrentDocumentRef(page, ref, frames = getAllFrames(page)) {
+  if (!ref) return;
+  const parsed = parseRefString(String(ref));
+  if (!parsed) return;
+  if (await isRefFromPreviousDocument(page, frames, parsed)) {
+    throw new Error(`Element ref "${ref}" belongs to a previous document (the page navigated since it was issued). Run inspect_compact again.`);
+  }
+}
+
 async function pickBestLocator(allLoc, allowHidden = false) {
   const count = await allLoc.count().catch(() => 0);
   if (count === 0) return null;
@@ -482,6 +647,9 @@ export async function resolveTarget(page, { ref, selector, text, frameIdx, allow
     const parsed = parseRefString(ref);
     if (!parsed) {
       throw new Error(`Invalid ref format "${ref}". Expected "f0:e1" or "e1".`);
+    }
+    if (await isRefFromPreviousDocument(page, frames, parsed)) {
+      throw new Error(`Element ref "${ref}" belongs to a previous document (the page navigated since it was issued). Run inspect_compact again.`);
     }
     const candidates = parsed.frameIdx !== null
       ? frames.filter((f) => f.frameIdx === parsed.frameIdx)
@@ -1607,6 +1775,9 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
   const nextRefs = new Map();
   const scannedFrames = new Set();
   let totalMatched = 0;
+  const loaderState = await getPageLoaderState(page);
+  if (loaderState) await syncFrameTree(loaderState);
+  const mainLoaderId = loaderState ? (matchCdpFrame(loaderState, allFrames, 0)?.loaderId || '') : '';
 
   for (const frameInfo of frames) {
     let chunk;
@@ -2079,9 +2250,19 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
     nextRefNum = chunk.nextRef;
     pageRefHigh.set(page, Math.max(pageRefHigh.get(page) || 0, chunk.nextRef - 1));
     totalMatched += chunk.total;
+    const cdpFrame = loaderState ? matchCdpFrame(loaderState, allFrames, frameInfo.frameIdx) : null;
+    const frameStamp = cdpFrame?.loaderId
+      ? { frameIdx: frameInfo.frameIdx, frameId: cdpFrame.id, loaderId: cdpFrame.loaderId, mainLoaderId }
+      : null;
 
     const frameItems = [];
     for (const item of chunk.items) {
+      if (frameStamp) {
+        const refLower = item.ref.toLowerCase();
+        const bareLower = refLower.split(':')[1];
+        loaderState.refs.set(refLower, frameStamp);
+        if (bareLower) loaderState.refs.set(bareLower, frameStamp);
+      }
       nextSignatures.add(item.sig);
       nextRefs.set(item.ref, item.sig);
       if (queryRe && !queryRe.test(item.line)) continue;
@@ -2469,6 +2650,9 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
   const frames = getAllFrames(page);
   const overwrite = Boolean(spec.overwrite);
   const fields = Array.isArray(spec.fields) ? spec.fields : [];
+  for (const f of fields) {
+    if (f?.ref) await assertCurrentDocumentRef(page, f.ref, frames);
+  }
 
   const fileFields = [];
   const domFields = [];
@@ -5375,7 +5559,13 @@ export async function findOutboundApplyLinks(page) {
   return found;
 }
 
-async function executeSingleAction(page, params = {}) {
+const activeLateMutating = new WeakMap();
+
+async function executeSingleAction(page, rawParams = {}) {
+  const allowSubmit = resolveAllowSubmit(rawParams.allowSubmit);
+  const params = { ...rawParams, allowSubmit };
+  if (params.ref) await assertCurrentDocumentRef(page, params.ref);
+  if (params.targetRef) await assertCurrentDocumentRef(page, params.targetRef);
   const silentState = { count: 0, wantKind: false, clickKind: '' };
   const enabled = params.observeAftermath ?? (process.env.TURBO_BROWSER_OBSERVE_AFTERMATH === 'true');
   const observer = enabled && ['click', 'dblclick'].includes(params.action) ? observeClickAftermath(page) : null;
@@ -5383,7 +5573,7 @@ async function executeSingleAction(page, params = {}) {
     ? watchActionNavigation(page, Number(params.timeoutMs) || DEFAULT_TIMEOUT_MS) : null;
   // A committing click/key gets the same settle step so a toast ("This domain isn't allowed.") can show up.
   const wantToast = ['click', 'dblclick', 'press'].includes(params.action);
-  const toastWindow = wantToast && resolveAllowSubmit(params.allowSubmit);
+  const toastWindow = wantToast && allowSubmit;
   // One shared settle step replaces fixed sleeps; listeners stay attached until it is done.
   const activity = observer || navigation || toastWindow ? watchActivity(page) : null;
   if (wantToast) await armToasts(page);
@@ -5398,19 +5588,24 @@ async function executeSingleAction(page, params = {}) {
   // Mutating fetch/XHR requests started by a click are reported (never blocked); one that starts within ~800 ms
   // after the result is parked on the next tool result.
   const clickAction = ['click', 'dblclick'].includes(params.action);
+  if (clickAction || allowSubmit) {
+    activeLateMutating.get(page)?.();
+    activeLateMutating.delete(page);
+  }
   const mutating = [];
   let watchOpen = clickAction;
   let returned = false;
   let completed = false;
   const onMutating = (request) => {
-    if (!watchOpen || !/^(POST|PUT|PATCH|DELETE)$/.test(request.method()) || !['fetch', 'xhr'].includes(request.resourceType())) return;
+    const rType = request.resourceType?.() || '';
+    if (!watchOpen || rType === 'ping' || rType === 'beacon' || !/^(POST|PUT|PATCH|DELETE)$/.test(request.method()) || !['fetch', 'xhr'].includes(rType)) return;
     let host = '';
-    let path = '';
-    try { const u = new URL(request.url()); host = u.host; path = u.pathname; } catch { return; }
-    if (ANALYTICS_RE.test(host) || ANALYTICS_RE.test(path)) return;
+    let reqPath = '';
+    try { const u = new URL(request.url()); host = u.host; reqPath = u.pathname; } catch { return; }
+    if (isAnalyticsRequest(request, host, reqPath)) return;
     // An allowed submit was the point of the click: the agent knows it submitted, no late warning.
     if (returned && params.allowSubmit === true) return;
-    if (returned) parkLate(page, `possibleSubmit: ${request.method()} ${host}${path.slice(0, 60)}`);
+    if (returned) parkLate(page, `possibleSubmit: ${request.method()} ${host}${reqPath.slice(0, 60)}`);
     else mutating.push({ method: request.method(), host });
   };
   // With observeAftermath the aftermath report already lists mutating requests (and parks late ones itself).
@@ -5436,7 +5631,7 @@ async function executeSingleAction(page, params = {}) {
         res.url = page.url();
       }
     }
-    await observer?.finish(res, resolveAllowSubmit(params.allowSubmit));
+    await observer?.finish(res, allowSubmit);
     if (res && res._applyLike) {
       if (!observer && !navigation) await new Promise((r) => setTimeout(r, 600));
       if (!openedTab && page.url() === beforeApplyUrl) {
@@ -5454,10 +5649,12 @@ async function executeSingleAction(page, params = {}) {
         res.possibleSubmit = true;
         res.request = `${seen[0].method} ${seen[0].host}`;
       }
-      if (observer || !ok) { watchOpen = false; page.off('request', onMutating); }
+      if (observer || !ok || params.allowSubmit === true) { watchOpen = false; page.off('request', onMutating); }
       else {
-        const t = setTimeout(() => { watchOpen = false; page.off('request', onMutating); }, 800);
+        const off = () => { watchOpen = false; page.off('request', onMutating); };
+        const t = setTimeout(off, 800);
         t.unref?.();
+        activeLateMutating.set(page, () => { clearTimeout(t); off(); });
       }
     }
     ctxForTabs?.off('page', onNewPage);
@@ -7128,7 +7325,7 @@ export async function actFast(page, params = {}, previousLinesSet = null) {
   const tnKey = allowSubmit && params.expect?.textNew ? await armTextNew(page, params.expect.textNew) : '';
   let res;
   try {
-    res = await executeSingleAction(page, params);
+    res = await executeSingleAction(page, { ...params, allowSubmit });
     if (guard) await guard.settle();
   } finally {
     if (guard) await guard.remove();
@@ -7270,12 +7467,14 @@ async function batchActionsCore(page, stepList, options, previousLinesSet, guard
       } else {
         if (step.action && !BATCH_ACTIONS.has(step.action)) throw new Error(`unknown batch action: ${step.action}`);
         lastNavBad = '';
+        const stepAllowSubmit =
+          options.allowSubmit === false ? false : resolveAllowSubmit(step.allowSubmit ?? defaultAllowSubmit);
         stepResult = await executeSingleAction(page, {
           ...step,
           ...(afterNav && step.action === 'wait' && step.textNew ? { _freshDocument: true } : {}),
           returnSnapshot: options.returnSnapshot || step.returnSnapshot,
           observeAftermath: step.observeAftermath ?? options.observeAftermath,
-          allowSubmit: options.allowSubmit === false ? false : (step.allowSubmit ?? defaultAllowSubmit),
+          allowSubmit: stepAllowSubmit,
         });
       }
       tagBlockedBy(stepResult);
