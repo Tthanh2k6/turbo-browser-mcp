@@ -951,31 +951,39 @@ export class BrowserManager {
     // Re-probe the main world of every tab in parallel (1.5 s cap): marks tabs that got stuck after
     // attach and clears marks on tabs that answer again.
     await Promise.all([...this.tabs.values()].map((p) => this.probePage(p, 1500)));
-    for (const [tabId, page] of this.tabs.entries()) {
+    // Titles in parallel, and never waited for on a stuck tab (title reads the blocked main world): sequential
+    // 1.5 s waits made a listing with many such tabs take 15-20 s.
+    const entries = await Promise.all([...this.tabs.entries()].map(async ([tabId, page]) => {
       let title = '';
-      let timer;
-      try {
-        title = await Promise.race([
-          page.title(),
-          new Promise((resolve) => {
-            timer = setTimeout(() => resolve(''), 1500);
-          }),
-        ]);
-      } catch {
-        title = '';
-      } finally {
-        clearTimeout(timer);
+      const stuck = this.isPageUnresponsive(page);
+      if (!stuck) {
+        let timer;
+        try {
+          title = await Promise.race([
+            page.title(),
+            new Promise((resolve) => {
+              timer = setTimeout(() => resolve(''), 1500);
+            }),
+          ]);
+        } catch {
+          title = '';
+        } finally {
+          clearTimeout(timer);
+        }
       }
+      const url = page.url();
       const entry = {
         tabId,
-        url: page.url(),
+        url,
         title,
         active: tabId === this.activeTabId,
         isolatedContext: this.tabContextName.get(tabId) || 'default',
       };
-      if (this.isPageUnresponsive(page)) entry.unresponsive = true;
-      results.push(entry);
-    }
+      // A tab with no committed document yet (empty url) has nothing to be stuck on.
+      if (stuck && url) entry.unresponsive = true;
+      return entry;
+    }));
+    results.push(...entries);
     return results;
   }
 

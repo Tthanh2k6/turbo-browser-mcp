@@ -22,6 +22,11 @@ function scanToasts(init) {
   for (const el of found) {
     const txt = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
     if (!txt) continue;
+    // A tag/chip box (field inside, or several chip buttons) is a widget, not a message about the action.
+    try {
+      if (el.querySelector('input:not([type="hidden"]), textarea, select, [contenteditable=""], [contenteditable="true"]') ||
+        el.querySelectorAll('button, [role="button"]').length >= 2) continue;
+    } catch { /* ignore */ }
     const r = el.getBoundingClientRect();
     let hidden = !(r.width > 0 && r.height > 0);
     try { const st = getComputedStyle(el); hidden = hidden || st.visibility === 'hidden' || st.display === 'none'; } catch { /* ignore */ }

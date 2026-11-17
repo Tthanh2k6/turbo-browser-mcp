@@ -2181,6 +2181,28 @@ function commitStaleProbe(arg) {
   return stale(arg);
 }
 
+// Rich text editors that ignore programmatic edits: replace the content with real key events (select all, delete,
+// text, Enter between lines = one paragraph each), then check the text by lines. Returns true when it took.
+async function fillEditorByKeys(page, frame, idx, val) {
+  const lines = (t) => String(t).split('\n').map((l) => l.replace(/\s+/g, ' ').trim()).filter(Boolean);
+  const want = String(val).replace(/\r\n?/g, '\n');
+  try {
+    const loc = frame.locator('[data-tbm-fill="' + idx + '"]').first();
+    await loc.focus({ timeout: 1500 });
+    await page.keyboard.press('ControlOrMeta+a');
+    await page.keyboard.press('Backspace');
+    const parts = want.split('\n');
+    for (let i = 0; i < parts.length; i++) {
+      if (i > 0) await page.keyboard.press('Enter');
+      if (parts[i]) await page.keyboard.insertText(parts[i]);
+    }
+    await new Promise((r) => setTimeout(r, 80));
+    const got = await loc.evaluate((el) => el.innerText).catch(() => '');
+    return lines(got).join('|') === lines(want).join('|');
+  } catch {
+    return false;
+  }
+}
 // Fallback for such fields: focus, select all and type for real (trusted key events). Returns true when typed.
 async function retypeField(page, locator, val) {
   if (/[\r\n]/.test(val)) return false;
@@ -2200,6 +2222,8 @@ const BLUR_SETTLE_MS = 60;
 const norm = (v) => String(v ?? '').replace(/\s+/g, ' ').trim();
 function blurFlag(want, now) {
   if (norm(want) === '' || norm(now) === norm(want)) return null;
+  // Reported fill values are cut at 60 chars; the live field holds the full text, so a prefix match is a match.
+  if (String(want).length >= 60 && norm(now).startsWith(norm(want))) return null;
   return norm(now) === '' ? { clearedAfterBlur: true } : { changedAfterBlur: String(now).slice(0, 60) };
 }
 async function blurAndRead(frame, idxs) {
@@ -2265,7 +2289,7 @@ async function verifyAfterBlur(page, filled) {
       if (now === undefined) continue;
       const flag = blurFlag(e.value, now);
       if (!flag) continue;
-      if (flag.clearedAfterBlur && !/[\r\n]/.test(e.value)) {
+      if (flag.clearedAfterBlur && !/[\r\n]/.test(e.value) && String(e.value).length < 60) {
         const loc = frame.locator('[data-tbm-fill="' + e.idx + '"]').first();
         const back = await retypeSlowly(page, loc, e.value);
         if (norm(back) !== '') {
@@ -2327,6 +2351,44 @@ async function recheckFilled(page, spec, filled) {
   return n;
 }
 
+// A ref that no longer exists but was in an earlier snapshot: the page re-rendered. Name the live ref with the same
+// label when there is one. Returns '' when the ref was never in a snapshot (typo: keep plain not-found).
+async function staleRefHint(frames, ref, previousLinesSet) {
+  const m = /^(?:f(\d+):)?(e\d+)$/i.exec(String(ref).trim());
+  const store = previousLinesSet ? snapshotBaselines.get(previousLinesSet) : null;
+  if (!m || !store) return '';
+  let label = null;
+  for (const { refs } of store.byMode.values()) {
+    for (const [r, sig] of refs) {
+      if (r.split(':')[1] !== m[2] || (m[1] !== undefined && r.split(':')[0] !== `f${m[1]}`)) continue;
+      const lm = /^f\d+:<[^>]*> "([^"]*)"/.exec(sig);
+      label = lm ? lm[1].split(' | ')[0] : '';
+    }
+  }
+  if (label === null) return '';
+  let now = '';
+  if (label) {
+    for (const f of frames) {
+      const id = await f.frame.evaluate((want) => {
+        const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const w = clean(want);
+        const stack = [document];
+        while (stack.length) {
+          const root = stack.shift();
+          for (const el of root.querySelectorAll('[data-tbm-ref]')) {
+            const labs = [el.getAttribute('aria-label'), el.placeholder, el.getAttribute('name'), el.value, ...[...(el.labels || [])].map((l) => l.textContent), el.innerText];
+            if (labs.some((x) => clean(x).slice(0, 80) === w.slice(0, 80))) return el.getAttribute('data-tbm-ref');
+          }
+          for (const n of root.querySelectorAll('*')) if (n.shadowRoot) stack.push(n.shadowRoot);
+        }
+        return '';
+      }, label).catch(() => '');
+      if (id) { now = `f${f.frameIdx}:${id}`; break; }
+    }
+  }
+  return `ref from an older snapshot, page re-rendered; ${now ? `same label now ${now}` : `re-inspect${label ? ` (was "${label.slice(0, 30)}")` : ''}`}`;
+}
+
 export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
   const t0 = Date.now();
   const frames = getAllFrames(page);
@@ -2339,6 +2401,11 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
   const skipped = [];
   fields.forEach((f, idx) => {
     if (!f) return;
+    // Agents often write {label|name: "Email"} instead of {keys}: treat it as keys when no other target is given.
+    if (!f.keys && !f.ref && !f.selector) {
+      const alias = typeof f.label === 'string' && f.label ? f.label : typeof f.name === 'string' && f.name ? f.name : '';
+      if (alias) f = { ...f, keys: alias };
+    }
     const hasNonEmptyFile = typeof f.file === 'string' ? f.file.trim().length > 0 : Boolean(f.file);
     const hasNonEmptyFiles =
       Array.isArray(f.files) &&
@@ -2526,7 +2593,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
     try {
       res = await withFrameSubmitGuard(frameInfo.frame, () =>
         frameInfo.frame.evaluate(
-          ({ domSpec, mainVal, gmailSpec, overwriteFlag, stopBeforeSubmitFlag, frameIdxArg, qBlockSel, submitSel }) => {
+          async ({ domSpec, mainVal, gmailSpec, overwriteFlag, stopBeforeSubmitFlag, frameIdxArg, qBlockSel, submitSel }) => {
             const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
             const getSR = (node) => node?.shadowRoot || window.__tbmGetShadowRoot?.(node) || null;
 
@@ -2930,6 +2997,32 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             if (el.isContentEditable) return clean(el.innerText);
             if (typeof el.value === 'string') return el.value.trim();
             return clean(el.getAttribute('data-value') || el.innerText || '');
+          };
+
+          // Rich editors (Lexical, ProseMirror) own their DOM: replace the content through editing commands, one
+          // paragraph per newline, wait for the editor to render, then check the text really is there line by line.
+          const setEditable = async (el, val) => {
+            el.focus();
+            const want = String(val).replace(/\r\n?/g, '\n');
+            const lines = (t) => String(t).split('\n').map(clean).filter(Boolean);
+            try {
+              window.getSelection().selectAllChildren(el);
+              if (clean(el.innerText)) document.execCommand('delete', false);
+              want.split('\n').forEach((line, i) => {
+                if (i > 0) document.execCommand('insertParagraph', false);
+                if (line) document.execCommand('insertText', false, line);
+              });
+            } catch { /* fall through to the check */ }
+            await new Promise((r) => setTimeout(r, 40));
+            let ok = lines(el.innerText).join('\n') === lines(want).join('\n');
+            if (!ok && !clean(el.innerText).length && !el.querySelector('*')) {
+              el.textContent = want;
+              ok = lines(el.innerText).join('\n') === lines(want).join('\n');
+            }
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.style.outline = '2px solid #E0461D';
+            el.style.outlineOffset = '1px';
+            return ok;
           };
 
           const setNativeValue = (el, val) => {
@@ -3639,7 +3732,16 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
               }
 
               const strVal = String(f.value ?? '');
-              setNativeValue(el, strVal);
+              let editRejected = false;
+              if (el.isContentEditable && strVal !== '') {
+                editRejected = !(await setEditable(el, strVal));
+                if (editRejected) {
+                  // Editing commands did not take (editor inside a shadow root, or one that owns its DOM): the Node side retries with real key events.
+                  try { el.setAttribute('data-tbm-fill', String(f._idx)); } catch { /* ignore */ }
+                  frameSkipped.push({ idx: f._idx, frameIdx: frameIdxArg, reason: 'value-rejected-by-input', label: describe(el).slice(0, 50), _editor: 1, _val: strVal });
+                  continue;
+                }
+              } else setNativeValue(el, strVal);
               let afterVal = currentValue(el);
               // A widget that empties the value on blur (date pickers) also empties it on our synthetic blur. If the
               // value sticks when set again without events, the input accepts it: keep it so the post-blur check can
@@ -3651,6 +3753,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                 afterVal = currentValue(el);
               }
               if (
+                editRejected ||
                 (strVal !== '' && afterVal === '') ||
                 (overwriteFlag && cur !== '' && clean(afterVal) === clean(cur) && clean(strVal) !== clean(cur))
               ) {
@@ -3863,7 +3966,13 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
 
     if (!res) continue;
     filled.push(...res.frameFilled);
-    skipped.push(...res.frameSkipped);
+    for (const sk of res.frameSkipped) {
+      if (!sk._editor) { skipped.push(sk); continue; }
+      const { _editor, _val, ...rest } = sk;
+      const ok = await fillEditorByKeys(page, frameInfo.frame, sk.idx, _val);
+      if (ok) filled.push({ idx: sk.idx, frameIdx: sk.frameIdx, tag: 'contenteditable', label: sk.label, value: _val.slice(0, 60) });
+      else skipped.push(rest);
+    }
     for (const mIdx of res.matchedIndexes) matchedFieldIndexes.add(mIdx);
     for (const l of res.leftover) leftoverSet.add(l);
     for (const s of res.submits) {
@@ -4577,6 +4686,10 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
   for (const f of domFields) {
     if (matchedFieldIndexes.has(f._idx) || reported.has(f._idx)) continue;
     const hasTarget = Boolean(f.ref || f.selector || f.keys);
+    if (f.ref && !f.selector && !f.keys) {
+      const hint = await staleRefHint(frames, f.ref, previousLinesSet);
+      if (hint) { skipped.push({ idx: f._idx, reason: 'stale-ref', hint }); continue; }
+    }
     skipped.push({ idx: f._idx, reason: hasTarget ? 'not-found' : 'no-target' });
   }
 
@@ -6354,8 +6467,16 @@ ${el.value || ''}`.toLowerCase();
     };
     await withActionSubmitGuard(
       async () => {
-        if (action === 'dblclick') await locator.dblclick(clickOpts);
-        else await locator.click(clickOpts);
+        const go = (o) => (action === 'dblclick' ? locator.dblclick(o) : locator.click(o));
+        try {
+          await go({ ...clickOpts, timeout: Math.min(timeout, 1500) });
+        } catch (err) {
+          // The page root receiving the click means the target's popover/menu closed under us; retrying for 8 s will not reopen it.
+          if (/<(html|body)[\s>][^\r\n]*?\s+intercepts pointer events/.test(String(err?.message || err).replace(ANSI_RE, ''))) {
+            throw new Error('Click missed: the target is no longer under the pointer (its popover or menu closed). Reopen it and click in the same batch.');
+          }
+          await go(clickOpts);
+        }
       },
       target.frame,
       isSafeClick,
@@ -6499,6 +6620,7 @@ ${el.value || ''}`.toLowerCase();
         }
       }
     }
+    const ringBefore = await ringSig(locator);
     if (params.slowly === false && !params.delayMs) {
       await withActionSubmitGuard(() => locator.fill(val, { timeout }));
     } else {
@@ -6558,7 +6680,11 @@ ${el.value || ''}`.toLowerCase();
     const typedOut = { ok: true, action, frameIdx, length: val.length, submitted: Boolean(params.submit) };
     // Typing appends, so only the tail has to match; maxlength, masks and number inputs cut it short.
     const typedBack = val ? await readBack(locator) : null;
-    if (typedBack && !typedBack.v.endsWith(val.replace(/\r\n/g, '\n'))) typedOut.mismatch = mismatchText(typedBack);
+    if (typedBack && !typedBack.v.endsWith(val.replace(/\r\n/g, '\n'))) {
+      // A tag/chip input turns the text into a chip and empties itself: that is a commit, not a mismatch.
+      const consumed = typedBack.v === '' && ringBefore && (await ringSig(locator)) !== ringBefore;
+      if (!consumed) typedOut.mismatch = mismatchText(typedBack);
+    }
     if (params.submit) {
       await page.keyboard.press('Enter');
     }
@@ -6803,6 +6929,14 @@ function readBack(locator) {
     ['INPUT', 'TEXTAREA'].includes(el.tagName) && el.type !== 'file'
       ? { v: String(el.value), secret: el.type === 'password', sh: el.getRootNode?.() instanceof ShadowRoot } : null
   )).catch(() => null);
+}
+// Size of the markup around a field (up to 3 ancestors up): changes when typing adds a chip or list item.
+function ringSig(locator) {
+  return locator.evaluate((el) => {
+    let box = el;
+    for (let i = 0; i < 3 && box.parentElement && box.parentElement !== document.body; i++) box = box.parentElement;
+    return `${box.querySelectorAll('*').length}:${(box.textContent || '').length}`;
+  }).catch(() => null);
 }
 function mismatchText(back) {
   return back.secret || process.env.TURBO_BROWSER_SECRETS_FILE ? 'field value differs from the typed value' : `field now holds "${back.v.slice(0, 60)}"`;
