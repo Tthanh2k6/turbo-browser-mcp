@@ -113,6 +113,25 @@ describe('round 15', () => {
     assert.equal(await (await manager.getPage()).page.evaluate(() => window.model()), 'Only this');
   });
 
+  it('6b: long multi-line editor fill is not flagged after blur and the field is reported once', async () => {
+    await open('/lexical');
+    const v = 'line one\n\nline two with a longer sentence that goes past sixty characters for the blur check\nline three';
+    const r = await call('smart_fill_form', { fields: [{ label: 'Body text', value: v }], overwrite: true });
+    assert.equal(r.filled?.length, 1, JSON.stringify(r));
+    assert.ok(!/changedAfterBlur|clearedAfterBlur/.test(JSON.stringify(r)), JSON.stringify(r));
+    assert.equal((r.skipped || []).length, 0, JSON.stringify(r));
+  });
+
+  it('7b: chrome:// pages are not flagged unresponsive', async () => {
+    const p = await manager.context.newPage();
+    await p.goto('chrome://version').catch(() => {});
+    const res = await manager.listTabs();
+    const t = res.find((x) => x.url.startsWith('chrome://'));
+    assert.ok(t, JSON.stringify(res));
+    assert.equal(t.unresponsive, undefined);
+    await p.close();
+  });
+
   it('7: listing tabs does not wait 1.5 s per stuck tab', async () => {
     const ctx = manager.context;
     const stuck = [];

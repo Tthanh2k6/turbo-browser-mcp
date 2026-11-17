@@ -2248,7 +2248,7 @@ async function blurAndRead(frame, idxs) {
         const out = {};
         for (const id of ids) {
           const el = els[id];
-          if (el) out[id] = String(el.isContentEditable ? el.textContent : el.value ?? '');
+          if (el) out[id] = String(el.isContentEditable ? el.innerText : el.value ?? '');
         }
         return out;
       },
@@ -2266,7 +2266,7 @@ async function retypeSlowly(page, locator, val) {
       for (const k of extra) await page.keyboard.press(k);
       await page.keyboard.press('Tab');
       await new Promise((r) => setTimeout(r, BLUR_SETTLE_MS));
-      const back = await locator.evaluate((el) => String(el.isContentEditable ? el.textContent : el.value ?? '')).catch(() => '');
+      const back = await locator.evaluate((el) => String(el.isContentEditable ? el.innerText : el.value ?? '')).catch(() => '');
       if (norm(back) !== '') return back;
     } catch {
       return '';
@@ -3739,6 +3739,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                   // Editing commands did not take (editor inside a shadow root, or one that owns its DOM): the Node side retries with real key events.
                   try { el.setAttribute('data-tbm-fill', String(f._idx)); } catch { /* ignore */ }
                   frameSkipped.push({ idx: f._idx, frameIdx: frameIdxArg, reason: 'value-rejected-by-input', label: describe(el).slice(0, 50), _editor: 1, _val: strVal });
+                  matchedIndexes.push(f._idx);
                   continue;
                 }
               } else setNativeValue(el, strVal);

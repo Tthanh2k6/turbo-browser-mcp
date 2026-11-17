@@ -560,6 +560,8 @@ export class BrowserManager {
   }
 
   isPageUnresponsive(page) {
+    // Browser-internal pages refuse script injection; that is not a blocked main world.
+    try { if (/^(chrome|devtools|chrome-untrusted|edge|about):/i.test(page.url()) && page.url() !== 'about:blank') return false; } catch { /* ignore */ }
     return !!this._unresponsivePages?.has(page);
   }
 
