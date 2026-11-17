@@ -24,7 +24,7 @@ const SUBMIT_LABEL_RE =
   /^(submit|publish|post|send|apply(\s+now)?|confirm(\s+and)?\s*(pay|submit|order|booking)|pay(\s+now)?|buy(\s+now)?|order(\s+now)?|complete\s+(order|purchase)|checkout|place\s+order|delete|remove|gửi|đăng(?!\s+nhập)(\s*bài)?|nộp(\s*đơn)?|xác\s*nhận(\s*(nộp|gửi|thanh\s*toán|đặt))?|thanh\s*toán|đặt\s+hàng|mua\s+ngay|xoá|xóa|hoàn\s*tất|lên\s+lịch(\s+họp)?|đặt\s+(lịch|hẹn|chỗ|bàn|phòng)|schedule\s+(meeting|call|demo|appointment|now)|book(\s+(now|an?\s+\p{L}+|appointment|meeting|call|demo))?|(제출|신청|등록|접수|결제|구매|삭제)(하기)?|送信(する)?|確定|申し込む|購入(する)?|削除|提交|确认提交|支付|购买|删除)(?![\p{L}\p{N}_])/iu;
 
 const SAFE_SUBMIT_TYPE_RE =
-  /^(next|continue|search|filter|save\s*draft|log\s*in|sign\s*in|tiếp(\s*tục)?|tìm(\s*kiếm)?|lọc|lưu\s*nháp|đăng\s+nhập|다음|이전|검색|로그인|次へ|検索|ログイン|下一步|搜索|登录)(?![\p{L}\p{N}_])/iu;
+  /^(next|continue|search|filter|save\s*draft|log\s*in|sign\s*in|tiếp(\s*tục)?|tìm(\s*kiếm)?|lọc|lưu\s*nháp|đăng\s+nhập|load\s+more|show\s+more|see\s+more|view\s+more|next\s+page|previous\s+page|xem\s+thêm|tải\s+thêm|다음|이전|검색|로그인|次へ|検索|ログイン|下一步|搜索|登录)(?![\p{L}\p{N}_])/iu;
 
 // Destructive-but-local UI (chip remove, clear form, close/cancel): not a final submit unless it is type=submit.
 const LOCAL_UI_RE =
@@ -520,6 +520,13 @@ export async function resolveTarget(page, { ref, selector, text, frameIdx, allow
 
   if (text) {
     let fallback = null;
+    // A modal dialog is open: its own match wins over an identical label on the page behind it.
+    for (const f of scopedFrames) {
+      const modal = f.frame.locator('[role="dialog"]:visible, [role="alertdialog"]:visible, [aria-modal="true"]:visible, dialog[open]');
+      if (!(await modal.count().catch(() => 0))) continue;
+      const picked = await pickBestTextLocator(modal.getByText(text, { exact: false }), text, allowHidden).catch(() => null);
+      if (picked?.visible) return { frame: f.frame, frameIdx: f.frameIdx, locator: picked.locator };
+    }
     for (const f of scopedFrames) {
       const allLoc = f.frame.getByText(text, { exact: false });
       const picked = await pickBestTextLocator(allLoc, text, allowHidden);
@@ -1591,7 +1598,9 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
   for (const frameInfo of frames) {
     let chunk;
     try {
-      chunk = await frameInfo.frame.evaluate(
+      // One busy or hung frame must not hold the whole snapshot: give each frame 8 s.
+      let capTimer;
+      chunk = await Promise.race([frameInfo.frame.evaluate(
         ({ modeArg, frameIdxArg, startRef, rootSel, boxesArg, preserveRefsArg }) => {
           const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
 
@@ -1916,7 +1925,16 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
               }
             }
           }
-          const nodes = rawNodes.filter((el) => !isHidden(el));
+          let nodes = rawNodes.filter((el) => !isHidden(el));
+          // A modal dialog (aria-modal or a showModal()'d <dialog>) is open: the page behind it cannot be used, list only the dialog.
+          if (modeArg === 'interactive' || modeArg === 'forms') {
+            const modals = queryAllDeep(root, '[aria-modal="true"], dialog[open]')
+              .filter((d) => !isHidden(d) && (d.getAttribute('aria-modal') === 'true' || d.matches(':modal')));
+            if (modals.length > 0) {
+              const inModal = nodes.filter((el) => modals.some((d) => d === el || d.contains(el) || (el.getRootNode?.() instanceof ShadowRoot && d.contains(el.getRootNode().host))));
+              if (inModal.length > 0) nodes = inModal;
+            }
+          }
 
           const usedRefs = new Set();
           const items = [];
@@ -2037,8 +2055,9 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
           boxesArg: boxes,
           preserveRefsArg: preserveRefs,
         }
-      );
-    } catch {
+      ), new Promise((_, rej) => { capTimer = setTimeout(() => rej(new Error('frame snapshot timed out')), 8000); })]).finally(() => clearTimeout(capTimer));
+    } catch (err) {
+      if (/timed out/.test(String(err?.message))) entries.push(`(frame f${frameInfo.frameIdx} skipped: no answer within 8 s)`);
       continue;
     }
 
@@ -2091,7 +2110,9 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
   const filterNote = `${query ? ` | Query: "${query}"` : ''}${onlyChanged ? ' | Delta: true' : ''}`;
   const urlChangedNote = onlyChanged && hadBaseline && !sameUrlAsBaseline
     ? 'URL changed: full snapshot\n'
-    : '';
+    : onlyChanged && !baseline
+      ? 'No earlier full snapshot (a query or selector snapshot is not kept as baseline): listing everything\n'
+      : '';
   const popupNote = (await popupOpenIn(allFrames[0].frame)) ? `Note: ${POPUP_NOTE}\n` : '';
   const header = `URL: ${page.url()}\nTitle: ${title}\nMode: ${mode} | Frames: ${frames.length} | Elements: ${totalMatched}${filterNote}\n${urlChangedNote}${popupNote}`;
   let body = '';
@@ -5655,9 +5676,10 @@ ${el.value || ''}`.toLowerCase();
       }
       return { ok: true, action, waitedFor: params.selector || params.text, ...(matchedAlt ? { matched: matchedAlt } : {}) };
     }
-    const ms = Math.min(Number(params.ms) || 500, 15000);
+    const wantMs = Number(params.ms) || 500;
+    const ms = Math.min(wantMs, 15000);
     await page.waitForTimeout(ms);
-    return { ok: true, action, ms };
+    return { ok: true, action, ms, ...(wantMs > ms ? { cappedTo: ms } : {}) };
   }
 
   let target = null;
@@ -6802,10 +6824,21 @@ ${el.value || ''}`.toLowerCase();
         if ((roleInfo.ariaChecked === 'true') !== wantChecked) {
           await locator.click({ timeout });
         }
-      } else if (wantChecked) {
-        await locator.check({ timeout });
       } else {
-        await locator.uncheck({ timeout });
+        const go = (o) => (wantChecked ? locator.check(o) : locator.uncheck(o));
+        try {
+          await go({ timeout: Math.min(timeout, 2500) });
+        } catch (err) {
+          // A styled span over a visually hidden input: its own label is the control people click.
+          if (!/intercepts pointer events/.test(String(err?.message || err))) throw err;
+          const flipped = await locator.evaluate((el, want) => {
+            const label = el.closest('label') || (el.labels && el.labels[0]);
+            if (!label) return false;
+            if (el.checked !== want) label.click();
+            return el.checked === want;
+          }, wantChecked).catch(() => false);
+          if (!flipped) await go({ timeout });
+        }
       }
     });
     return { ok: true, action, frameIdx };
@@ -7293,7 +7326,7 @@ export function denoiseText(text) {
 export async function extractCleanText(page, options = {}) {
   const maxChars = Math.max(200, Number(options.maxChars) || 6000);
   const includeFrames = options.includeFrames !== false;
-  const selector = options.selector || null;
+  let selector = options.selector || null;
   const format = options.format === 'markdown' ? 'markdown' : 'text';
 
   const frames = includeFrames ? getAllFrames(page) : getAllFrames(page).slice(0, 1);
@@ -7713,21 +7746,34 @@ export async function extractCleanText(page, options = {}) {
       await new Promise((r) => setTimeout(r, 200));
       await runAll();
     }
+    if (sections.length === 0 && selector) {
+      // The selector matched nothing useful (no <main>, or content in a sibling): read the whole page instead.
+      const wanted = selector;
+      selector = null;
+      await runAll();
+      if (sections.length > 0) note = `selector "${wanted}" had no text; used the page body`;
+    }
     if (sections.length === 0) note = 'page has no text yet';
   }
-  // Only a sliver of text (a footer) while an SPA route is still rendering: poll until it grows or holds still ~0.6 s.
-  const emptyRoot = !selector && sections.length > 0 && sections.join('').length < 400
-    ? await page.mainFrame().evaluate(() => [...document.querySelectorAll('#app, #root, #__next, #app-root, main, [role="main"]')].some((e) => !(e.innerText || '').trim())).catch(() => false)
-    : false;
-  if (emptyRoot) {
+  // An SPA that is still rendering: a sliver of text with an empty app root, or a document younger than ~8 s whose text
+  // is still growing (lazy lists load after the shell). Poll until the text holds still, at most 3 s.
+  const small = !selector && sections.length > 0 && sections.join('').length < 400;
+  const probeState = !selector && sections.length > 0
+    ? await page.mainFrame().evaluate((checkRoot) => ({
+      // Young document that already used fetch/XHR: a data-driven page whose list may still be coming in.
+      young: performance.now() < 8000 && performance.getEntriesByType('resource').some((e) => e.initiatorType === 'fetch' || e.initiatorType === 'xmlhttprequest'),
+      emptyRoot: checkRoot && [...document.querySelectorAll('#app, #root, #__next, #app-root, main, [role="main"]')].some((e) => !(e.innerText || '').trim()),
+    }), small).catch(() => ({ young: false, emptyRoot: false }))
+    : { young: false, emptyRoot: false };
+  if (probeState.emptyRoot || probeState.young) {
     const until = Date.now() + 3000;
+    const quietPolls = probeState.emptyRoot ? 5 : sections.join('').length < 1500 ? 6 : 3;
     let last = sections.join('').length;
     let still = 0;
-    while (still < 5 && Date.now() < until) {
+    while (still < quietPolls && Date.now() < until) {
       await new Promise((r) => setTimeout(r, 200));
       await runAll();
       const len = sections.join('').length;
-      if (len >= 400) break;
       still = len === last ? still + 1 : 0;
       last = len;
     }

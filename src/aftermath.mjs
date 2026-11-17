@@ -94,14 +94,24 @@ export function observeClickAftermath(page) {
     try { pathname = new URL(url).pathname; } catch {}
     const finalSubmit = method === 'DELETE' ||
       /(?:^|[/_.-])(?:submit|publish|commit|checkout|payment|purchase|delete)(?:$|[/_.-])/i.test(pathname);
-    mutatingRequests.push({ method, url, finalSubmit });
+    const entry = { method, url, finalSubmit };
+    mutatingRequests.push(entry);
+    entryOf.set(request, entry);
+  };
+  // The HTTP status decides whether a submit worked: a 403/4xx/5xx answer is a failed submit, not a sent one.
+  const entryOf = new WeakMap();
+  const onResponse = (response) => {
+    const entry = entryOf.get(response.request());
+    if (entry) entry.status = response.status();
   };
   page.on('request', onRequest);
+  page.on('response', onResponse);
   page.on('framenavigated', onNavigation);
   let late = false, lateTimer = null;
   const detach = () => {
     clearTimeout(lateTimer);
     page.off('request', onRequest);
+    page.off('response', onResponse);
     page.off('framenavigated', onNavigation);
     page.off('request', onLateRequest);
     page.off('framenavigated', onLateNav);
@@ -127,10 +137,15 @@ export function observeClickAftermath(page) {
         late = true;
         page.off('request', onRequest);
         page.off('framenavigated', onNavigation);
+        setTimeout(() => page.off('response', onResponse), LATE_MS).unref?.();
         page.on('request', onLateRequest);
         page.on('framenavigated', onLateNav);
         lateTimer = setTimeout(detach, LATE_MS);
         lateTimer.unref?.();
+      }
+      const failedReq = mutatingRequests.find((r) => r.status >= 400);
+      if (failedReq) {
+        result.aftermath.warning = `${failedReq.method} ${pathOf(failedReq.url)} answered ${failedReq.status}: the submit failed, do not report success.`;
       }
       if (unexpectedSubmit) {
         result.aftermath.warning = 'Possible final submit observed despite allowSubmit=false. The action already occurred; inspect the result before retrying.';
@@ -139,6 +154,7 @@ export function observeClickAftermath(page) {
     remove() {
       if (late) return; // late listeners detach themselves after LATE_MS
       page.off('request', onRequest);
+      page.off('response', onResponse);
       page.off('framenavigated', onNavigation);
     },
   };

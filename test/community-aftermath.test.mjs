@@ -31,7 +31,7 @@ it('records wizard Continue XHR without classifying a draft as final', async () 
   const result = await actFast(page, { action: 'click', selector: '#draft', observeAftermath: true });
   assert.equal(result.aftermath.navigated, false);
   assert.equal(result.aftermath.unexpectedSubmit, false);
-  assert.deepEqual(result.aftermath.mutatingRequests, [{ method: 'POST', url: base + '/draft', finalSubmit: false }]);
+  assert.deepEqual(result.aftermath.mutatingRequests, [{ method: 'POST', url: base + '/draft', finalSubmit: false, status: 200 }]);
 });
 it('reports allowed final Submit navigation', async () => {
   const result = await actFast(page, { action: 'click', selector: '#final', allowSubmit: true, observeAftermath: true });
