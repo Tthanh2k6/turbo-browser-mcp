@@ -9,6 +9,7 @@ Actions that open a popup return its registered tab ID as `newTab`.
 Screenshots fall back after a short font wait and report `fontsPending: true` when needed.
 Job-link tracking and editor telemetry no longer produce false submit reports; real form POSTs remain observable.
 `TURBO_BROWSER_ISOLATE_HOSTS` optionally opens matching hosts in fresh isolated contexts.
+Closing a tab in an isolated context is no longer refused as "the last tab of the attached browser" when the default context has one tab left.
 
 ## 0.7.1 (2026-11-18)
 

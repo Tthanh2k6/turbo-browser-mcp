@@ -39,6 +39,13 @@ describe('round 18c', () => {
       assert.equal(list.tabs.length, 1);
       await assert.rejects(bm.tabsBatch([{ action: 'close', tabId: list.tabs[0].tabId }]), /last tab of the attached browser/);
       assert.equal(up.isConnected(), true);
+      // A tab in an isolated context can be closed while the default context has a single tab (night 19-11).
+      const iso = await bm.tabsBatch([{ action: 'open', url: `http://127.0.0.1:${webPort}/`, isolatedContext: 'guest' }]);
+      const isoTab = iso.results[0].tabId;
+      await bm.tabsBatch([{ action: 'close', tabId: isoTab }]);
+      assert.equal(up.isConnected(), true);
+      assert.equal((await bm.tabsBatch([{ action: 'list' }])).tabs.some((t) => t.tabId === isoTab), false);
+      await assert.rejects(bm.tabsBatch([{ action: 'close', tabId: list.tabs[0].tabId }]), /last tab of the attached browser/);
       // A second tab makes closing the first fine.
       await bm.tabsBatch([{ action: 'open', url: `http://127.0.0.1:${webPort}/` }]);
       await bm.tabsBatch([{ action: 'close', tabId: list.tabs[0].tabId }]);

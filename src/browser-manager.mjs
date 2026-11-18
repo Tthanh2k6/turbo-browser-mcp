@@ -1509,7 +1509,10 @@ export class BrowserManager {
       if (action === 'close') {
         const { tabId, page } = await this.getPage(op.tabId);
         // Closing the last page of an attached browser closes the whole browser (the owner's Chrome).
-        if (this.connectionType === 'cdp' && op.force !== true && this.context.pages().filter((p) => !p.isClosed()).length <= 1) {
+        // Only pages of the default context count: a tab in an isolated context lives in its own
+        // browser context, so closing it never closes Chrome.
+        const inDefaultContext = page.context() === this.context;
+        if (this.connectionType === 'cdp' && op.force !== true && inDefaultContext && this.context.pages().filter((p) => !p.isClosed()).length <= 1) {
           throw new Error('Refusing to close the last tab of the attached browser: that closes Chrome. Open about:blank first, or pass force:true.');
         }
         await page.close();
