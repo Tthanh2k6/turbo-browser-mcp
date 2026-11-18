@@ -1,29 +1,8 @@
 import fs from 'node:fs';
 import { gotoRetry, navHealth } from './navinfo.mjs';
 
-// Analytics and telemetry endpoints are not submits.
-const ANALYTICS_HOST_RE = /(^adsapi\.|(^|\.)ads?\.|google-analytics|googletagmanager|googlesyndication|doubleclick|daily\.dev|segment\.(io|com)|mixpanel|amplitude|sentry|honeybadger|hotjar|clarity\.ms|datadoghq|newrelic|bugsnag|logrocket|fullstory|plausible|posthog)/i;
-const ANALYTICS_PATH_RE = /\/(ads?|page_?views?|collect|beacon|analytics|telemetry|track|log|events?|metrics|publishers)(\/|$)/i;
-const ANALYTICS_RE = new RegExp(`${ANALYTICS_HOST_RE.source}|${ANALYTICS_PATH_RE.source}`, 'i');
-
-function isAnalyticsRequest(request, host, reqPath) {
-  if (ANALYTICS_HOST_RE.test(host)) return true;
-  if (!ANALYTICS_PATH_RE.test(reqPath)) return false;
-  try {
-    const ct = String(request.headers?.()['content-type'] || '').toLowerCase();
-    if (ct.includes('multipart/form-data') || ct.includes('application/x-www-form-urlencoded')) return false;
-    const buf = typeof request.postDataBuffer === 'function' ? request.postDataBuffer() : null;
-    const body = buf ? buf.toString('utf8') : (typeof request.postData === 'function' ? request.postData() || '' : '');
-    const bytes = buf ? buf.length : Buffer.byteLength(body, 'utf8');
-    if (bytes >= 2048) return false;
-    if (/^--[-\w]+\r?\nContent-Disposition:\s*form-data/i.test(body)) return false;
-    return true;
-  } catch {
-    return true;
-  }
-}
 import { urlDenial, peekBlocked, denyMessage, matchUrl, getPolicy } from './allow-hosts.mjs';
-import { isGoogleBackgroundRequest, observeClickAftermath, parkLate, watchActivity } from './aftermath.mjs';
+import { isBackgroundRequest, observeClickAftermath, parkLate, watchActivity } from './aftermath.mjs';
 import { armToasts, takeToast } from './toast.mjs';
 import { wrapPage, boundariesEnabled } from './boundaries.mjs';
 import { redactText } from './secrets.mjs';
@@ -5772,7 +5751,7 @@ async function executeSingleAction(page, rawParams = {}) {
   if (params.targetRef) await assertCurrentDocumentRef(page, params.targetRef);
   const silentState = { count: 0, wantKind: false, clickKind: '' };
   const enabled = params.observeAftermath ?? (process.env.TURBO_BROWSER_OBSERVE_AFTERMATH === 'true');
-  const observer = enabled && ['click', 'dblclick'].includes(params.action) ? observeClickAftermath(page) : null;
+  const observer = enabled && ['click', 'dblclick'].includes(params.action) ? observeClickAftermath(page, () => silentState.clickKind) : null;
   const navigation = params.returnSnapshot && ['click', 'dblclick', 'press'].includes(params.action)
     ? watchActionNavigation(page, Number(params.timeoutMs) || DEFAULT_TIMEOUT_MS) : null;
   // A committing click/key gets the same settle step so a toast ("This domain isn't allowed.") can show up.
@@ -5782,11 +5761,13 @@ async function executeSingleAction(page, rawParams = {}) {
   const activity = observer || navigation || toastWindow ? watchActivity(page) : null;
   if (wantToast) await armToasts(page);
   const beforeApplyUrl = page.url();
-  let openedTab = false;
-  const onNewPage = () => { openedTab = true; };
-  const ctxForTabs = ['click'].includes(params.action) ? page.context() : null;
-  ctxForTabs?.on('page', onNewPage);
+  let openedTab = null, popupReady;
+  const popup = new Promise((resolve) => { popupReady = resolve; });
+  const onNewPage = (child) => { openedTab ||= child; popupReady(); };
+  const watchPopup = ['click', 'dblclick', 'press'].includes(params.action);
+  if (watchPopup) page.on('popup', onNewPage);
   let res;
+  // Classifying the clicked element costs a round trip: only when the aftermath observer reports it.
   silentState.wantKind = Boolean(observer);
   // Second check behind the label/type/form heuristics: an icon-only button outside a form can still submit.
   // Mutating fetch/XHR requests started by a click are reported (never blocked); one that starts within ~800 ms
@@ -5800,13 +5781,15 @@ async function executeSingleAction(page, rawParams = {}) {
   let watchOpen = clickAction;
   let returned = false;
   let completed = false;
+  let getNavigation = false;
   const onMutating = (request) => {
+    if (request.isNavigationRequest?.() && request.frame() === page.mainFrame() && request.method() === 'GET') getNavigation = true;
     const rType = request.resourceType?.() || '';
-    if (!watchOpen || rType === 'ping' || rType === 'beacon' || !/^(POST|PUT|PATCH|DELETE)$/.test(request.method()) || !['fetch', 'xhr'].includes(rType)) return;
+    if (!watchOpen || !/^(POST|PUT|PATCH|DELETE)$/.test(request.method()) || !['fetch', 'xhr', 'document'].includes(rType)) return;
     let host = '';
     let reqPath = '';
     try { const u = new URL(request.url()); host = u.host; reqPath = u.pathname; } catch { return; }
-    if (isAnalyticsRequest(request, host, reqPath) || isGoogleBackgroundRequest(request)) return;
+    if (isBackgroundRequest(request, { pageUrl: page.url(), readNavigation: getNavigation })) return;
     // An allowed submit was the point of the click: the agent knows it submitted, no late warning.
     if (returned && params.allowSubmit === true) return;
     if (returned) parkLate(page, `possibleSubmit: ${request.method()} ${host}${reqPath.slice(0, 60)}`);
@@ -5825,6 +5808,12 @@ async function executeSingleAction(page, rawParams = {}) {
       await navigation?.finish();
       // The guard keeps watching at least 400 ms so a late commit-like request is still reported.
       await activity?.settle({ minMs: observer ? 400 : 0 });
+      if (watchPopup && params._registerPopup) {
+        let timer;
+        if (!openedTab) await Promise.race([popup, new Promise((resolve) => { timer = setTimeout(resolve, 150); })]);
+        clearTimeout(timer);
+        if (openedTab) res.newTab = params._registerPopup(openedTab);
+      }
       if ((observer || navigation) && res && typeof res === 'object') res.outcome = activity.outcome();
       if (wantToast && res && typeof res === 'object') {
         const toast = await takeToast(page);
@@ -5861,7 +5850,7 @@ async function executeSingleAction(page, rawParams = {}) {
         activeLateMutating.set(page, () => { clearTimeout(t); off(); });
       }
     }
-    ctxForTabs?.off('page', onNewPage);
+    if (watchPopup) page.off('popup', onNewPage);
     if (res && res._applyLike !== undefined) delete res._applyLike;
     observer?.remove();
     navigation?.remove();
@@ -7713,6 +7702,7 @@ async function batchActionsCore(page, stepList, options, previousLinesSet, guard
           ...(afterNav && step.action === 'wait' && step.textNew ? { _freshDocument: true } : {}),
           returnSnapshot: options.returnSnapshot || step.returnSnapshot,
           observeAftermath: step.observeAftermath ?? options.observeAftermath,
+          _registerPopup: options._registerPopup,
           allowSubmit: stepAllowSubmit,
         });
       }
@@ -8647,16 +8637,43 @@ export async function capturePage(page, params = {}) {
     timeout,
   };
 
+  // Playwright waits indefinitely for FontFaceSet.ready within its screenshot timeout.
+  // Give web fonts a short chance, then capture through CDP without changing global env
+  // flags or the page's FontFaceSet (other concurrent captures must stay independent).
+  const fontsPending = (await Promise.all((page.frames?.() || []).map((frame) => frame.evaluate(async (ms) => {
+    if (!document.fonts || document.fonts.status === 'loaded') return false;
+    let timer;
+    const ready = await Promise.race([
+      document.fonts.ready.then(() => true),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(false), ms); }),
+    ]);
+    clearTimeout(timer);
+    return !ready;
+  }, Math.min(500, timeout)).catch(() => false)))).some(Boolean);
+  const target = params.ref || params.selector || params.text ? await resolveTarget(page, params) : null;
   let imgBuf;
-  if (params.ref || params.selector || params.text) {
-    const target = await resolveTarget(page, params);
-    imgBuf = await target.locator.screenshot(shotOpts);
-  } else {
-    imgBuf = await page.screenshot({
-      ...shotOpts,
-      fullPage: Boolean(params.fullPage),
-    });
-  }
+  if (fontsPending) {
+    if (target) await target.locator.scrollIntoViewIfNeeded({ timeout });
+    const box = target ? await target.locator.boundingBox({ timeout }) : null;
+    if (target && (!box || !box.width || !box.height)) throw new Error('Screenshot target is not visible.');
+    const client = await page.context().newCDPSession(page);
+    try {
+      const { cssLayoutViewport: viewport, cssContentSize: content } = await client.send('Page.getLayoutMetrics');
+      const dpr = await page.evaluate(() => window.devicePixelRatio);
+      const clip = box
+        ? { x: box.x + viewport.pageX, y: box.y + viewport.pageY, width: box.width, height: box.height }
+        : params.fullPage ? { x: 0, y: 0, width: content.width, height: content.height }
+          : { x: viewport.pageX, y: viewport.pageY, width: viewport.clientWidth, height: viewport.clientHeight };
+      const { data } = await client.send('Page.captureScreenshot', {
+        format: type,
+        ...(type === 'jpeg' ? { quality: shotOpts.quality } : {}),
+        clip: { ...clip, scale: shotOpts.scale === 'device' ? 1 : 1 / dpr },
+        captureBeyondViewport: true,
+      });
+      imgBuf = Buffer.from(data, 'base64');
+    } finally { await client.detach().catch(() => {}); }
+  } else if (target) imgBuf = await target.locator.screenshot(shotOpts);
+  else imgBuf = await page.screenshot({ ...shotOpts, fullPage: Boolean(params.fullPage) });
 
   if (resolvedPath) {
     fs.writeFileSync(resolvedPath, imgBuf);
@@ -8666,6 +8683,7 @@ export async function capturePage(page, params = {}) {
   return {
     ok: true,
     mode: 'screenshot',
+    ...(fontsPending ? { fontsPending: true } : {}),
     type,
     mimeType: type === 'jpeg' ? 'image/jpeg' : 'image/png',
     savePath: resolvedPath,

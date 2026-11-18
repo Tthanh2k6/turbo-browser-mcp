@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+Background tool targets keep rendering without activating or changing other tabs.
+Actions that open a popup return its registered tab ID as `newTab`.
+Screenshots fall back after a short font wait and report `fontsPending: true` when needed.
+Job-link tracking and editor telemetry no longer produce false submit reports; real form POSTs remain observable.
+`TURBO_BROWSER_ISOLATE_HOSTS` optionally opens matching hosts in fresh isolated contexts.
+
 ## 0.7.1 (2026-11-18)
 
 Fixes found while using the server on real sites (Gmail, LinkedIn job pages, an ATS form).

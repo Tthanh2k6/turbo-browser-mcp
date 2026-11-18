@@ -670,7 +670,7 @@ async function dispatchToolCallInner(manager, name, rawArgs = {}) {
     }
     case 'act_fast': {
       const { tabId, page } = await manager.getPage(args.tabId);
-      const res = await actFast(page, args, manager.getSnapshotState(page));
+      const res = await actFast(page, { ...args, _registerPopup: (child) => manager._registerPage(child, false, manager.tabContextName.get(tabId)) }, manager.getSnapshotState(page));
       return { text: JSON.stringify({ tabId, ...res }) };
     }
     case 'batch_actions': {
@@ -696,6 +696,7 @@ async function dispatchToolCallInner(manager, name, rawArgs = {}) {
           networkGuard: args.networkGuard,
           networkGuardAllow: args.networkGuardAllow,
           networkGuardSettleMs: args.networkGuardSettleMs,
+          _registerPopup: (child) => manager._registerPage(child, false, manager.tabContextName.get(tabId)),
         },
         manager.getSnapshotState(page)
       );

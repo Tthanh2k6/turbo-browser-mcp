@@ -1,3 +1,23 @@
+// Analytics and telemetry endpoints are not submits.
+const ANALYTICS_HOST_RE = /(^adsapi\.|(^|\.)ads?\.|google-analytics|googletagmanager|googlesyndication|doubleclick|daily\.dev|segment\.(io|com)|mixpanel|amplitude|sentry|honeybadger|hotjar|clarity\.ms|datadoghq|newrelic|bugsnag|logrocket|fullstory|plausible|posthog)/i;
+const ANALYTICS_PATH_RE = /\/(ads?|page_?views?|collect|beacon|analytics|telemetry|track|log|events?|metrics|publishers)(\/|$)/i;
+
+export function isAnalyticsRequest(request, host, reqPath) {
+  if (ANALYTICS_HOST_RE.test(host)) return true;
+  if (!ANALYTICS_PATH_RE.test(reqPath)) return false;
+  try {
+    const ct = String(request.headers?.()['content-type'] || '').toLowerCase();
+    if (ct.includes('multipart/form-data') || ct.includes('application/x-www-form-urlencoded')) return false;
+    const buf = typeof request.postDataBuffer === 'function' ? request.postDataBuffer() : null;
+    const body = buf ? buf.toString('utf8') : (typeof request.postData === 'function' ? request.postData() || '' : '');
+    const bytes = buf ? buf.length : Buffer.byteLength(body, 'utf8');
+    if (bytes >= 2048) return false;
+    if (/^--[-\w]+\r?\nContent-Disposition:\s*form-data/i.test(body)) return false;
+    return true;
+  } catch {
+    return true;
+  }
+}
 // One settle step after an action: no fixed sleep. Resolves when the DOM has been quiet for
 // QUIET_MS and no request younger than INFLIGHT_MS is pending, or at capMs. Listeners stay
 // attached until remove() so a late request is still seen by the guards that share this page.
@@ -20,6 +40,22 @@ export function isGoogleBackgroundRequest(request) {
     const actions = [...url.searchParams.getAll('act'), ...new URLSearchParams(request.postData?.() || '').getAll('act')];
     return actions.length > 0 && actions.every((act) => act === 'sync');
   } catch { return false; }
+}
+
+// Shared by ordinary, detailed and late click reporting. A reading navigation may
+// start tracking on its destination; do not classify that cross-host traffic as a submit.
+export function isBackgroundRequest(request, { pageUrl = '', readNavigation = false } = {}) {
+  try {
+    const url = new URL(request.url());
+    if (isGoogleBackgroundRequest(request) || isAnalyticsRequest(request, url.host, url.pathname)) return true;
+    if (readNavigation && request.method() === 'POST' && ['fetch', 'xhr'].includes(request.resourceType())) {
+      const ct = String(request.headers?.()['content-type'] || '').toLowerCase();
+      const form = /multipart\/form-data|application\/x-www-form-urlencoded/.test(ct);
+      const commit = /(?:^|[/_.-])(?:submit|publish|commit|checkout|payment|purchase|delete|send|comment)(?:$|[/_.-])/i.test(url.pathname);
+      return !form && !commit && url.hostname !== new URL(pageUrl).hostname;
+    }
+  } catch { /* Unknown requests remain observable. */ }
+  return false;
 }
 // A JS dialog freezes page.evaluate; give up on the DOM probe instead of hanging the action.
 const probe = (promise, ms = 250) => Promise.race([promise, new Promise((r) => setTimeout(() => r(null), ms))]).catch(() => null);
@@ -94,10 +130,14 @@ export function takeLate(page) {
 }
 
 // Observation only: this cannot undo a request or establish submission success.
-export function observeClickAftermath(page) {
+export function observeClickAftermath(page, getKind = null) {
   const beforeUrl = page.url();
   const mutatingRequests = [];
   let navigated = false;
+  let getNavigation = false;
+  const background = (request) => isBackgroundRequest(request, {
+    pageUrl: page.url(), readNavigation: getNavigation && ['link', 'search'].includes(getKind?.() || kind),
+  });
   const pathChanged = (url) => {
     try {
       const before = new URL(beforeUrl), after = new URL(url);
@@ -109,8 +149,9 @@ export function observeClickAftermath(page) {
   };
   const onRequest = (request) => {
     const method = request.method();
-    if (!/^(POST|PUT|PATCH|DELETE)$/.test(method) || !['fetch', 'xhr'].includes(request.resourceType())) return;
-    if (isGoogleBackgroundRequest(request)) return;
+    if (request.isNavigationRequest?.() && request.frame() === page.mainFrame() && method === 'GET') getNavigation = true;
+    if (!/^(POST|PUT|PATCH|DELETE)$/.test(method) || !['fetch', 'xhr', 'document'].includes(request.resourceType())) return;
+    if (background(request)) return;
     const url = request.url();
     let pathname = '';
     try { pathname = new URL(url).pathname; } catch {}
@@ -142,8 +183,9 @@ export function observeClickAftermath(page) {
   const pathOf = (u) => { try { return new URL(u).pathname; } catch { return u; } };
   const onLateNav = (frame) => { if (frame === page.mainFrame() && pathChanged(frame.url())) park(`navigated to ${pathOf(frame.url())}`); };
   const onLateRequest = (request) => {
-    if (isGoogleBackgroundRequest(request)) return;
-    if (/^(POST|PUT|PATCH|DELETE)$/.test(request.method()) && ['fetch', 'xhr'].includes(request.resourceType())) park(`${request.method()} ${pathOf(request.url())}`);
+    if (request.isNavigationRequest?.() && request.frame() === page.mainFrame() && request.method() === 'GET') getNavigation = true;
+    if (background(request)) return;
+    if (/^(POST|PUT|PATCH|DELETE)$/.test(request.method()) && ['fetch', 'xhr', 'document'].includes(request.resourceType())) park(`${request.method()} ${pathOf(request.url())}`);
   };
   let kind = '';
   return {

@@ -101,6 +101,9 @@ export class BrowserManager {
       options.headless ?? (process.env.TURBO_BROWSER_HEADLESS !== 'false');
     this.defaultTimeoutMs =
       options.defaultTimeoutMs ?? (Number(process.env.TURBO_BROWSER_TIMEOUT_MS) || 15000);
+    this.isolateHosts = String(options.isolateHosts ?? process.env.TURBO_BROWSER_ISOLATE_HOSTS ?? '')
+      .split(',').map((s) => s.trim().toLowerCase().replace(/\.$/, '')).filter(Boolean);
+    this.nextAutoContextId = 1;
 
     this.browser = null;
     this.context = null;
@@ -707,6 +710,9 @@ export class BrowserManager {
     const id = this.pageToId.get(page);
     const renewed = () => (id !== undefined && this.tabs.get(id)) || page;
     if (page.url() === '' && (await this._healStalePages().catch(() => false))) return renewed();
+    // Keep this target rendering even when Chrome's front tab is elsewhere. The session must
+    // stay attached: detaching clears focus emulation. Never activate or reset another tab.
+    await this._keepRendering(page);
     // Only pages already marked unresponsive (at attach time or by tabs_batch list) pay for a probe:
     // a short re-check, since the dialog may be gone. Probing every page on every call made slow
     // but healthy pages (heavy scripts mid-load) look blocked.
@@ -717,6 +723,22 @@ export class BrowserManager {
       throw new Error('page main world is blocked (open dialog or paused debugger?)');
     }
     return page;
+  }
+
+  async _keepRendering(page) {
+    const diag = this._ensureDiagState(page);
+    let timer;
+    try {
+      await Promise.race([
+        (async () => {
+          if (!diag.cdpSession) diag.cdpSession = await page.context().newCDPSession(page);
+          await diag.cdpSession.send('Emulation.setFocusEmulationEnabled', { enabled: true });
+          await diag.cdpSession.send('Page.setWebLifecycleState', { state: 'active' });
+        })(),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), 1000); }),
+      ]);
+    } catch { /* Some targets do not support emulation; the liveness check still applies. */ }
+    finally { clearTimeout(timer); }
   }
 
   _ensureDiagState(page) {
@@ -984,6 +1006,7 @@ export class BrowserManager {
     }
 
     const page = await this.context.newPage();
+    await this._keepRendering(page);
     await this._guard(page);
     const newId = this._registerPage(page, true);
     return { tabId: newId, page };
@@ -1154,6 +1177,23 @@ export class BrowserManager {
     return { name: contextName, ctx: isoCtx };
   }
 
+  _contextForUrl(url, explicit) {
+    if (explicit !== undefined && explicit !== null) return explicit;
+    let host;
+    try {
+      const parsed = new URL(url);
+      if (!/^https?:$/.test(parsed.protocol)) return undefined;
+      host = parsed.hostname.toLowerCase().replace(/\.$/, '');
+    } catch { return undefined; }
+    const match = this.isolateHosts.some((pattern) => pattern.startsWith('*.')
+      ? host === pattern.slice(2) || host.endsWith('.' + pattern.slice(2))
+      : host === pattern);
+    if (!match) return undefined;
+    let name;
+    do { name = `auto-isolate-${this.nextAutoContextId++}`; } while (this.isolatedContexts.has(name));
+    return name;
+  }
+
   async tabsBatch(operations = [], { includeTabs } = {}) {
     const batchStart = Date.now();
     await this.ensureReady();
@@ -1199,7 +1239,6 @@ export class BrowserManager {
         if (urls.length === 0) throw new Error('open_many action requires a non-empty urls array.');
         const batchT0 = Date.now();
         const prevActiveTabId = this.activeTabId;
-        const { name: ctxName, ctx } = await this._getOrCreateContext(op.isolatedContext);
         const concurrency = Math.min(10, Math.max(1, Number(op.concurrency) || 5));
         const navOpts = {
           waitUntil: op.waitUntil || 'domcontentloaded',
@@ -1212,11 +1251,13 @@ export class BrowserManager {
             slice.map(async (targetUrl) => {
               const denied = urlDenial(targetUrl);
               if (denied) {
-                return { tabId: null, isolatedContext: ctxName, url: targetUrl, title: '', ok: false, error: denied };
+                return { tabId: null, isolatedContext: op.isolatedContext || 'default', url: targetUrl, title: '', ok: false, error: denied };
               }
+              const { name: ctxName, ctx } = await this._getOrCreateContext(this._contextForUrl(targetUrl, op.isolatedContext));
               const page = await ctx.newPage();
               const tabId = this._registerPage(page, false, ctxName);
               try {
+                await this._keepRendering(page);
                 await this._guard(page);
                 const resp = await page.goto(targetUrl, navOpts);
                 const title = await page.title().catch(() => '');
@@ -1273,7 +1314,7 @@ export class BrowserManager {
           continue;
         }
         const prevActiveTabId = this.activeTabId;
-        const { name: ctxName, ctx } = await this._getOrCreateContext(op.isolatedContext);
+        const { name: ctxName, ctx } = await this._getOrCreateContext(this._contextForUrl(op.url, op.isolatedContext));
         const page = await ctx.newPage();
         const tabId = this._registerPage(page, op.activate !== false, ctxName);
         if (op.activate === false) {
@@ -1285,6 +1326,7 @@ export class BrowserManager {
         let openResp = null;
         if (op.url) {
           try {
+            await this._keepRendering(page);
             await this._guard(page);
             openResp = await page.goto(op.url, {
               waitUntil: op.waitUntil || 'domcontentloaded',
@@ -1350,6 +1392,15 @@ export class BrowserManager {
           continue;
         }
         const { tabId, page } = await this.getPage(op.tabId);
+        const contextName = this._contextForUrl(op.url, op.isolatedContext);
+        if (contextName !== undefined && contextName !== this.tabContextName.get(tabId)) {
+          // A Page cannot change cookie contexts. Leave the owner's tab intact and return
+          // the new tab's ID, just as open does, without sending the URL through the old page.
+          const opened = await this.tabsBatch([{ ...op, action: 'open', isolatedContext: contextName, activate: op.activate === true }], { includeTabs: false });
+          const { isolatedContext, ...result } = opened.results[0];
+          results.push({ ...result, action: 'navigate' });
+          continue;
+        }
         let navResp, navRetried;
         try {
           ({ resp: navResp, retried: navRetried } = await gotoRetry(page, op.url, {
