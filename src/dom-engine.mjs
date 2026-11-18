@@ -382,20 +382,34 @@ function getPageRefFingerprints(page) {
   return map;
 }
 
-function reusedRefMessage(ref) {
+function reusedRefMessage(ref, stored) {
+  if (stored?.startsWith('#id:')) {
+    return `Element ref "${ref}" now points to a different field (its name, type or label changed, e.g. a virtualized form reused the node). Run inspect_compact again.`;
+  }
   return `Element ref "${ref}" now shows different content (the node was reused, e.g. a virtualized list scrolled). Run inspect_compact again.`;
 }
 
 function computeElementFingerprintInBrowser(el) {
   if (!el || el.nodeType !== 1) return null;
   const tag = (el.tagName || '').toLowerCase();
-  if (tag === 'input' || tag === 'textarea' || tag === 'select') return null;
-  if (el.isContentEditable) return null;
   const ce = el.getAttribute?.('contenteditable');
-  if (ce !== null && ce !== undefined && String(ce).toLowerCase() !== 'false') return null;
   const role = (el.getAttribute?.('role') || '').trim().toLowerCase();
-  if (role === 'textbox' || role === 'combobox' || role === 'slider' || role === 'spinbutton') return null;
-  return String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128);
+  const isValueControl = tag === 'input' || tag === 'textarea' || tag === 'select' ||
+    el.isContentEditable ||
+    (ce !== null && ce !== undefined && String(ce).toLowerCase() !== 'false') ||
+    role === 'textbox' || role === 'combobox' || role === 'slider' || role === 'spinbutton';
+  if (isValueControl) {
+    const label = el.labels?.[0];
+    const root = el.getRootNode();
+    const labelText = label ? label.textContent : (el.getAttribute('aria-labelledby') || '')
+      .split(/\s+/).filter(Boolean).map((id) => root.getElementById?.(id)?.textContent || '').join(' ');
+    // Remove the separator from parts before joining; values and checked state are never identity.
+    const part = (s) => String(s || '').replace(/\u0000/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 64);
+    return '#id:' + [tag, tag === 'input' ? (el.getAttribute('type') || '').toLowerCase() : '',
+      el.getAttribute('name'), el.getAttribute('id'), el.getAttribute('aria-label'),
+      el.getAttribute('placeholder'), el.getAttribute('role'), String(labelText || '').replace(/\d+/g, '#')].map(part).join('\u0000');
+  }
+  return '#text:' + String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128);
 }
 
 async function assertRefFingerprint(page, ref, parsed, locator) {
@@ -408,7 +422,7 @@ async function assertRefFingerprint(page, ref, parsed, locator) {
   if (typeof stored !== 'string') return;
   const cur = await locator.evaluate(computeElementFingerprintInBrowser).catch(() => null);
   if (typeof cur === 'string' && cur !== stored) {
-    throw new Error(reusedRefMessage(ref));
+    throw new Error(reusedRefMessage(ref, stored));
   }
 }
 
@@ -2168,18 +2182,29 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
             }
           }
 
-          const isValueControl = (el) => {
-            if (!el || el.nodeType !== 1) return false;
-            const t = (el.tagName || '').toLowerCase();
-            if (t === 'input' || t === 'textarea' || t === 'select') return true;
-            if (el.isContentEditable) return true;
+          // Keep in sync with computeElementFingerprintInBrowser (round22 tests guard all copies).
+          const fingerprintOf = (el) => {
+            if (!el || el.nodeType !== 1) return null;
+            const tag = (el.tagName || '').toLowerCase();
             const ce = el.getAttribute?.('contenteditable');
-            if (ce !== null && ce !== undefined && String(ce).toLowerCase() !== 'false') return true;
-            const r = (el.getAttribute?.('role') || '').trim().toLowerCase();
-            return r === 'textbox' || r === 'combobox' || r === 'slider' || r === 'spinbutton';
+            const role = (el.getAttribute?.('role') || '').trim().toLowerCase();
+            const isValueControl = tag === 'input' || tag === 'textarea' || tag === 'select' ||
+              el.isContentEditable ||
+              (ce !== null && ce !== undefined && String(ce).toLowerCase() !== 'false') ||
+              role === 'textbox' || role === 'combobox' || role === 'slider' || role === 'spinbutton';
+            if (isValueControl) {
+              const label = el.labels?.[0];
+              const root = el.getRootNode();
+              const labelText = label ? label.textContent : (el.getAttribute('aria-labelledby') || '')
+                .split(/\s+/).filter(Boolean).map((id) => root.getElementById?.(id)?.textContent || '').join(' ');
+              // Remove the separator from parts before joining; values and checked state are never identity.
+              const part = (s) => String(s || '').replace(/\u0000/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 64);
+              return '#id:' + [tag, tag === 'input' ? (el.getAttribute('type') || '').toLowerCase() : '',
+                el.getAttribute('name'), el.getAttribute('id'), el.getAttribute('aria-label'),
+                el.getAttribute('placeholder'), el.getAttribute('role'), String(labelText || '').replace(/\d+/g, '#')].map(part).join('\u0000');
+            }
+            return '#text:' + String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128);
           };
-          const fingerprintOf = (el) =>
-            isValueControl(el) ? null : String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128);
 
           const usedRefs = new Set();
           const items = [];
@@ -2955,18 +2980,29 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
           async ({ domSpec, mainVal, gmailSpec, overwriteFlag, stopBeforeSubmitFlag, frameIdxArg, qBlockSel, submitSel, fpMapArg }) => {
             const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
             const getSR = (node) => node?.shadowRoot || window.__tbmGetShadowRoot?.(node) || null;
-            const isValueControl = (el) => {
-              if (!el || el.nodeType !== 1) return false;
-              const t = (el.tagName || '').toLowerCase();
-              if (t === 'input' || t === 'textarea' || t === 'select') return true;
-              if (el.isContentEditable) return true;
+            // Keep in sync with computeElementFingerprintInBrowser (round22 tests guard all copies).
+            const fingerprintOf = (el) => {
+              if (!el || el.nodeType !== 1) return null;
+              const tag = (el.tagName || '').toLowerCase();
               const ce = el.getAttribute?.('contenteditable');
-              if (ce !== null && ce !== undefined && String(ce).toLowerCase() !== 'false') return true;
-              const r = (el.getAttribute?.('role') || '').trim().toLowerCase();
-              return r === 'textbox' || r === 'combobox' || r === 'slider' || r === 'spinbutton';
+              const role = (el.getAttribute?.('role') || '').trim().toLowerCase();
+              const isValueControl = tag === 'input' || tag === 'textarea' || tag === 'select' ||
+                el.isContentEditable ||
+                (ce !== null && ce !== undefined && String(ce).toLowerCase() !== 'false') ||
+                role === 'textbox' || role === 'combobox' || role === 'slider' || role === 'spinbutton';
+              if (isValueControl) {
+                const label = el.labels?.[0];
+                const root = el.getRootNode();
+                const labelText = label ? label.textContent : (el.getAttribute('aria-labelledby') || '')
+                  .split(/\s+/).filter(Boolean).map((id) => root.getElementById?.(id)?.textContent || '').join(' ');
+                // Remove the separator from parts before joining; values and checked state are never identity.
+                const part = (s) => String(s || '').replace(/\u0000/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 64);
+                return '#id:' + [tag, tag === 'input' ? (el.getAttribute('type') || '').toLowerCase() : '',
+                  el.getAttribute('name'), el.getAttribute('id'), el.getAttribute('aria-label'),
+                  el.getAttribute('placeholder'), el.getAttribute('role'), String(labelText || '').replace(/\d+/g, '#')].map(part).join('\u0000');
+              }
+              return '#text:' + String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128);
             };
-            const fingerprintOf = (el) =>
-              isValueControl(el) ? null : String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128);
 
             const safeControlClick = (node) => {
             if (stopBeforeSubmitFlag) {
@@ -3692,7 +3728,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                   if (typeof storedFp === 'string') {
                     const curFp = fingerprintOf(refEl);
                     if (typeof curFp === 'string' && curFp !== storedFp) {
-                      return { frameFilled, frameSkipped, matchedIndexes, leftover: [], submits: [], fpError: f.ref };
+                      return { frameFilled, frameSkipped, matchedIndexes, leftover: [], submits: [], fpError: f.ref, fpStored: storedFp };
                     }
                   }
                 }
@@ -4363,7 +4399,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
       if (selectorHandlesToDispose.length > 0) {
         for (const h of selectorHandlesToDispose) await h.dispose().catch(() => {});
       }
-      throw new Error(reusedRefMessage(res.fpError));
+      throw new Error(reusedRefMessage(res.fpError, res.fpStored));
     }
     filled.push(...res.frameFilled);
     for (const sk of res.frameSkipped) {
