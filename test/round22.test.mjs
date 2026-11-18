@@ -142,7 +142,7 @@ describe('round 22: recycled value controls', () => {
     `);
     const field = page.locator('#field');
     assert.equal(await field.evaluate(fingerprint),
-      '#id:' + ['input', 'text', 'account name', 'field', 'Stable', 'Hint', 'textbox', 'First label'].join('\0'));
+      '#id:' + ['input', 'text', 'account name', 'field', 'Stable', 'Hint', 'textbox', '', 'First label'].join('\0'));
     const snap = await inspectCompact(page, {}, new Set());
     const ref = 'f0:' + await field.getAttribute('data-tbm-ref');
     assert.ok(snap.text.includes('[' + ref + ']'), snap.text);
@@ -162,13 +162,26 @@ describe('round 22: recycled value controls', () => {
       el.setAttribute('placeholder', 'a\0b');
     });
     const parts = (await field.evaluate(fingerprint)).slice(4).split('\0');
-    assert.equal(parts.length, 8);
+    assert.equal(parts.length, 9);
     assert.equal(parts[2], 'x'.repeat(64));
     assert.equal(parts[5], 'a b');
+    // Exercise every copy against clones, including counter normalization and DOM order.
+    await page.setContent('<form><input name="address3" aria-label="Line (3 of 7)" placeholder="12/160" title="Entry 3"><input name="address3" aria-label="Line (4 of 7)" placeholder="123/160" title="Entry 4"></form>');
+    const functions = [fingerprint, ...copies.map((body) => new Function('el', body))];
+    const expected = '#id:' + ['input', '', 'address3', '', 'Line (# of #)', '#/#', '', 'Entry #', '', '#index:0'].join('\0');
+    for (const fn of functions) {
+      assert.equal(await page.locator('input').nth(0).evaluate(fn), expected);
+      assert.equal(await page.locator('input').nth(1).evaluate(fn), expected.replace(/0$/, '1'));
+    }
+    await page.locator('form').evaluate((form) => form.prepend(form.lastElementChild));
+    for (const fn of functions) {
+      assert.equal(await page.locator('input').nth(0).evaluate(fn), expected);
+      assert.equal(await page.locator('input').nth(1).evaluate(fn), expected.replace(/0$/, '1'));
+    }
   });
 
   it('6: each identity component is checked through snapshot, act and form paths', async () => {
-    for (const attr of ['type', 'name', 'id', 'aria-label', 'placeholder', 'role', 'label']) {
+    for (const attr of ['type', 'name', 'id', 'aria-label', 'placeholder', 'role', 'title', 'label']) {
       await page.setContent('<label for="field">Label</label><input id="field" aria-label="Stable" value="kept">');
       const snap = await inspectCompact(page, {}, new Set());
       const ref = refOf(snap.text, 'Stable');

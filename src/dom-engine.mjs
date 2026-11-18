@@ -370,23 +370,44 @@ function reusedRefMessage(ref, stored) {
 
 function computeElementFingerprintInBrowser(el) {
   if (!el || el.nodeType !== 1) return null;
-  const tag = (el.tagName || '').toLowerCase();
-  const ce = el.getAttribute?.('contenteditable');
-  const role = (el.getAttribute?.('role') || '').trim().toLowerCase();
-  const isValueControl = tag === 'input' || tag === 'textarea' || tag === 'select' ||
-    el.isContentEditable ||
-    (ce !== null && ce !== undefined && String(ce).toLowerCase() !== 'false') ||
-    role === 'textbox' || role === 'combobox' || role === 'slider' || role === 'spinbutton';
-  if (isValueControl) {
-    const label = el.labels?.[0];
-    const root = el.getRootNode();
-    const labelText = label ? label.textContent : (el.getAttribute('aria-labelledby') || '')
+  function identityOf(node) {
+    const tag = (node.tagName || '').toLowerCase();
+    const ce = node.getAttribute?.('contenteditable');
+    const role = (node.getAttribute?.('role') || '').trim().toLowerCase();
+    const isValueControl = tag === 'input' || tag === 'textarea' || tag === 'select' ||
+      node.isContentEditable ||
+      (ce !== null && ce !== undefined && String(ce).toLowerCase() !== 'false') ||
+      role === 'textbox' || role === 'combobox' || role === 'slider' || role === 'spinbutton';
+    if (!isValueControl) return null;
+    const label = node.labels?.[0];
+    const root = node.getRootNode();
+    const labelText = label ? label.textContent : (node.getAttribute('aria-labelledby') || '')
       .split(/\s+/).filter(Boolean).map((id) => root.getElementById?.(id)?.textContent || '').join(' ');
-    // Remove the separator from parts before joining; values and checked state are never identity.
+    // Remove separators and mask live counters; values and checked state are never identity.
     const part = (s) => String(s || '').replace(/\u0000/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 64);
-    return '#id:' + [tag, tag === 'input' ? (el.getAttribute('type') || '').toLowerCase() : '',
-      el.getAttribute('name'), el.getAttribute('id'), el.getAttribute('aria-label'),
-      el.getAttribute('placeholder'), el.getAttribute('role'), String(labelText || '').replace(/\d+/g, '#')].map(part).join('\u0000');
+    const mask = (s) => String(s || '').replace(/\d+/g, '#');
+    return [tag, tag === 'input' ? (node.getAttribute('type') || '').toLowerCase() : '',
+      node.getAttribute('name'), node.getAttribute('id'), mask(node.getAttribute('aria-label')),
+      mask(node.getAttribute('placeholder')), node.getAttribute('role'), mask(node.getAttribute('title')),
+      mask(labelText)].map(part).join('\u0000');
+  }
+  const identity = identityOf(el);
+  if (identity !== null) {
+    // Only matching controls count, within the nearest ancestor containing a clone.
+    // parentNode includes ShadowRoot, keeping controls in the same DOM tree together.
+    const tag = el.tagName.toLowerCase();
+    // One pass over this DOM tree with cheap attribute checks first: a form with hundreds of fields stays fast.
+    const same = (node, attr) => node.getAttribute(attr) === el.getAttribute(attr);
+    const treeRoot = el.getRootNode();
+    const clones = treeRoot.querySelectorAll ? Array.from(treeRoot.querySelectorAll(tag)).filter((node) => node === el ||
+      (same(node, 'name') && same(node, 'id') && same(node, 'type') && same(node, 'role') && identityOf(node) === identity)) : [];
+    if (clones.length > 1) {
+      for (let container = el.parentNode; container; container = container.parentNode) {
+        const inside = clones.filter((node) => container.contains(node));
+        if (inside.length > 1) return '#id:' + identity + '\u0000#index:' + inside.indexOf(el);
+      }
+    }
+    return '#id:' + identity;
   }
   return '#text:' + String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128);
 }
@@ -2190,23 +2211,44 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
           // Keep in sync with computeElementFingerprintInBrowser (round22 tests guard all copies).
           const fingerprintOf = (el) => {
             if (!el || el.nodeType !== 1) return null;
-            const tag = (el.tagName || '').toLowerCase();
-            const ce = el.getAttribute?.('contenteditable');
-            const role = (el.getAttribute?.('role') || '').trim().toLowerCase();
-            const isValueControl = tag === 'input' || tag === 'textarea' || tag === 'select' ||
-              el.isContentEditable ||
-              (ce !== null && ce !== undefined && String(ce).toLowerCase() !== 'false') ||
-              role === 'textbox' || role === 'combobox' || role === 'slider' || role === 'spinbutton';
-            if (isValueControl) {
-              const label = el.labels?.[0];
-              const root = el.getRootNode();
-              const labelText = label ? label.textContent : (el.getAttribute('aria-labelledby') || '')
+            function identityOf(node) {
+              const tag = (node.tagName || '').toLowerCase();
+              const ce = node.getAttribute?.('contenteditable');
+              const role = (node.getAttribute?.('role') || '').trim().toLowerCase();
+              const isValueControl = tag === 'input' || tag === 'textarea' || tag === 'select' ||
+                node.isContentEditable ||
+                (ce !== null && ce !== undefined && String(ce).toLowerCase() !== 'false') ||
+                role === 'textbox' || role === 'combobox' || role === 'slider' || role === 'spinbutton';
+              if (!isValueControl) return null;
+              const label = node.labels?.[0];
+              const root = node.getRootNode();
+              const labelText = label ? label.textContent : (node.getAttribute('aria-labelledby') || '')
                 .split(/\s+/).filter(Boolean).map((id) => root.getElementById?.(id)?.textContent || '').join(' ');
-              // Remove the separator from parts before joining; values and checked state are never identity.
+              // Remove separators and mask live counters; values and checked state are never identity.
               const part = (s) => String(s || '').replace(/\u0000/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 64);
-              return '#id:' + [tag, tag === 'input' ? (el.getAttribute('type') || '').toLowerCase() : '',
-                el.getAttribute('name'), el.getAttribute('id'), el.getAttribute('aria-label'),
-                el.getAttribute('placeholder'), el.getAttribute('role'), String(labelText || '').replace(/\d+/g, '#')].map(part).join('\u0000');
+              const mask = (s) => String(s || '').replace(/\d+/g, '#');
+              return [tag, tag === 'input' ? (node.getAttribute('type') || '').toLowerCase() : '',
+                node.getAttribute('name'), node.getAttribute('id'), mask(node.getAttribute('aria-label')),
+                mask(node.getAttribute('placeholder')), node.getAttribute('role'), mask(node.getAttribute('title')),
+                mask(labelText)].map(part).join('\u0000');
+            }
+            const identity = identityOf(el);
+            if (identity !== null) {
+              // Only matching controls count, within the nearest ancestor containing a clone.
+              // parentNode includes ShadowRoot, keeping controls in the same DOM tree together.
+              const tag = el.tagName.toLowerCase();
+              // One pass over this DOM tree with cheap attribute checks first: a form with hundreds of fields stays fast.
+              const same = (node, attr) => node.getAttribute(attr) === el.getAttribute(attr);
+              const treeRoot = el.getRootNode();
+              const clones = treeRoot.querySelectorAll ? Array.from(treeRoot.querySelectorAll(tag)).filter((node) => node === el ||
+                (same(node, 'name') && same(node, 'id') && same(node, 'type') && same(node, 'role') && identityOf(node) === identity)) : [];
+              if (clones.length > 1) {
+                for (let container = el.parentNode; container; container = container.parentNode) {
+                  const inside = clones.filter((node) => container.contains(node));
+                  if (inside.length > 1) return '#id:' + identity + '\u0000#index:' + inside.indexOf(el);
+                }
+              }
+              return '#id:' + identity;
             }
             return '#text:' + String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128);
           };
@@ -2993,23 +3035,44 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             // Keep in sync with computeElementFingerprintInBrowser (round22 tests guard all copies).
             const fingerprintOf = (el) => {
               if (!el || el.nodeType !== 1) return null;
-              const tag = (el.tagName || '').toLowerCase();
-              const ce = el.getAttribute?.('contenteditable');
-              const role = (el.getAttribute?.('role') || '').trim().toLowerCase();
-              const isValueControl = tag === 'input' || tag === 'textarea' || tag === 'select' ||
-                el.isContentEditable ||
-                (ce !== null && ce !== undefined && String(ce).toLowerCase() !== 'false') ||
-                role === 'textbox' || role === 'combobox' || role === 'slider' || role === 'spinbutton';
-              if (isValueControl) {
-                const label = el.labels?.[0];
-                const root = el.getRootNode();
-                const labelText = label ? label.textContent : (el.getAttribute('aria-labelledby') || '')
+              function identityOf(node) {
+                const tag = (node.tagName || '').toLowerCase();
+                const ce = node.getAttribute?.('contenteditable');
+                const role = (node.getAttribute?.('role') || '').trim().toLowerCase();
+                const isValueControl = tag === 'input' || tag === 'textarea' || tag === 'select' ||
+                  node.isContentEditable ||
+                  (ce !== null && ce !== undefined && String(ce).toLowerCase() !== 'false') ||
+                  role === 'textbox' || role === 'combobox' || role === 'slider' || role === 'spinbutton';
+                if (!isValueControl) return null;
+                const label = node.labels?.[0];
+                const root = node.getRootNode();
+                const labelText = label ? label.textContent : (node.getAttribute('aria-labelledby') || '')
                   .split(/\s+/).filter(Boolean).map((id) => root.getElementById?.(id)?.textContent || '').join(' ');
-                // Remove the separator from parts before joining; values and checked state are never identity.
+                // Remove separators and mask live counters; values and checked state are never identity.
                 const part = (s) => String(s || '').replace(/\u0000/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 64);
-                return '#id:' + [tag, tag === 'input' ? (el.getAttribute('type') || '').toLowerCase() : '',
-                  el.getAttribute('name'), el.getAttribute('id'), el.getAttribute('aria-label'),
-                  el.getAttribute('placeholder'), el.getAttribute('role'), String(labelText || '').replace(/\d+/g, '#')].map(part).join('\u0000');
+                const mask = (s) => String(s || '').replace(/\d+/g, '#');
+                return [tag, tag === 'input' ? (node.getAttribute('type') || '').toLowerCase() : '',
+                  node.getAttribute('name'), node.getAttribute('id'), mask(node.getAttribute('aria-label')),
+                  mask(node.getAttribute('placeholder')), node.getAttribute('role'), mask(node.getAttribute('title')),
+                  mask(labelText)].map(part).join('\u0000');
+              }
+              const identity = identityOf(el);
+              if (identity !== null) {
+                // Only matching controls count, within the nearest ancestor containing a clone.
+                // parentNode includes ShadowRoot, keeping controls in the same DOM tree together.
+                const tag = el.tagName.toLowerCase();
+                // One pass over this DOM tree with cheap attribute checks first: a form with hundreds of fields stays fast.
+                const same = (node, attr) => node.getAttribute(attr) === el.getAttribute(attr);
+                const treeRoot = el.getRootNode();
+                const clones = treeRoot.querySelectorAll ? Array.from(treeRoot.querySelectorAll(tag)).filter((node) => node === el ||
+                  (same(node, 'name') && same(node, 'id') && same(node, 'type') && same(node, 'role') && identityOf(node) === identity)) : [];
+                if (clones.length > 1) {
+                  for (let container = el.parentNode; container; container = container.parentNode) {
+                    const inside = clones.filter((node) => container.contains(node));
+                    if (inside.length > 1) return '#id:' + identity + '\u0000#index:' + inside.indexOf(el);
+                  }
+                }
+                return '#id:' + identity;
               }
               return '#text:' + String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128);
             };
