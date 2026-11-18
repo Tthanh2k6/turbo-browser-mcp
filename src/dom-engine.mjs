@@ -371,6 +371,46 @@ function parseRefString(refStr) {
 }
 
 const pageLoaders = new WeakMap();
+const pageRefFingerprints = new WeakMap();
+
+function getPageRefFingerprints(page) {
+  let map = pageRefFingerprints.get(page);
+  if (!map) {
+    map = new Map();
+    pageRefFingerprints.set(page, map);
+  }
+  return map;
+}
+
+function reusedRefMessage(ref) {
+  return `Element ref "${ref}" now shows different content (the node was reused, e.g. a virtualized list scrolled). Run inspect_compact again.`;
+}
+
+function computeElementFingerprintInBrowser(el) {
+  if (!el || el.nodeType !== 1) return null;
+  const tag = (el.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea' || tag === 'select') return null;
+  if (el.isContentEditable) return null;
+  const ce = el.getAttribute?.('contenteditable');
+  if (ce !== null && ce !== undefined && String(ce).toLowerCase() !== 'false') return null;
+  const role = (el.getAttribute?.('role') || '').trim().toLowerCase();
+  if (role === 'textbox' || role === 'combobox' || role === 'slider' || role === 'spinbutton') return null;
+  return String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128);
+}
+
+async function assertRefFingerprint(page, ref, parsed, locator) {
+  const map = pageRefFingerprints.get(page);
+  if (!map || !parsed || !locator) return;
+  const key = parsed.frameIdx !== null
+    ? `f${parsed.frameIdx}:${parsed.refId.toLowerCase()}`
+    : parsed.refId.toLowerCase();
+  const stored = map.has(key) ? map.get(key) : map.get(parsed.refId.toLowerCase());
+  if (typeof stored !== 'string') return;
+  const cur = await locator.evaluate(computeElementFingerprintInBrowser).catch(() => null);
+  if (typeof cur === 'string' && cur !== stored) {
+    throw new Error(reusedRefMessage(ref));
+  }
+}
 
 function flattenCdpFrameTree(node, out = []) {
   if (!node?.frame) return out;
@@ -661,11 +701,17 @@ export async function resolveTarget(page, { ref, selector, text, frameIdx, allow
       const picked = await pickBestLocator(allLoc, allowHidden);
       if (picked) {
         const res = { frame: f.frame, frameIdx: f.frameIdx, locator: picked.locator };
-        if (picked.visible) return res;
+        if (picked.visible) {
+          await assertRefFingerprint(page, ref, parsed, res.locator);
+          return res;
+        }
         if (!fallback) fallback = res;
       }
     }
-    if (fallback) return fallback;
+    if (fallback) {
+      await assertRefFingerprint(page, ref, parsed, fallback.locator);
+      return fallback;
+    }
     const near = await nearbyRefs(candidates, parsed.refId);
     if (refWasIssued(page, ref)) {
       throw new Error(`Element ref "${ref}" not found (page navigated or re-rendered since this ref was issued). ${near ? `Nearest current refs: ${near}. ` : ''}Run inspect_compact again.`);
@@ -1773,6 +1819,8 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
   const entries = [];
   const nextSignatures = new Set();
   const nextRefs = new Map();
+  const nextFingerprints = new Map();
+  const fpMap = getPageRefFingerprints(page);
   const scannedFrames = new Set();
   let totalMatched = 0;
   const loaderState = await getPageLoaderState(page);
@@ -2120,6 +2168,19 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
             }
           }
 
+          const isValueControl = (el) => {
+            if (!el || el.nodeType !== 1) return false;
+            const t = (el.tagName || '').toLowerCase();
+            if (t === 'input' || t === 'textarea' || t === 'select') return true;
+            if (el.isContentEditable) return true;
+            const ce = el.getAttribute?.('contenteditable');
+            if (ce !== null && ce !== undefined && String(ce).toLowerCase() !== 'false') return true;
+            const r = (el.getAttribute?.('role') || '').trim().toLowerCase();
+            return r === 'textbox' || r === 'combobox' || r === 'slider' || r === 'spinbutton';
+          };
+          const fingerprintOf = (el) =>
+            isValueControl(el) ? null : String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128);
+
           const usedRefs = new Set();
           const items = [];
           for (const el of nodes) {
@@ -2138,7 +2199,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
               const txt = (composedText(el) || clean(el.innerText || el.textContent)).slice(0, 220);
               if (txt) {
                 const line = `[${fullRef}] <${tag}> ${txt}`;
-                items.push({ ref: fullRef, line, sig: `f${frameIdxArg}:<${tag}>:${txt}` });
+                items.push({ ref: fullRef, line, sig: `f${frameIdxArg}:<${tag}>:${txt}`, fp: fingerprintOf(el) });
               }
               continue;
             }
@@ -2224,7 +2285,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
 
             const line = `[${fullRef}] <${kind}> "${lbl}"${extra}${shadowTag}${boxTag}`;
             const sig = `f${frameIdxArg}:<${kind}> "${lbl}"${extra}${shadowTag}`;
-            items.push({ ref: fullRef, line, sig });
+            items.push({ ref: fullRef, line, sig, fp: fingerprintOf(el) });
           }
           try {
             Object.defineProperty(window, '__tbmRefHigh', { value: refCounter - 1, writable: true, configurable: true, enumerable: false });
@@ -2257,12 +2318,17 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
 
     const frameItems = [];
     for (const item of chunk.items) {
+      const refLower = item.ref.toLowerCase();
+      const bareLower = refLower.split(':')[1];
       if (frameStamp) {
-        const refLower = item.ref.toLowerCase();
-        const bareLower = refLower.split(':')[1];
         loaderState.refs.set(refLower, frameStamp);
         if (bareLower) loaderState.refs.set(bareLower, frameStamp);
       }
+      if (!fpMap.has(refLower)) {
+        fpMap.set(refLower, item.fp);
+        if (bareLower) fpMap.set(bareLower, item.fp);
+      }
+      nextFingerprints.set(item.ref, item.fp);
       nextSignatures.add(item.sig);
       nextRefs.set(item.ref, item.sig);
       if (queryRe && !queryRe.test(item.line)) continue;
@@ -2272,7 +2338,8 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
           continue;
         }
         // An unchanged submit-like control stays visible so the model knows it exists.
-        if (baseline.refs.get(item.ref) === item.sig && !isSubmitLikeLine(item.line)) continue;
+        const fpSame = !fpMap.has(refLower) || fpMap.get(refLower) === item.fp;
+        if (baseline.refs.get(item.ref) === item.sig && fpSame && !isSubmitLikeLine(item.line)) continue;
       }
       frameItems.push(item.line);
     }
@@ -2315,6 +2382,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
   let truncated = false;
   const trailerReserve = 64;
 
+  const reportedRefs = new Set();
   for (const line of entries) {
     const candidate = body ? `${body}\n${line}` : line;
     if (header.length + candidate.length + trailerReserve + (removedLine ? removedLine.length + 1 : 0) > maxChars) {
@@ -2322,7 +2390,26 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
       break;
     }
     body = candidate;
-    if (/^\*?\[f/.test(line)) shownCount++;
+    const mRef = /^\*?\[(f\d+:e\d+)\]/.exec(line);
+    if (mRef) {
+      shownCount++;
+      reportedRefs.add(mRef[1]);
+    }
+  }
+  if (options.savePath) {
+    for (const line of entries) {
+      const mRef = /^\*?\[(f\d+:e\d+)\]/.exec(line);
+      if (mRef) reportedRefs.add(mRef[1]);
+    }
+  }
+  for (const ref of reportedRefs) {
+    if (nextFingerprints.has(ref)) {
+      const fp = nextFingerprints.get(ref);
+      const refLower = ref.toLowerCase();
+      const bareLower = refLower.split(':')[1];
+      fpMap.set(refLower, fp);
+      if (bareLower) fpMap.set(bareLower, fp);
+    }
   }
 
   if (previousLinesSet && !query && !rootSelector) {
@@ -2653,6 +2740,19 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
   for (const f of fields) {
     if (f?.ref) await assertCurrentDocumentRef(page, f.ref, frames);
   }
+  const fpMap = pageRefFingerprints.get(page);
+  const fpObj = {};
+  if (fpMap) {
+    for (const f of fields) {
+      if (!f?.ref) continue;
+      const parsed = parseRefString(String(f.ref));
+      if (!parsed) continue;
+      const k1 = parsed.frameIdx !== null ? `f${parsed.frameIdx}:${parsed.refId.toLowerCase()}` : parsed.refId.toLowerCase();
+      const k2 = parsed.refId.toLowerCase();
+      if (fpMap.has(k1)) fpObj[k1] = fpMap.get(k1);
+      if (fpMap.has(k2)) fpObj[k2] = fpMap.get(k2);
+    }
+  }
 
   const fileFields = [];
   const domFields = [];
@@ -2852,9 +2952,21 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
     try {
       res = await withFrameSubmitGuard(frameInfo.frame, () =>
         frameInfo.frame.evaluate(
-          async ({ domSpec, mainVal, gmailSpec, overwriteFlag, stopBeforeSubmitFlag, frameIdxArg, qBlockSel, submitSel }) => {
+          async ({ domSpec, mainVal, gmailSpec, overwriteFlag, stopBeforeSubmitFlag, frameIdxArg, qBlockSel, submitSel, fpMapArg }) => {
             const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
             const getSR = (node) => node?.shadowRoot || window.__tbmGetShadowRoot?.(node) || null;
+            const isValueControl = (el) => {
+              if (!el || el.nodeType !== 1) return false;
+              const t = (el.tagName || '').toLowerCase();
+              if (t === 'input' || t === 'textarea' || t === 'select') return true;
+              if (el.isContentEditable) return true;
+              const ce = el.getAttribute?.('contenteditable');
+              if (ce !== null && ce !== undefined && String(ce).toLowerCase() !== 'false') return true;
+              const r = (el.getAttribute?.('role') || '').trim().toLowerCase();
+              return r === 'textbox' || r === 'combobox' || r === 'slider' || r === 'spinbutton';
+            };
+            const fingerprintOf = (el) =>
+              isValueControl(el) ? null : String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128);
 
             const safeControlClick = (node) => {
             if (stopBeforeSubmitFlag) {
@@ -3568,6 +3680,24 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
           let nextRadioGroupId = 1;
 
           for (const f of domSpec) {
+            if (f.ref) {
+              const m = /^(?:f(\d+):)?(e\d+)$/i.exec(f.ref.trim());
+              if (m && (m[1] === undefined || Number(m[1]) === frameIdxArg)) {
+                const refEl = queryAllDeep(document, `[data-tbm-ref="${m[2]}"]`)[0];
+                if (refEl && fpMapArg) {
+                  const refKey = f.ref.trim().toLowerCase();
+                  const storedFp = Object.prototype.hasOwnProperty.call(fpMapArg, refKey)
+                    ? fpMapArg[refKey]
+                    : fpMapArg[m[2].toLowerCase()];
+                  if (typeof storedFp === 'string') {
+                    const curFp = fingerprintOf(refEl);
+                    if (typeof curFp === 'string' && curFp !== storedFp) {
+                      return { frameFilled, frameSkipped, matchedIndexes, leftover: [], submits: [], fpError: f.ref };
+                    }
+                  }
+                }
+              }
+            }
             if (f.option !== undefined || f.check !== undefined) {
               const wanted = f.check ?? f.option;
               const checkIsBool = typeof f.check === 'boolean';
@@ -4220,6 +4350,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             frameIdxArg: frameInfo.frameIdx,
             qBlockSel: QUESTION_BLOCK_SELECTOR,
             submitSel: SUBMIT_SCAN_SELECTOR,
+            fpMapArg: fpObj,
           }
         )
       );
@@ -4228,6 +4359,12 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
     }
 
     if (!res) continue;
+    if (res.fpError) {
+      if (selectorHandlesToDispose.length > 0) {
+        for (const h of selectorHandlesToDispose) await h.dispose().catch(() => {});
+      }
+      throw new Error(reusedRefMessage(res.fpError));
+    }
     filled.push(...res.frameFilled);
     for (const sk of res.frameSkipped) {
       if (!sk._editor) { skipped.push(sk); continue; }
