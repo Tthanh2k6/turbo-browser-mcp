@@ -386,9 +386,15 @@ function computeElementFingerprintInBrowser(el) {
     // Remove separators and mask live counters; values and checked state are never identity.
     const part = (s) => String(s || '').replace(/\u0000/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 64);
     const mask = (s) => String(s || '').replace(/\d+/g, '#');
+    // Hydration may expand [f] to [alt-shift-f]; only strip hints for this control's accesskey.
+    const accessKeys = (node.getAttribute('accesskey') || '').toLowerCase().split(/\s+/).filter(Boolean);
+    const title = (node.getAttribute('title') || '').replace(/\s*\[([^\[\]]+)\]\s*$/, (suffix, hint) => {
+      const key = hint.toLowerCase().replace(/^(?:(?:alt|ctrl|control|shift|meta|cmd|command|option)[+-])+/, '');
+      return accessKeys.includes(key) ? '' : suffix;
+    });
     return [tag, tag === 'input' ? (node.getAttribute('type') || '').toLowerCase() : '',
       node.getAttribute('name'), node.getAttribute('id'), mask(node.getAttribute('aria-label')),
-      mask(node.getAttribute('placeholder')), node.getAttribute('role'), mask(node.getAttribute('title')),
+      mask(node.getAttribute('placeholder')), node.getAttribute('role'), mask(title),
       mask(labelText)].map(part).join('\u0000');
   }
   const identity = identityOf(el);
@@ -2274,9 +2280,15 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
               // Remove separators and mask live counters; values and checked state are never identity.
               const part = (s) => String(s || '').replace(/\u0000/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 64);
               const mask = (s) => String(s || '').replace(/\d+/g, '#');
+              // Hydration may expand [f] to [alt-shift-f]; only strip hints for this control's accesskey.
+              const accessKeys = (node.getAttribute('accesskey') || '').toLowerCase().split(/\s+/).filter(Boolean);
+              const title = (node.getAttribute('title') || '').replace(/\s*\[([^\[\]]+)\]\s*$/, (suffix, hint) => {
+                const key = hint.toLowerCase().replace(/^(?:(?:alt|ctrl|control|shift|meta|cmd|command|option)[+-])+/, '');
+                return accessKeys.includes(key) ? '' : suffix;
+              });
               return [tag, tag === 'input' ? (node.getAttribute('type') || '').toLowerCase() : '',
                 node.getAttribute('name'), node.getAttribute('id'), mask(node.getAttribute('aria-label')),
-                mask(node.getAttribute('placeholder')), node.getAttribute('role'), mask(node.getAttribute('title')),
+                mask(node.getAttribute('placeholder')), node.getAttribute('role'), mask(title),
                 mask(labelText)].map(part).join('\u0000');
             }
             const identity = identityOf(el);
@@ -3088,9 +3100,15 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                 // Remove separators and mask live counters; values and checked state are never identity.
                 const part = (s) => String(s || '').replace(/\u0000/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 64);
                 const mask = (s) => String(s || '').replace(/\d+/g, '#');
+                // Hydration may expand [f] to [alt-shift-f]; only strip hints for this control's accesskey.
+                const accessKeys = (node.getAttribute('accesskey') || '').toLowerCase().split(/\s+/).filter(Boolean);
+                const title = (node.getAttribute('title') || '').replace(/\s*\[([^\[\]]+)\]\s*$/, (suffix, hint) => {
+                  const key = hint.toLowerCase().replace(/^(?:(?:alt|ctrl|control|shift|meta|cmd|command|option)[+-])+/, '');
+                  return accessKeys.includes(key) ? '' : suffix;
+                });
                 return [tag, tag === 'input' ? (node.getAttribute('type') || '').toLowerCase() : '',
                   node.getAttribute('name'), node.getAttribute('id'), mask(node.getAttribute('aria-label')),
-                  mask(node.getAttribute('placeholder')), node.getAttribute('role'), mask(node.getAttribute('title')),
+                  mask(node.getAttribute('placeholder')), node.getAttribute('role'), mask(title),
                   mask(labelText)].map(part).join('\u0000');
               }
               const identity = identityOf(el);

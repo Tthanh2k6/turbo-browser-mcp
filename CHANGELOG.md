@@ -10,6 +10,7 @@ Screenshots fall back after a short font wait and report `fontsPending: true` wh
 Job-link tracking and editor telemetry no longer produce false submit reports; real form POSTs remain observable.
 `TURBO_BROWSER_ISOLATE_HOSTS` optionally opens matching hosts in fresh isolated contexts.
 Closing a tab in an isolated context is no longer refused as "the last tab of the attached browser" when the default context has one tab left.
+A field whose title gains a longer accesskey hint after page load (Wikipedia's search box: `[f]` becomes `[alt-f]`) no longer fails every action with "now points to a different field".
 
 ## 0.7.1 (2026-11-18)
 
