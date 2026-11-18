@@ -168,15 +168,15 @@ describe('round 22: recycled value controls', () => {
     // Exercise every copy against clones, including counter normalization and DOM order.
     await page.setContent('<form><input name="address3" aria-label="Line (3 of 7)" placeholder="12/160" title="Entry 3"><input name="address3" aria-label="Line (4 of 7)" placeholder="123/160" title="Entry 4"></form>');
     const functions = [fingerprint, ...copies.map((body) => new Function('el', body))];
-    const expected = '#id:' + ['input', '', 'address3', '', 'Line (# of #)', '#/#', '', 'Entry #', '', '#index:0'].join('\0');
+    const expected = '#id:' + ['input', '', 'address3', '', 'Line (# of #)', '#/#', '', 'Entry #', '', '#index:0/2'].join('\0');
     for (const fn of functions) {
       assert.equal(await page.locator('input').nth(0).evaluate(fn), expected);
-      assert.equal(await page.locator('input').nth(1).evaluate(fn), expected.replace(/0$/, '1'));
+      assert.equal(await page.locator('input').nth(1).evaluate(fn), expected.replace(/0\/2$/, '1/2'));
     }
     await page.locator('form').evaluate((form) => form.prepend(form.lastElementChild));
     for (const fn of functions) {
       assert.equal(await page.locator('input').nth(0).evaluate(fn), expected);
-      assert.equal(await page.locator('input').nth(1).evaluate(fn), expected.replace(/0$/, '1'));
+      assert.equal(await page.locator('input').nth(1).evaluate(fn), expected.replace(/0\/2$/, '1/2'));
     }
   });
 

@@ -404,7 +404,7 @@ function computeElementFingerprintInBrowser(el) {
     if (clones.length > 1) {
       for (let container = el.parentNode; container; container = container.parentNode) {
         const inside = clones.filter((node) => container.contains(node));
-        if (inside.length > 1) return '#id:' + identity + '\u0000#index:' + inside.indexOf(el);
+        if (inside.length > 1) return '#id:' + identity + '\u0000#index:' + inside.indexOf(el) + '/' + inside.length;
       }
     }
     return '#id:' + identity;
@@ -412,18 +412,63 @@ function computeElementFingerprintInBrowser(el) {
   return '#text:' + String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128);
 }
 
-async function assertRefFingerprint(page, ref, parsed, locator) {
+function splitFingerprint(fp) {
+  const at = fp.indexOf('\u0000#index:');
+  if (at < 0) return { id: fp, cnt: 1, hasCnt: true };
+  const tail = fp.slice(at + 8);
+  const slash = tail.indexOf('/');
+  return slash < 0
+    ? { id: fp.slice(0, at), cnt: null, hasCnt: false }
+    : { id: fp.slice(0, at), cnt: Number(tail.slice(slash + 1)), hasCnt: true };
+}
+
+async function assertRefFingerprint(page, ref, parsed, locator, frame = null, frameIdx = null) {
   const map = pageRefFingerprints.get(page);
-  if (!map || !parsed || !locator) return;
-  const key = parsed.frameIdx !== null
-    ? `f${parsed.frameIdx}:${parsed.refId.toLowerCase()}`
-    : parsed.refId.toLowerCase();
-  const stored = map.has(key) ? map.get(key) : map.get(parsed.refId.toLowerCase());
-  if (typeof stored !== 'string') return;
+  if (!map || !parsed || !locator) return null;
+  const bare = parsed.refId.toLowerCase();
+  const key = parsed.frameIdx !== null ? `f${parsed.frameIdx}:${bare}` : bare;
+  const stored = map.has(key) ? map.get(key) : map.get(bare);
+  if (typeof stored !== 'string') return null;
   const cur = await locator.evaluate(computeElementFingerprintInBrowser).catch(() => null);
-  if (typeof cur === 'string' && cur !== stored) {
+  if (typeof cur !== 'string' || cur === stored) return null;
+  const s = splitFingerprint(stored);
+  const c = splitFingerprint(cur);
+  if (s.id !== c.id || (s.hasCnt && c.hasCnt && s.cnt === c.cnt)) {
     throw new Error(reusedRefMessage(ref, stored));
   }
+  const fi = parsed.frameIdx ?? frameIdx;
+  map.set(key, cur);
+  map.set(bare, cur);
+  if (fi !== null && fi !== undefined) map.set(`f${fi}:${bare}`, cur);
+  if (!s.hasCnt || !c.hasCnt) return null;
+  if (frame) {
+    const peerIds = new Set();
+    for (const [k, v] of map.entries()) {
+      if (typeof v !== 'string') continue;
+      const ps = splitFingerprint(v);
+      if (ps.id === s.id && ps.cnt === s.cnt) {
+        const pid = k.includes(':') ? k.split(':')[1] : k;
+        if (pid && pid !== bare) peerIds.add(pid);
+      }
+    }
+    for (const pid of peerIds) {
+      const h = await frame.$(`[data-tbm-ref="${pid}"]`).catch(() => null);
+      if (!h) continue;
+      try {
+        const pCur = await h.evaluate(computeElementFingerprintInBrowser).catch(() => null);
+        if (typeof pCur === 'string') {
+          const pc = splitFingerprint(pCur);
+          if (pc.id === s.id && pc.cnt === c.cnt) {
+            map.set(pid, pCur);
+            if (fi !== null && fi !== undefined) map.set(`f${fi}:${pid}`, pCur);
+          }
+        }
+      } finally {
+        await h.dispose().catch(() => {});
+      }
+    }
+  }
+  return `clone group for ${ref} changed size (${s.cnt} -> ${c.cnt})`;
 }
 
 function flattenCdpFrameTree(node, out = []) {
@@ -716,14 +761,16 @@ export async function resolveTarget(page, { ref, selector, text, frameIdx, allow
       if (picked) {
         const res = { frame: f.frame, frameIdx: f.frameIdx, locator: picked.locator };
         if (picked.visible) {
-          await assertRefFingerprint(page, ref, parsed, res.locator);
+          const note = await assertRefFingerprint(page, ref, parsed, res.locator, f.frame, f.frameIdx);
+          if (note) res.note = note;
           return res;
         }
         if (!fallback) fallback = res;
       }
     }
     if (fallback) {
-      await assertRefFingerprint(page, ref, parsed, fallback.locator);
+      const note = await assertRefFingerprint(page, ref, parsed, fallback.locator, fallback.frame, fallback.frameIdx);
+      if (note) fallback.note = note;
       return fallback;
     }
     const near = await nearbyRefs(candidates, parsed.refId);
@@ -2245,7 +2292,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
               if (clones.length > 1) {
                 for (let container = el.parentNode; container; container = container.parentNode) {
                   const inside = clones.filter((node) => container.contains(node));
-                  if (inside.length > 1) return '#id:' + identity + '\u0000#index:' + inside.indexOf(el);
+                  if (inside.length > 1) return '#id:' + identity + '\u0000#index:' + inside.indexOf(el) + '/' + inside.length;
                 }
               }
               return '#id:' + identity;
@@ -2818,18 +2865,8 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
     if (f?.ref) await assertCurrentDocumentRef(page, f.ref, frames);
   }
   const fpMap = pageRefFingerprints.get(page);
-  const fpObj = {};
-  if (fpMap) {
-    for (const f of fields) {
-      if (!f?.ref) continue;
-      const parsed = parseRefString(String(f.ref));
-      if (!parsed) continue;
-      const k1 = parsed.frameIdx !== null ? `f${parsed.frameIdx}:${parsed.refId.toLowerCase()}` : parsed.refId.toLowerCase();
-      const k2 = parsed.refId.toLowerCase();
-      if (fpMap.has(k1)) fpObj[k1] = fpMap.get(k1);
-      if (fpMap.has(k2)) fpObj[k2] = fpMap.get(k2);
-    }
-  }
+  const fpObj = fpMap ? Object.fromEntries(fpMap) : {};
+  const fpNotes = [];
 
   const fileFields = [];
   const domFields = [];
@@ -3069,7 +3106,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                 if (clones.length > 1) {
                   for (let container = el.parentNode; container; container = container.parentNode) {
                     const inside = clones.filter((node) => container.contains(node));
-                    if (inside.length > 1) return '#id:' + identity + '\u0000#index:' + inside.indexOf(el);
+                    if (inside.length > 1) return '#id:' + identity + '\u0000#index:' + inside.indexOf(el) + '/' + inside.length;
                   }
                 }
                 return '#id:' + identity;
@@ -3787,6 +3824,16 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
           const claimed = new Set();
           const radioGroupMap = new Map();
           let nextRadioGroupId = 1;
+          const fpUpdates = [];
+          const splitFp = (fp) => {
+            const at = fp.indexOf('\u0000#index:');
+            if (at < 0) return { id: fp, cnt: 1, hasCnt: true };
+            const tail = fp.slice(at + 8);
+            const slash = tail.indexOf('/');
+            return slash < 0
+              ? { id: fp.slice(0, at), cnt: null, hasCnt: false }
+              : { id: fp.slice(0, at), cnt: Number(tail.slice(slash + 1)), hasCnt: true };
+          };
 
           for (const f of domSpec) {
             if (f.ref) {
@@ -3795,13 +3842,43 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                 const refEl = queryAllDeep(document, `[data-tbm-ref="${m[2]}"]`)[0];
                 if (refEl && fpMapArg) {
                   const refKey = f.ref.trim().toLowerCase();
+                  const bareKey = m[2].toLowerCase();
                   const storedFp = Object.prototype.hasOwnProperty.call(fpMapArg, refKey)
                     ? fpMapArg[refKey]
-                    : fpMapArg[m[2].toLowerCase()];
+                    : fpMapArg[bareKey];
                   if (typeof storedFp === 'string') {
                     const curFp = fingerprintOf(refEl);
                     if (typeof curFp === 'string' && curFp !== storedFp) {
-                      return { frameFilled, frameSkipped, matchedIndexes, leftover: [], submits: [], fpError: f.ref, fpStored: storedFp };
+                      const s = splitFp(storedFp);
+                      const c = splitFp(curFp);
+                      if (s.id !== c.id || (s.hasCnt && c.hasCnt && s.cnt === c.cnt)) {
+                        return { frameFilled, frameSkipped, matchedIndexes, leftover: [], submits: [], fpError: f.ref, fpStored: storedFp, fpUpdates };
+                      }
+                      const note = s.hasCnt && c.hasCnt ? `clone group for ${f.ref.trim()} changed size (${s.cnt} -> ${c.cnt})` : '';
+                      fpMapArg[refKey] = curFp;
+                      fpMapArg[bareKey] = curFp;
+                      fpMapArg[`f${frameIdxArg}:${bareKey}`] = curFp;
+                      fpUpdates.push({ refKey, bareKey, frameIdx: frameIdxArg, curFp, note });
+                      if (note) {
+                        for (const peerEl of queryAllDeep(document, '[data-tbm-ref]')) {
+                          if (peerEl === refEl) continue;
+                          const pid = (peerEl.getAttribute('data-tbm-ref') || '').toLowerCase();
+                          if (!pid) continue;
+                          const pStored = fpMapArg[`f${frameIdxArg}:${pid}`] ?? fpMapArg[pid];
+                          if (typeof pStored !== 'string') continue;
+                          const ps = splitFp(pStored);
+                          if (ps.id !== s.id || ps.cnt !== s.cnt) continue;
+                          const pCur = fingerprintOf(peerEl);
+                          if (typeof pCur === 'string') {
+                            const pc = splitFp(pCur);
+                            if (pc.id === s.id && pc.cnt === c.cnt) {
+                              fpMapArg[pid] = pCur;
+                              fpMapArg[`f${frameIdxArg}:${pid}`] = pCur;
+                              fpUpdates.push({ refKey: `f${frameIdxArg}:${pid}`, bareKey: pid, frameIdx: frameIdxArg, curFp: pCur, note: '' });
+                            }
+                          }
+                        }
+                      }
                     }
                   }
                 }
@@ -4448,7 +4525,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
             })
             .filter((b) => b.type === 'submit' || b.type === 'image' || b.text);
 
-          return { frameFilled, frameSkipped, matchedIndexes, leftover, submits };
+          return { frameFilled, frameSkipped, matchedIndexes, leftover, submits, fpUpdates };
           },
           {
             domSpec: activeDomFields,
@@ -4468,6 +4545,17 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
     }
 
     if (!res) continue;
+    if (Array.isArray(res.fpUpdates) && fpMap) {
+      for (const u of res.fpUpdates) {
+        fpMap.set(u.refKey, u.curFp);
+        fpMap.set(u.bareKey, u.curFp);
+        fpMap.set(`f${u.frameIdx}:${u.bareKey}`, u.curFp);
+        fpObj[u.refKey] = u.curFp;
+        fpObj[u.bareKey] = u.curFp;
+        fpObj[`f${u.frameIdx}:${u.bareKey}`] = u.curFp;
+        if (u.note && !fpNotes.includes(u.note)) fpNotes.push(u.note);
+      }
+    }
     if (res.fpError) {
       if (selectorHandlesToDispose.length > 0) {
         for (const h of selectorHandlesToDispose) await h.dispose().catch(() => {});
@@ -5284,6 +5372,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
         },
         { allowHidden: true }
       );
+      if (target.note && !fpNotes.includes(target.note)) fpNotes.push(target.note);
       const isDisabledOrInertTarget = await target.locator
         .evaluate((el) => {
           const isDisabledByFieldset = (node) => {
@@ -5568,6 +5657,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
     stoppedBeforeSubmit: spec.stopBeforeSubmit !== false,
     submitButtons,
     ...(refilled > 0 ? { refilled } : {}),
+    ...(fpNotes.length > 0 ? { note: fpNotes[0] } : {}),
     elapsedMs: Date.now() - t0,
   };
 
@@ -5924,6 +6014,9 @@ async function executeSingleAction(page, rawParams = {}) {
     res.note =
       'The page tried to submit a form during this action (submit event, form.submit() or requestSubmit()); it was stopped because allowSubmit=false. Nothing was sent.';
   }
+  if (silentState.note && res && typeof res === 'object' && !res.note) {
+    res.note = silentState.note;
+  }
   return res;
 }
 
@@ -5943,6 +6036,7 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
   if (action === 'scroll') {
     if (params.ref || params.selector || params.text) {
       const target = await resolveTarget(page, params);
+      if (target.note) silentState.note = target.note;
       await target.locator.scrollIntoViewIfNeeded({ timeout });
       return { ok: true, action, frameIdx: target.frameIdx };
     }
@@ -6063,6 +6157,7 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
       const target = await resolveTarget(page, params, {
         allowHidden: ['hidden', 'detached', 'attached'].includes(params.state),
       });
+      if (target.note) silentState.note = target.note;
       await target.locator.waitFor({ state: params.state || 'visible', timeout });
       return { ok: true, action, waitedFor: params.ref };
     }
@@ -6644,6 +6739,7 @@ ${el.value || ''}`.toLowerCase();
     const hasCtrlOrMeta = keyParts.some((p) => /^(control|ctrl|meta|command|cmd|controlormeta)$/i.test(p.trim()));
     if (params.ref || params.selector || params.text) {
       target = await resolveTarget(page, params);
+      if (target.note) silentState.note = target.note;
       let isSafeTargetPress = false;
       let isSafeActivePress = false;
       if ((isEnter || isSpace) && !allowSubmit) {
@@ -6929,6 +7025,7 @@ ${el.value || ''}`.toLowerCase();
   target = await resolveTarget(page, params, {
     allowHidden: action === 'upload',
   });
+  if (target.note) silentState.note = target.note;
   const { locator, frameIdx } = target;
 
   if (action === 'drag') {
@@ -6938,6 +7035,7 @@ ${el.value || ''}`.toLowerCase();
       text: params.targetText,
       frameIdx: params.targetFrameIdx,
     });
+    if (dest.note && !silentState.note) silentState.note = dest.note;
     if (!allowSubmit) {
       for (const [which, loc] of [['source', locator], ['target', dest.locator]]) {
         const meta = await isSubmitLikeElement(loc);

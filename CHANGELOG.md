@@ -3,6 +3,7 @@
 ## Unreleased
 
 Cloned fields reject stale refs after reordering; live counters in field labels, placeholders, and titles no longer invalidate refs.
+Removing or adding a row of cloned fields no longer invalidates refs to the untouched clones; the action proceeds and reports `note: "clone group for <ref> changed size (3 -> 2)"`. A swap within an unchanged group is still refused.
 Background tool targets keep rendering without activating or changing other tabs.
 Actions that open a popup return its registered tab ID as `newTab`.
 Screenshots fall back after a short font wait and report `fontsPending: true` when needed.
