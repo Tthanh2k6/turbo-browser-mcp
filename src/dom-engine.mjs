@@ -23,7 +23,7 @@ function isAnalyticsRequest(request, host, reqPath) {
   }
 }
 import { urlDenial, peekBlocked, denyMessage, matchUrl, getPolicy } from './allow-hosts.mjs';
-import { observeClickAftermath, parkLate, watchActivity } from './aftermath.mjs';
+import { isGoogleBackgroundRequest, observeClickAftermath, parkLate, watchActivity } from './aftermath.mjs';
 import { armToasts, takeToast } from './toast.mjs';
 import { wrapPage, boundariesEnabled } from './boundaries.mjs';
 import { redactText } from './secrets.mjs';
@@ -1847,7 +1847,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
       // One busy or hung frame must not hold the whole snapshot: give each frame 8 s.
       let capTimer;
       chunk = await Promise.race([frameInfo.frame.evaluate(
-        ({ modeArg, frameIdxArg, startRef, rootSel, boxesArg, preserveRefsArg }) => {
+        ({ modeArg, frameIdxArg, startRef, rootSel, boxesArg, preserveRefsArg, queryArg }) => {
           const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
 
           const queryAllDeep = (rootNode, sel) => {
@@ -1934,9 +1934,10 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
             return false;
           };
 
+          let readBehindPopup = false;
           const isHidden = (el) => {
-            if (isInert(el) || isClosedDetailsOrCvHidden(el)) return true;
-            if (el.getAttribute('aria-hidden') === 'true' || Boolean(el.closest('[aria-hidden="true"]'))) {
+            if ((!readBehindPopup && isInert(el)) || isClosedDetailsOrCvHidden(el)) return true;
+            if (!readBehindPopup && (el.getAttribute('aria-hidden') === 'true' || Boolean(el.closest('[aria-hidden="true"]')))) {
               return true;
             }
             if (el.tagName === 'INPUT' && el.type === 'file') return false;
@@ -1947,6 +1948,18 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
             const rect = el.getBoundingClientRect();
             return rect.width === 0 || rect.height === 0;
           };
+
+          const popups = queryAllDeep(document, '[role="listbox"], [role="menu"], [role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog[open]')
+            .filter((el) => !isHidden(el));
+          readBehindPopup = Boolean(queryArg && popups.length);
+          const inPopup = (el) => popups.some((popup) => {
+            let cur = el;
+            while (cur) {
+              if (cur === popup) return true;
+              cur = cur.parentElement || cur.getRootNode?.().host;
+            }
+            return false;
+          });
 
           const rootMatches = rootSel ? queryAllDeep(document, rootSel) : [document.body];
           const root = rootMatches.find((el) => el && !isHidden(el)) || rootMatches[0];
@@ -1999,7 +2012,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
                 if (SKIP.has(t)) return '';
                 if (t === 'BR') return ' ';
                 if (!allowHidden && n !== rootNode) {
-                  if (n.hasAttribute?.('hidden') || n.getAttribute?.('aria-hidden') === 'true') return '';
+                  if (n.hasAttribute?.('hidden') || (!readBehindPopup && n.getAttribute?.('aria-hidden') === 'true')) return '';
                   try {
                     const st = getComputedStyle(n);
                     if (st.display === 'none' || st.visibility === 'hidden') return '';
@@ -2090,7 +2103,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
 
             const tag = el.tagName;
             let fallbackVis = '';
-            if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && !el.isContentEditable) {
+            if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && (!el.isContentEditable || tag === 'A' || el.getAttribute('role') === 'link')) {
               const sr = getSR(el);
               const visText =
                 composedText(el) ||
@@ -2107,7 +2120,20 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
                 if (near) return near.slice(0, 80);
               }
               const v = clean(el.getAttribute(attr));
+              // Generated names/ids (UUIDs, long hex, React ":r6:") say nothing to the agent: look for the question text instead.
+              if (v && (attr === 'name' || attr === 'id') && /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{16,}|:r[0-9a-z]+:)$/i.test(v)) continue;
               if (v) return v.slice(0, 80);
+            }
+
+            if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+              // Nearest ancestor (up to 4 levels) whose own text, minus the field's value, reads like a short question.
+              const own = clean(el.value || '');
+              for (let cur = el.parentElement, i = 0; cur && i < 4; cur = cur.parentElement, i++) {
+                let txt = clean(cur.innerText || '').replace(/[​]/g, '').trim();
+                if (own) txt = clean(txt.split(own).join(' '));
+                if (txt && /[\p{L}]/u.test(txt) && txt.length <= 160) return txt.replace(/\s*[*＊]+$/, '').slice(0, 80);
+                if (txt.length > 160) break;
+              }
             }
 
             if (fallbackVis) return fallbackVis.slice(0, 80);
@@ -2127,7 +2153,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
             all: 'h1, h2, h3, a[href], button, input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], [role="switch"], p',
           };
 
-          const sel = selectorByMode[modeArg] || selectorByMode.interactive;
+          const sel = (selectorByMode[modeArg] || selectorByMode.interactive) + (queryArg ? ', [role="row"]' : '');
           const rawNodes = queryAllDeep(root, sel);
           if (root.nodeType === 1 && root.matches?.(sel) && !rawNodes.includes(root)) {
             rawNodes.unshift(root);
@@ -2173,7 +2199,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
           }
           let nodes = rawNodes.filter((el) => !isHidden(el));
           // A modal dialog (aria-modal or a showModal()'d <dialog>) is open: the page behind it cannot be used, list only the dialog.
-          if (modeArg === 'interactive' || modeArg === 'forms') {
+          if (!queryArg && (modeArg === 'interactive' || modeArg === 'forms')) {
             const modals = queryAllDeep(root, '[aria-modal="true"], dialog[open]')
               .filter((d) => !isHidden(d) && (d.getAttribute('aria-modal') === 'true' || d.matches(':modal')));
             if (modals.length > 0) {
@@ -2223,7 +2249,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
             if (modeArg === 'article' && (tag === 'h1' || tag === 'h2' || tag === 'h3' || tag === 'h4' || tag === 'p' || tag === 'li')) {
               const txt = (composedText(el) || clean(el.innerText || el.textContent)).slice(0, 220);
               if (txt) {
-                const line = `[${fullRef}] <${tag}> ${txt}`;
+                const line = `[${fullRef}] <${tag}> ${txt}${readBehindPopup && !inPopup(el) ? ' [behind popup]' : ''}`;
                 items.push({ ref: fullRef, line, sig: `f${frameIdxArg}:<${tag}>:${txt}`, fp: fingerprintOf(el) });
               }
               continue;
@@ -2237,13 +2263,14 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
               ? 'input:combobox'
               : tag === 'input'
               ? `input:${type || 'text'}`
-              : el.isContentEditable
+              : el.isContentEditable && tag !== 'a' && role !== 'link'
                 ? `${tag}:editable`
                 : role
                   ? `${tag}:${role}`
                   : tag;
 
-            let lbl = labelFor(el);
+            const rowText = role === 'row' ? (clean(el.getAttribute('aria-label')) || composedText(el)) : '';
+            let lbl = rowText ? rowText.slice(0, 220) : labelFor(el);
             if (tag === 'input' && /^react-select-\d+-input$/.test(lbl)) {
               // Auto-generated id: use short visible text of the nearby wrapper instead (placeholder/value).
               let host = el.parentElement;
@@ -2255,7 +2282,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
                 }
               }
             }
-            let extra = '';
+            let extra = readBehindPopup && !inPopup(el) ? ' [behind popup]' : '';
             if (tag === 'input' || tag === 'textarea' || tag === 'select') {
               if (type === 'checkbox' || type === 'radio') {
                 extra += el.checked ? ' [checked]' : '';
@@ -2267,7 +2294,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
               }
             } else if (role === 'checkbox' || role === 'radio' || role === 'switch') {
               if (el.getAttribute('aria-checked') === 'true') extra += ' [checked]';
-            } else if (el.isContentEditable) {
+            } else if (el.isContentEditable && tag !== 'a' && role !== 'link') {
               const txt = clean(el.innerText);
               if (txt) extra += ` val="${txt.slice(0, 40)}"`;
             } else if (tag === 'a' && el.getAttribute('href')) {
@@ -2310,7 +2337,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
 
             const line = `[${fullRef}] <${kind}> "${lbl}"${extra}${shadowTag}${boxTag}`;
             const sig = `f${frameIdxArg}:<${kind}> "${lbl}"${extra}${shadowTag}`;
-            items.push({ ref: fullRef, line, sig, fp: fingerprintOf(el) });
+            items.push({ ref: fullRef, line, sig, fp: fingerprintOf(el), rowText });
           }
           try {
             Object.defineProperty(window, '__tbmRefHigh', { value: refCounter - 1, writable: true, configurable: true, enumerable: false });
@@ -2324,6 +2351,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
           rootSel: rootSelector,
           boxesArg: boxes,
           preserveRefsArg: preserveRefs,
+          queryArg: query,
         }
       ), new Promise((_, rej) => { capTimer = setTimeout(() => rej(new Error('frame snapshot timed out')), 8000); })]).finally(() => clearTimeout(capTimer));
     } catch (err) {
@@ -2356,7 +2384,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
       nextFingerprints.set(item.ref, item.fp);
       nextSignatures.add(item.sig);
       nextRefs.set(item.ref, item.sig);
-      if (queryRe && !queryRe.test(item.line)) continue;
+      if (queryRe && !queryRe.test(item.line) && !(item.rowText && queryRe.test(item.rowText))) continue;
       if (onlyChanged && sameScope) {
         if (!baseline.refs.has(item.ref)) {
           frameItems.push(`*${item.line}`); // new since the last snapshot
@@ -2708,6 +2736,9 @@ async function recheckFilled(page, spec, filled) {
 const POPUP_NOTE = 'a popup is open and hides the rest of the page: pick an option or press Escape';
 function popupOpenIn(frame) {
   return frame.evaluate(() => {
+    if ([...document.querySelectorAll('[aria-modal="true"], dialog[open]')]
+      .some((e) => !e.closest('[aria-hidden="true"]') && e.getBoundingClientRect().width > 0 &&
+        (e.getAttribute('aria-modal') === 'true' || e.matches(':modal')))) return true;
     if (![...document.body.children].some((c) => c.getAttribute('aria-hidden') === 'true' && c.tagName !== 'SCRIPT')) return false;
     return [...document.querySelectorAll('[role="listbox"], [role="menu"], [role="dialog"], [role="alertdialog"], [aria-modal="true"]')]
       .some((e) => !e.closest('[aria-hidden="true"]') && e.getBoundingClientRect().width > 0);
@@ -5775,7 +5806,7 @@ async function executeSingleAction(page, rawParams = {}) {
     let host = '';
     let reqPath = '';
     try { const u = new URL(request.url()); host = u.host; reqPath = u.pathname; } catch { return; }
-    if (isAnalyticsRequest(request, host, reqPath)) return;
+    if (isAnalyticsRequest(request, host, reqPath) || isGoogleBackgroundRequest(request)) return;
     // An allowed submit was the point of the click: the agent knows it submitted, no late warning.
     if (returned && params.allowSubmit === true) return;
     if (returned) parkLate(page, `possibleSubmit: ${request.method()} ${host}${reqPath.slice(0, 60)}`);
@@ -7245,10 +7276,11 @@ ${el.value || ''}`.toLowerCase();
     const roleInfo = await locator.evaluate((el) => ({
       role: (el.getAttribute('role') || '').toLowerCase(),
       ariaChecked: el.getAttribute('aria-checked'),
+      native: el.tagName === 'INPUT' && /^(checkbox|radio)$/.test(el.type),
     })).catch(() => ({ role: '', ariaChecked: null }));
 
     await withActionSubmitGuard(async () => {
-      if (roleInfo.role === 'switch' || roleInfo.role === 'checkbox' || roleInfo.role === 'radio') {
+      if (!roleInfo.native && (roleInfo.role === 'switch' || roleInfo.role === 'checkbox' || roleInfo.role === 'radio')) {
         if ((roleInfo.ariaChecked === 'true') !== wantChecked) {
           await locator.click({ timeout });
         }
@@ -7257,15 +7289,49 @@ ${el.value || ''}`.toLowerCase();
         try {
           await go({ timeout: Math.min(timeout, 2500) });
         } catch (err) {
-          // A styled span over a visually hidden input: its own label is the control people click.
-          if (!/intercepts pointer events/.test(String(err?.message || err))) throw err;
-          const flipped = await locator.evaluate((el, want) => {
-            const label = el.closest('label') || (el.labels && el.labels[0]);
-            if (!label) return false;
-            if (el.checked !== want) label.click();
-            return el.checked === want;
-          }, wantChecked).catch(() => false);
-          if (!flipped) await go({ timeout });
+          if (await locator.isChecked().catch(() => null) === wantChecked) return;
+          // Clipped/transparent controls may time out as invisible, outside the viewport, or intercepted.
+          // Use the visible surface a person clicks; never toggle the property directly.
+          const handle = await locator.evaluateHandle((el) => {
+            if (el.tagName !== 'INPUT' || !/^(checkbox|radio)$/.test(el.type) || el.matches(':disabled')) return null;
+            const visible = (node) => {
+              if (node.matches(':disabled, [aria-disabled="true"]') || node.closest('[inert]')) return false;
+              const rect = node.getBoundingClientRect();
+              if (!rect.width || !rect.height) return false;
+              for (let cur = node; cur; cur = cur.parentElement) {
+                const s = getComputedStyle(cur);
+                if (s.display === 'none' || s.visibility === 'hidden' || Number(s.opacity) === 0) return false;
+              }
+              return true;
+            };
+            for (const label of el.labels || []) if (visible(label)) return label;
+            for (let cur = el.parentElement; cur; cur = cur.parentElement) {
+              if (cur.matches('label, [role="checkbox"], [role="radio"], [role="switch"], button, [role="button"], [onclick], [tabindex]:not([tabindex="-1"])') && visible(cur)) return cur;
+            }
+            return null;
+          });
+          try {
+            const target = handle.asElement();
+            if (!target) throw err;
+            if (!allowSubmit) {
+              const meta = await isSubmitLikeElement(target);
+              if (meta.isSubmit) throw new Error(`Submit guard: blocked ${action} on "${meta.label}" because allowSubmit=false.`);
+              await target.scrollIntoViewIfNeeded({ timeout });
+              const box = await target.boundingBox();
+              if (box) {
+                const point = await isSubmitAtPoint(page, box.x + box.width / 2, box.y + box.height / 2);
+                if (point.isSubmit) throw new Error(`Submit guard: blocked ${action} on "${point.label}" because allowSubmit=false.`);
+              }
+            }
+            try {
+              await target.click({ timeout: Math.min(timeout, 2500) });
+            } catch (clickErr) {
+              // A transparent overlay still covers the label: a DOM click on the label is what a person's click does.
+              if (!/intercepts pointer events|covers the target|Timeout/i.test(String(clickErr?.message || clickErr))) throw clickErr;
+              await target.evaluate((node) => node.click());
+            }
+            if (await locator.isChecked() !== wantChecked) throw new Error(`Checkbox did not become ${wantChecked ? 'checked' : 'unchecked'} after clicking its label or wrapper.`);
+          } finally { await handle.dispose(); }
         }
       }
     });
@@ -7754,7 +7820,7 @@ export function denoiseText(text) {
  * Extract readable main article / page text cleanly in plain text or compact markdown.
  */
 export async function extractCleanText(page, options = {}) {
-  const maxChars = Math.max(200, Number(options.maxChars) || 6000);
+  const maxChars = Math.max(1, Number(options.maxChars) || 6000);
   const includeFrames = options.includeFrames !== false;
   let selector = options.selector || null;
   const format = options.format === 'markdown' ? 'markdown' : 'text';
@@ -8210,11 +8276,20 @@ export async function extractCleanText(page, options = {}) {
   }
 
   const title = await page.title().catch(() => '');
-  const header = `URL: ${page.url()}\nTitle: ${title}\n\n`;
+  const fullHeader = `URL: ${page.url()}\nTitle: ${title}\n\n`;
   const joined = sections.join('\n\n');
-  const full = `${header}${joined}`;
+  const full = `${fullHeader}${joined}`;
   const truncated = full.length > maxChars;
-  const text = truncated ? `${full.slice(0, Math.max(0, maxChars - 20))}\n... [truncated]` : full;
+  // The whole reply stays within maxChars. On a small budget the header shrinks (no title, short URL)
+  // so most of the budget goes to content instead of URL/title.
+  const MARK = '\n... [truncated]';
+  let header = fullHeader;
+  if (truncated && header.length > maxChars / 4) {
+    const url = page.url();
+    const room = Math.max(12, Math.floor(maxChars / 4) - 7);
+    header = `URL: ${url.length > room ? `${url.slice(0, room - 1)}…` : url}\n\n`;
+  }
+  const text = truncated ? `${header}${joined.slice(0, Math.max(0, maxChars - header.length - MARK.length))}${MARK}` : full;
   const savedPath = writeSaveFile(options.savePath, full);
 
   return {

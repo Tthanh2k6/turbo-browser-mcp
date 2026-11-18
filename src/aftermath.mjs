@@ -3,6 +3,24 @@
 // attached until remove() so a late request is still seen by the guards that share this page.
 const QUIET_MS = 80, INFLIGHT_MS = 1500, POLL_MS = 20;
 const IGNORED_RESOURCES = new Set(['websocket', 'eventsource', 'media', 'ping', 'beacon']);
+// Presence, suggestions and people lookups, not a blanket Google-domain exception.
+const GOOGLE_BACKGROUND_RPC_HOSTS = new Set([
+  'signaler-pa.clients6.google.com',
+  'taskassist-pa.clients6.google.com',
+  'peoplestack-pa.clients6.google.com',
+]);
+export function isGoogleBackgroundRequest(request) {
+  if (request.method() !== 'POST') return false;
+  try {
+    const url = new URL(request.url());
+    if (GOOGLE_BACKGROUND_RPC_HOSTS.has(url.hostname)) return true;
+    if (url.hostname !== 'mail.google.com' || !/^\/mail\/u\/\d+\/$/.test(url.pathname)) return false;
+    // This endpoint also sends mail (act=sm). Ignore only an explicitly identified sync;
+    // opaque or unfamiliar payloads must still be reported.
+    const actions = [...url.searchParams.getAll('act'), ...new URLSearchParams(request.postData?.() || '').getAll('act')];
+    return actions.length > 0 && actions.every((act) => act === 'sync');
+  } catch { return false; }
+}
 // A JS dialog freezes page.evaluate; give up on the DOM probe instead of hanging the action.
 const probe = (promise, ms = 250) => Promise.race([promise, new Promise((r) => setTimeout(() => r(null), ms))]).catch(() => null);
 export function watchActivity(page) {
@@ -92,6 +110,7 @@ export function observeClickAftermath(page) {
   const onRequest = (request) => {
     const method = request.method();
     if (!/^(POST|PUT|PATCH|DELETE)$/.test(method) || !['fetch', 'xhr'].includes(request.resourceType())) return;
+    if (isGoogleBackgroundRequest(request)) return;
     const url = request.url();
     let pathname = '';
     try { pathname = new URL(url).pathname; } catch {}
@@ -123,6 +142,7 @@ export function observeClickAftermath(page) {
   const pathOf = (u) => { try { return new URL(u).pathname; } catch { return u; } };
   const onLateNav = (frame) => { if (frame === page.mainFrame() && pathChanged(frame.url())) park(`navigated to ${pathOf(frame.url())}`); };
   const onLateRequest = (request) => {
+    if (isGoogleBackgroundRequest(request)) return;
     if (/^(POST|PUT|PATCH|DELETE)$/.test(request.method()) && ['fetch', 'xhr'].includes(request.resourceType())) park(`${request.method()} ${pathOf(request.url())}`);
   };
   let kind = '';

@@ -1370,7 +1370,10 @@ export class BrowserManager {
           });
           continue;
         }
-        if (op.activate !== false) this.activeTabId = tabId;
+        if (op.activate === true) {
+          this.activeTabId = tabId;
+          await page.bringToFront().catch(() => {});
+        }
         const navTitle = await page.title().catch(() => '');
         results.push({
           action: 'navigate',
