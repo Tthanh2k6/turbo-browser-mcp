@@ -13,6 +13,7 @@ Closing a tab in an isolated context is no longer refused as "the last tab of th
 A field whose title gains a longer accesskey hint after page load (Wikipedia's search box: `[f]` becomes `[alt-f]`) no longer fails every action with "now points to a different field".
 `act_fast` select accepts `option` (the visible option text, the same key `smart_fill_form` uses), and on an ARIA combobox it says to use `smart_fill_form` instead of failing inside Playwright.
 An unlabeled field no longer takes the source of a nearby `<script>` as its label (seen on the-internet's upload page); hidden and non-visual siblings are skipped.
+`inspect_compact` adds `Loading frames: f1,...` to its header when an iframe has no fields yet because its document is still loading, so an agent waits instead of concluding the form is empty.
 
 ## 0.7.1 (2026-11-18)
 

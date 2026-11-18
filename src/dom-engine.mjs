@@ -1889,6 +1889,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
   const nextFingerprints = new Map();
   const fpMap = getPageRefFingerprints(page);
   const scannedFrames = new Set();
+  const loadingFrames = [];
   let totalMatched = 0;
   const loaderState = await getPageLoaderState(page);
   if (loaderState) await syncFrameTree(loaderState);
@@ -2424,7 +2425,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
           try {
             Object.defineProperty(window, '__tbmRefHigh', { value: refCounter - 1, writable: true, configurable: true, enumerable: false });
           } catch {}
-          return { items, nextRef: refCounter, total: items.length };
+          return { items, nextRef: refCounter, total: items.length, readyState: document.readyState, blank: location.href === 'about:blank' };
         },
         {
           modeArg: mode,
@@ -2442,6 +2443,8 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
     }
 
     if (!chunk) continue;
+    // An empty iframe that is still loading (lazy embeds such as MDN's live examples) is reported so the agent waits.
+    if (!frameInfo.isMain && chunk.total === 0 && (chunk.readyState !== 'complete' || chunk.blank)) loadingFrames.push(`f${frameInfo.frameIdx}`);
     scannedFrames.add(`f${frameInfo.frameIdx}`);
     nextRefNum = chunk.nextRef;
     pageRefHigh.set(page, Math.max(pageRefHigh.get(page) || 0, chunk.nextRef - 1));
@@ -2504,7 +2507,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
     title = '';
   }
 
-  const filterNote = `${query ? ` | Query: "${query}"` : ''}${onlyChanged ? ' | Delta: true' : ''}`;
+  const filterNote = `${query ? ` | Query: "${query}"` : ''}${onlyChanged ? ' | Delta: true' : ''}${loadingFrames.length ? ` | Loading frames: ${loadingFrames.slice(0, 8).join(',')} (inspect again shortly)` : ''}`;
   const urlChangedNote = onlyChanged && hadBaseline && !sameUrlAsBaseline
     ? 'URL changed: full snapshot\n'
     : onlyChanged && !baseline
