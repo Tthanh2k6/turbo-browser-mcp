@@ -2113,7 +2113,9 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
               }
               if (best) return best;
               // Plain sibling block before the field (no label element): "First Name*" in a <div>.
-              const sib = up < 3 ? prevChild.previousElementSibling : null;
+              let sib = up < 3 ? prevChild.previousElementSibling : null;
+              // Skip non-visual siblings: a <script> before the field is code, not a label (the-internet /upload).
+              while (sib && (/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|BR|HR)$/.test(sib.tagName) || !sib.getClientRects().length)) sib = sib.previousElementSibling;
               if (sib && !sib.matches(FIELD_SEL) && !sib.querySelector(FIELD_SEL) && !sib.querySelector('button, a')) {
                 const t = clean(sib.innerText || sib.textContent).replace(/\s*[*\uFF0A]+$/, '');
                 if (t && t.length <= 60 && /[\p{L}\p{N}]/u.test(t)) return t;
@@ -3393,7 +3395,9 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
               }
               if (best) return best;
               // Plain sibling block before the field (no label element): "First Name*" in a <div>.
-              const sib = up < 3 ? prevChild.previousElementSibling : null;
+              let sib = up < 3 ? prevChild.previousElementSibling : null;
+              // Skip non-visual siblings: a <script> before the field is code, not a label (the-internet /upload).
+              while (sib && (/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|BR|HR)$/.test(sib.tagName) || !sib.getClientRects().length)) sib = sib.previousElementSibling;
               if (sib && !sib.matches(FIELD_SEL) && !sib.querySelector(FIELD_SEL) && !sib.querySelector('button, a')) {
                 const t = clean(sib.innerText || sib.textContent).replace(/\s*[*\uFF0A]+$/, '');
                 if (t && t.length <= 60 && /[\p{L}\p{N}]/u.test(t)) return t;
