@@ -7391,13 +7391,22 @@ ${el.value || ''}`.toLowerCase();
   }
 
   if (action === 'select') {
-    const raw = params.values ?? params.value ?? params.label;
-    if (raw === undefined) throw new Error('select action requires value, values, or label.');
+    // `option` is what smart_fill_form calls the visible option text; accept it here too (as a label).
+    const optionAlias = params.values === undefined && params.value === undefined && params.label === undefined
+      ? params.option : undefined;
+    const raw = params.values ?? params.value ?? params.label ?? optionAlias;
+    if (raw === undefined) throw new Error('select action requires value, values, label, or option.');
+    const isNativeSelect = await locator.evaluate((el) => el.tagName === 'SELECT').catch(() => true);
+    if (!isNativeSelect) {
+      throw new Error('select works on a native <select>. For an ARIA combobox or custom dropdown use smart_fill_form with {ref, option}.');
+    }
+    const byLabel = params.label !== undefined || optionAlias !== undefined;
+    const labelValue = params.label ?? optionAlias;
     let spec;
     if (Array.isArray(raw)) {
-      spec = params.label ? raw.map((l) => ({ label: String(l) })) : raw.map((v) => String(v));
+      spec = byLabel ? raw.map((l) => ({ label: String(l) })) : raw.map((v) => String(v));
     } else {
-      spec = params.label ? { label: String(params.label) } : String(raw);
+      spec = byLabel ? { label: String(labelValue) } : String(raw);
     }
     let chosen;
     try {
