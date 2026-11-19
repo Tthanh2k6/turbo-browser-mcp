@@ -105,4 +105,28 @@ describe('night 19-11: clone group size shifts vs swaps', () => {
       ['111-0001', '222-0002', '333-0003', '']
     );
   });
+
+  it('keeps every ref on its own field when two identical clone sections swap wholesale (no notes)', async () => {
+    const sec = (n) => `<fieldset class="sec" data-n="${n}">` + '<div class="row"><input aria-label="Phone"></div>'.repeat(3) + '</fieldset>';
+    await page.setContent(`<form>${sec('a')}${sec('b')}</form>`);
+    await inspectCompact(page, {}, new Set());
+    const refs = await refsForInputs(6);
+    await page.evaluate(() => {
+      const [a, b] = document.querySelectorAll('.sec');
+      a.parentNode.insertBefore(b, a);
+    });
+
+    const notes = [];
+    for (const [i, ref] of refs.entries()) {
+      const r = await actFast(page, { action: 'fill', ref, value: `v${i}` });
+      if (r.note) notes.push(r.note);
+    }
+    const res = await smartFillForm(page, { fields: refs.map((ref, i) => ({ ref, value: `s${i}` })) });
+    assert.deepEqual(notes, []);
+    assert.equal(res.note || '', '');
+    assert.deepEqual(
+      await page.locator('fieldset').evaluateAll((fs) => fs.map((f) => f.dataset.n + ':' + [...f.querySelectorAll('input')].map((i) => i.value).join(','))),
+      ['b:s3,s4,s5', 'a:s0,s1,s2']
+    );
+  });
 });
