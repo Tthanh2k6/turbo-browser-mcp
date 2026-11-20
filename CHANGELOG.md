@@ -1,19 +1,26 @@
 # Changelog
 
-## Unreleased
+## 0.7.2 (2026-11-20)
 
-Cloned fields reject stale refs after reordering; live counters in field labels, placeholders, and titles no longer invalidate refs.
-Removing or adding a row of cloned fields no longer invalidates refs to the untouched clones; the action proceeds and reports `note: "clone group for <ref> changed size (3 -> 2)"`. A swap within an unchanged group is still refused.
-Background tool targets keep rendering without activating or changing other tabs.
-Actions that open a popup return its registered tab ID as `newTab`.
-Screenshots fall back after a short font wait and report `fontsPending: true` when needed.
-Job-link tracking and editor telemetry no longer produce false submit reports; real form POSTs remain observable.
-`TURBO_BROWSER_ISOLATE_HOSTS` optionally opens matching hosts in fresh isolated contexts.
-Closing a tab in an isolated context is no longer refused as "the last tab of the attached browser" when the default context has one tab left.
-A field whose title gains a longer accesskey hint after page load (Wikipedia's search box: `[f]` becomes `[alt-f]`) no longer fails every action with "now points to a different field".
-`act_fast` select accepts `option` (the visible option text, the same key `smart_fill_form` uses), and on an ARIA combobox it says to use `smart_fill_form` instead of failing inside Playwright.
-An unlabeled field no longer takes the source of a nearby `<script>` as its label (seen on the-internet's upload page); hidden and non-visual siblings are skipped.
-`inspect_compact` adds `Loading frames: f1,...` to its header when an iframe has no fields yet because its document is still loading, so an agent waits instead of concluding the form is empty.
+Refs
+- Cloned fields reject stale refs when swapped inside an unchanged group, and WeakMap owner IDs on enclosing groups and clone containers keep distinct sections separate across reorders.
+- Live counters in field labels, placeholders, and titles stay masked, and accesskey hints appended to `title` after load (`[f]` to `[alt-f]` on Wikipedia) stay ignored in field fingerprints.
+- Adding or removing a cloned row keeps refs to untouched clones valid and returns `note: "clone group for <ref> changed size (3 -> 2)"`; swaps inside an unchanged group still fail.
+
+Snapshots
+- `inspect_compact` adds `Loading frames: f1,...` to its header when an iframe has no fields yet because its document is still loading.
+- Nearby label lookup skips `<script>`, `<style>`, and hidden siblings so an unlabeled input never picks up script source as its label.
+- `screenshot` falls back after a short font wait and reports `fontsPending: true` when webfonts keep loading.
+
+Actions
+- `act_fast` `select` accepts `option` (matching `smart_fill_form`) and points ARIA comboboxes to `smart_fill_form` instead of failing inside Playwright.
+- Actions that open a popup return the registered tab ID as `newTab`.
+- Job-link tracking and editor telemetry POSTs do not trigger `possibleSubmit`, while real form submissions still report it.
+
+Tabs and isolation
+- Background tool targets keep rendering without activating or changing other tabs.
+- `TURBO_BROWSER_ISOLATE_HOSTS` opens matching hosts in isolated browser contexts.
+- Closing a tab in an isolated context succeeds when the default context still has one tab left.
 
 ## 0.7.1 (2026-11-18)
 

@@ -58,3 +58,18 @@ Same harness, host and prompts; only turbo-browser-mcp was run again. Changes si
 | total | 23 | 867,474 | 0.256 | 61.6 | 42 / 0.395 / 85.8 |
 
 All three passed. Still one trial per cell. The catalog run read the four result pages in one `batch_actions` call; the application run filled name, email and the upload in one `smart_fill_form` call but still chose the portaled Region list with three `act_fast` calls, and a second application run gave 9 turns, 0.096 USD, 26.2 s. The other stacks were not run again, so compare with their stage 1 numbers above with care. Records: [e2e-agent/results_claude_turbo_main.jsonl](e2e-agent/results_claude_turbo_main.jsonl).
+
+## turbo-browser-mcp 0.7.2 (20 Nov 2026)
+
+Same harness, model (`sonnet`), and prompts, running Claude Code 2.1.329 with stream-json transcripts enabled (`BENCH_TRANSCRIPT=1`).
+
+| Task | Success | Turns | Tool calls | Tokens | Output tokens | Cost (USD) | Seconds | 16 Nov `main` (turns / tokens / cost / s) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| application | yes | 10 | 9 | 227,216 | 1,198 | 0.079 | 24.7 | 10 / 341,204 / 0.092 / 21.2 |
+| catalog | yes | 6 | 5 | 157,407 | 1,714 | 0.075 | 21.5 | 6 / 237,960 / 0.084 / 21.7 |
+| booking | yes | 7 | 6 | 190,786 | 870 | 0.068 | 30.3 | 7 / 288,310 / 0.080 / 18.7 |
+| total | 3/3 | 23 | 20 | 575,409 | 3,782 | 0.223 | 76.5 | 23 / 867,474 / 0.256 / 61.6 |
+
+All three tasks passed in 23 turns and 3,782 output tokens (compared with 23 turns and 3,822 output tokens on 16 Nov `main`). Total tokens fell 33.7% (575,409 vs 867,474) and cost fell 13.0% ($0.223 vs $0.256). Transcripts show Claude Code 2.1.329 ran one `ToolSearch` call per task (`10,403` to `11,385` cache-creation tokens), keeping base prompt schemas smaller across turns.
+
+This remains one trial per cell. In `application`, `smart_fill_form` filled name, email, and the PDF upload, followed by five `act_fast` calls for the portaled Region list, review, and submit. `catalog` read all four result pages across two `batch_actions` calls. `booking` used `smart_fill_form` plus two `act_fast` calls; host and model turn latency accounted for the 30.3s wall time (up from 18.7s). Records: [e2e-agent/results_claude_v072.jsonl](e2e-agent/results_claude_v072.jsonl).
