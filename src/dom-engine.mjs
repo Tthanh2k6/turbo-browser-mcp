@@ -407,13 +407,25 @@ function computeElementFingerprintInBrowser(el) {
     const treeRoot = el.getRootNode();
     const clones = treeRoot.querySelectorAll ? Array.from(treeRoot.querySelectorAll(tag)).filter((node) => node === el ||
       (same(node, 'name') && same(node, 'id') && same(node, 'type') && same(node, 'role') && identityOf(node) === identity)) : [];
+    function ownerOf(node) {
+      if (!node) return '';
+      const map = window.__tbmOwners || (window.__tbmOwners = new WeakMap());
+      let id = map.get(node);
+      if (!id) map.set(node, id = (window.__tbmOwnerSeq = (window.__tbmOwnerSeq || 0) + 1));
+      return id;
+    }
+    const group = el.closest?.('fieldset, tr, [role="group"], [role="row"], [role="listitem"]');
     if (clones.length > 1) {
       for (let container = el.parentNode; container; container = container.parentNode) {
         const inside = clones.filter((node) => container.contains(node));
-        if (inside.length > 1) return '#id:' + identity + '\u0000#index:' + inside.indexOf(el) + '/' + inside.length;
+        if (inside.length > 1) {
+          const owner = group || container.tagName !== 'FORM' ? `\u0000#owner:${ownerOf(group)}:${ownerOf(container)}` : '';
+          return '#id:' + identity + owner + '\u0000#index:' + inside.indexOf(el) + '/' + inside.length;
+        }
       }
     }
-    return '#id:' + identity;
+    const owner = group ? `\u0000#owner:${ownerOf(group)}:` : '';
+    return '#id:' + identity + owner;
   }
   return '#text:' + String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128);
 }
@@ -2304,13 +2316,25 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
               const treeRoot = el.getRootNode();
               const clones = treeRoot.querySelectorAll ? Array.from(treeRoot.querySelectorAll(tag)).filter((node) => node === el ||
                 (same(node, 'name') && same(node, 'id') && same(node, 'type') && same(node, 'role') && identityOf(node) === identity)) : [];
+              function ownerOf(node) {
+                if (!node) return '';
+                const map = window.__tbmOwners || (window.__tbmOwners = new WeakMap());
+                let id = map.get(node);
+                if (!id) map.set(node, id = (window.__tbmOwnerSeq = (window.__tbmOwnerSeq || 0) + 1));
+                return id;
+              }
+              const group = el.closest?.('fieldset, tr, [role="group"], [role="row"], [role="listitem"]');
               if (clones.length > 1) {
                 for (let container = el.parentNode; container; container = container.parentNode) {
                   const inside = clones.filter((node) => container.contains(node));
-                  if (inside.length > 1) return '#id:' + identity + '\u0000#index:' + inside.indexOf(el) + '/' + inside.length;
+                  if (inside.length > 1) {
+                    const owner = group || container.tagName !== 'FORM' ? `\u0000#owner:${ownerOf(group)}:${ownerOf(container)}` : '';
+                    return '#id:' + identity + owner + '\u0000#index:' + inside.indexOf(el) + '/' + inside.length;
+                  }
                 }
               }
-              return '#id:' + identity;
+              const owner = group ? `\u0000#owner:${ownerOf(group)}:` : '';
+              return '#id:' + identity + owner;
             }
             return '#text:' + String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128);
           };
@@ -3126,13 +3150,25 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                 const treeRoot = el.getRootNode();
                 const clones = treeRoot.querySelectorAll ? Array.from(treeRoot.querySelectorAll(tag)).filter((node) => node === el ||
                   (same(node, 'name') && same(node, 'id') && same(node, 'type') && same(node, 'role') && identityOf(node) === identity)) : [];
+                function ownerOf(node) {
+                  if (!node) return '';
+                  const map = window.__tbmOwners || (window.__tbmOwners = new WeakMap());
+                  let id = map.get(node);
+                  if (!id) map.set(node, id = (window.__tbmOwnerSeq = (window.__tbmOwnerSeq || 0) + 1));
+                  return id;
+                }
+                const group = el.closest?.('fieldset, tr, [role="group"], [role="row"], [role="listitem"]');
                 if (clones.length > 1) {
                   for (let container = el.parentNode; container; container = container.parentNode) {
                     const inside = clones.filter((node) => container.contains(node));
-                    if (inside.length > 1) return '#id:' + identity + '\u0000#index:' + inside.indexOf(el) + '/' + inside.length;
+                    if (inside.length > 1) {
+                      const owner = group || container.tagName !== 'FORM' ? `\u0000#owner:${ownerOf(group)}:${ownerOf(container)}` : '';
+                      return '#id:' + identity + owner + '\u0000#index:' + inside.indexOf(el) + '/' + inside.length;
+                    }
                   }
                 }
-                return '#id:' + identity;
+                const owner = group ? `\u0000#owner:${ownerOf(group)}:` : '';
+                return '#id:' + identity + owner;
               }
               return '#text:' + String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128);
             };

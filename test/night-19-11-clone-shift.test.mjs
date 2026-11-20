@@ -150,4 +150,46 @@ describe('night 19-11: clone group size shifts vs swaps', () => {
       ['b:kept-b', 'a:kept-a', 'c:ok-c']
     );
   });
+
+  it('rejects old refs when an input moves across fieldsets or remove-plus-append keeps total/per-parent size unchanged', async () => {
+    const sec = (n) => `<fieldset class="sec" data-n="${n}"><div class="row"><input aria-label="Phone" value="kept-${n}"></div></fieldset>`;
+    await page.setContent(`<form>${sec('a')}${sec('b')}${sec('c')}</form>`);
+    await inspectCompact(page, {}, new Set());
+    const refs = await refsForInputs(3);
+    // Pull the Phone input out of fieldset A and move it into fieldset B (replacing B's input while appending a fresh one to C),
+    // so both total count (3) and per-parent size (1) stay unchanged and refs[0] is still at index 0/3 in <form>.
+    await page.evaluate(() => {
+      const [a, b, c] = document.querySelectorAll('.sec');
+      const inputA = a.querySelector('input');
+      b.querySelector('input').replaceWith(inputA);
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.innerHTML = '<input aria-label="Phone" value="fresh">';
+      c.after( Object.assign(document.createElement('fieldset'), { className: 'sec' }) );
+      c.nextElementSibling.dataset.n = 'd';
+      c.nextElementSibling.appendChild(row);
+    });
+
+    await assert.rejects(actFast(page, { action: 'fill', ref: refs[0], value: 'wrong' }), /now points to a different field/);
+    await assert.rejects(smartFillForm(page, { fields: [{ ref: refs[0], value: 'wrong' }] }), /now points to a different field/);
+
+    // Also test pulling the input out of fieldset A and appending an equivalent one to fieldset B in the same tick.
+    await page.setContent(`<form>${sec('a')}${sec('b')}${sec('c')}</form>`);
+    await inspectCompact(page, {}, new Set());
+    const refs2 = await refsForInputs(3);
+    await page.evaluate(() => {
+      const [a, b] = document.querySelectorAll('.sec');
+      a.querySelector('.row').remove();
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.innerHTML = '<input aria-label="Phone" value="appended-b">';
+      b.appendChild(row);
+    });
+
+    await assert.rejects(actFast(page, { action: 'fill', ref: refs2[1], value: 'wrong' }), /now points to a different field/);
+    await assert.rejects(smartFillForm(page, { fields: [{ ref: refs2[1], value: 'wrong' }] }), /now points to a different field/);
+    await actFast(page, { action: 'fill', ref: refs2[2], value: 'ok-c' });
+    assert.equal(await page.locator('fieldset[data-n="b"] input').first().inputValue(), 'kept-b');
+    assert.equal(await page.locator('fieldset[data-n="c"] input').inputValue(), 'ok-c');
+  });
 });
