@@ -129,4 +129,25 @@ describe('night 19-11: clone group size shifts vs swaps', () => {
       ['b:s3,s4,s5', 'a:s0,s1,s2']
     );
   });
+
+  it('rejects old refs as stale when three 1-row clone fieldsets reorder inside the form (flipped distribution)', async () => {
+    const sec = (n) => `<fieldset class="sec" data-n="${n}"><div class="row"><input aria-label="Phone" value="kept-${n}"></div></fieldset>`;
+    await page.setContent(`<form>${sec('a')}${sec('b')}${sec('c')}</form>`);
+    await inspectCompact(page, {}, new Set());
+    const refs = await refsForInputs(3);
+    await page.evaluate(() => {
+      const [a, b] = document.querySelectorAll('.sec');
+      a.parentNode.insertBefore(b, a);
+    });
+
+    for (const ref of [refs[0], refs[1]]) {
+      await assert.rejects(actFast(page, { action: 'fill', ref, value: 'wrong' }), /now points to a different field/);
+      await assert.rejects(smartFillForm(page, { fields: [{ ref, value: 'wrong' }] }), /now points to a different field/);
+    }
+    await actFast(page, { action: 'fill', ref: refs[2], value: 'ok-c' });
+    assert.deepEqual(
+      await page.locator('fieldset').evaluateAll((fs) => fs.map((f) => f.dataset.n + ':' + f.querySelector('input').value)),
+      ['b:kept-b', 'a:kept-a', 'c:ok-c']
+    );
+  });
 });
