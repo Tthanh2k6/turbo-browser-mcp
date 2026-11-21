@@ -387,7 +387,7 @@ CI runs the tests on Ubuntu with Node 20 and 22.
 
 ## Credits
 
-Several features came from readers of the Show HN post and the dev.to article: johnnylemonny and alexcodebytes (portaled and virtualized selects), eye_java_420f1faa10ae8b86 (keyboard selection and click aftermath), amintacccp (safe submit labels), snake_doc and lukevp (end-to-end comparison, level of abstraction), vidarh (human hand-off), harrysong138759 (receipt verification and duplicate submissions), and Renhua Wei / dafili ([clone-group reorder and WeakMap owner checks](https://dev.to/tthanh2k6/building-a-faster-playwright-mcp-server-compact-dom-deltas-1-turn-form-filling-and-submit-guards-2o2p#comment-3ldfc)).
+Several features came from readers of the Show HN post and the dev.to article: johnnylemonny and alexcodebytes (portaled and virtualized selects), eye_java_420f1faa10ae8b86 (keyboard selection and click aftermath), amintacccp (safe submit labels), snake_doc and lukevp (end-to-end comparison, level of abstraction), vidarh (human hand-off), harrysong138759 (receipt verification and duplicate submissions), and Renhua Wei / dafili ([clone-group reorder and WeakMap owner checks](https://dev.to/tthanh2k6/building-a-faster-playwright-mcp-server-compact-dom-deltas-1-turn-form-filling-and-submit-guards-2o2p#comment-3l9pn)).
 
 ## License
 
