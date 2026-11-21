@@ -226,7 +226,7 @@ The tool definitions are sent to the model on every turn. `npm run benchmark` pr
 
 Every stack passed every task. turbo-browser-mcp had the lowest total time and browse the lowest cost. One trial per cell cannot rank them, and headless and headed browsers are not equally fast. The application task took turbo-browser-mcp 23 turns, the most of any trial. The transcript showed why: the agent filled each field with a separate `act_fast` call, and `smart_fill_form` could not pick an option that sat behind the list's own search box.
 
-The unreleased `main` branch steers the agent to `smart_fill_form` and was run once more with the same harness: 23 turns, 0.256 USD and 61.6 s in total, down from 42 turns, 0.395 USD and 85.8 s. Still one trial per cell, and the other stacks were not run again. The search-box fix for `smart_fill_form` landed after that run and has not been measured yet. Per-task numbers, how tokens are counted, and the harness fixes made during the run are in [`benchmarks/E2E_RESULTS.md`](benchmarks/E2E_RESULTS.md).
+The `0.7.2` release steers the agent to `smart_fill_form` and was measured with the same harness and `sonnet` model (Claude Code 2.1.329, `BENCH_TRANSCRIPT=1`, 20 Nov 2026): 3/3 passed in 23 turns, 20 tool calls, 575,409 total tokens (3,782 output), 0.223 USD, and 76.5 s (down from 42 turns and 0.395 USD on `0.6.1`, and 867,474 tokens / 0.256 USD on 16 Nov `main`). Still one trial per cell, and the other stacks were not run again. Per-task numbers, how tokens are counted, and the harness fixes made during the run are in [`benchmarks/E2E_RESULTS.md`](benchmarks/E2E_RESULTS.md).
 
 When to keep `chrome-devtools-mcp` as well: it offers Lighthouse audits, performance traces and heap snapshots, which turbo-browser-mcp does not.
 
@@ -316,6 +316,7 @@ This reports an action that has already happened. It cannot prevent a commit or 
 | `--allow-hosts <a,b>` | `TURBO_BROWSER_ALLOW_HOSTS` | unset | Only navigate to these hosts and their subdomains (see [Restricting navigation](#restricting-navigation)) |
 | `--allow-origins <o,o>` | `TURBO_BROWSER_ALLOW_ORIGINS` | unset | Only navigate to these exact origins; combined with the hosts list when both are set |
 | `--allow-strict` | `TURBO_BROWSER_ALLOW_STRICT` | `false` | With an allowlist, also block sub-resource requests to other hosts |
+| - | `TURBO_BROWSER_ISOLATE_HOSTS` | `""` | Comma-separated hosts (and subdomains) that open in fresh isolated browser contexts |
 | `--secrets <file>` | `TURBO_BROWSER_SECRETS_FILE` | unset | dotenv file of secrets for `$secret:NAME` placeholders (see [Secrets](#secrets)) |
 | `--content-boundaries` | `TURBO_BROWSER_CONTENT_BOUNDARIES` | `false` | Wrap page-sourced text in `<<page:nonce>>` markers (see [Content boundaries](#content-boundaries)) |
 | `--print-skill` | - | - | Print the bundled `SKILL.md` for this version |
