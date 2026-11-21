@@ -3,7 +3,7 @@
 ## 0.7.2 (2026-11-20)
 
 Refs
-- Cloned fields reject stale refs when swapped inside an unchanged group, and WeakMap owner IDs on enclosing groups and clone containers keep distinct sections separate across reorders.
+- Cloned fields reject stale refs when swapped inside an unchanged group, and WeakMap owner IDs on enclosing groups and clone containers keep distinct sections separate across reorders (thanks to Renhua Wei / `@dafili` for the [review thread](https://dev.to/tthanh2k6/building-a-faster-playwright-mcp-server-compact-dom-deltas-1-turn-form-filling-and-submit-guards-2o2p#comment-3ldfc)).
 - Live counters in field labels, placeholders, and titles stay masked, and accesskey hints appended to `title` after load (`[f]` to `[alt-f]` on Wikipedia) stay ignored in field fingerprints.
 - Adding or removing a cloned row keeps refs to untouched clones valid and returns `note: "clone group for <ref> changed size (3 -> 2)"`; swaps inside an unchanged group still fail.
 
