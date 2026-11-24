@@ -4,6 +4,7 @@ Thumbs.db
 *.log
 *.tmp
 tmp/
+docs/
 .env
 .env.*
 coverage/
