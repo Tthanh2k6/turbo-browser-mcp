@@ -154,17 +154,26 @@ function textNewNeedles(textNew) {
 // In-page scan shared by arm (init=true: remember every element already showing the text) and check.
 function textNewScan([ns, k, init]) {
   // After a full navigation the remembered set is gone: everything on the new page counts as new.
-  const seen = init ? (window[k] = new WeakSet()) : window[k] || new WeakSet();
+  const seen = init ? (window[k] = new WeakMap()) : window[k] || new WeakMap();
+  const EDITABLE_SEL =
+    'input, textarea, [contenteditable="true"], [contenteditable=""], [contenteditable="plaintext-only"]';
+  const BLOCK_DESC_SEL =
+    'div, p, li, ul, ol, table, tr, section, article, main, form, header, footer, nav, aside, blockquote, pre, h1, h2, h3, h4, h5, h6';
   for (const el of document.querySelectorAll('body *')) {
+    if (el.isContentEditable || el.closest?.(EDITABLE_SEL)) continue;
     let own = '';
     for (const n of el.childNodes) if (n.nodeType === 3) own += n.nodeValue + ' ';
-    own = own.toLowerCase();
-    const hit = ns.find((x) => own.includes(x));
+    own = own.replace(/\s+/g, ' ').trim().toLowerCase();
+    const inlineFull = !el.querySelector(BLOCK_DESC_SEL)
+      ? (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase()
+      : '';
+    const hit = ns.find((x) => own.includes(x) || (inlineFull && inlineFull.includes(x)));
     if (!hit) continue;
     const r = el.getBoundingClientRect();
     if (!(r.width > 0 && r.height > 0) || getComputedStyle(el).visibility === 'hidden') continue;
-    if (init) seen.add(el);
-    else if (!seen.has(el)) return hit;
+    const sig = inlineFull || own;
+    if (init) seen.set(el, sig);
+    else if (!seen.has(el) || seen.get(el) !== sig) return hit;
   }
   return '';
 }

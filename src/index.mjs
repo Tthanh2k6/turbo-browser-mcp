@@ -28,6 +28,7 @@ import {
   inspectCompact,
   smartFillFormGuarded,
 } from './dom-engine.mjs';
+import * as domEngine from './dom-engine.mjs';
 import { takeLate } from './aftermath.mjs';
 import { getPolicy, takeBlocked } from './allow-hosts.mjs';
 import { waitForHuman } from './guards.mjs';
@@ -101,11 +102,10 @@ export const TOOL_DEFINITIONS = [
       properties: {
         includeTabs: {
           type: 'boolean',
-          description: 'true always returns the tab list; false never does. Default: only when listed, tabs closed/opened in bulk, or unexpectedly changed.',
+          description: 'true forces the tab list on; false off.',
         },
         operations: {
           type: 'array',
-          description: 'List of tab operations executed in order.',
           items: {
             type: 'object',
             properties: {
@@ -130,19 +130,17 @@ export const TOOL_DEFINITIONS = [
               urls: {
                 type: 'array',
                 items: { type: 'string' },
-                description: 'URLs for parallel open_many action.',
               },
               concurrency: {
                 type: 'integer',
                 default: 5,
-                description: 'Max concurrent tabs opened per batch for open_many (1-10).',
               },
               tabId: { type: 'integer' },
-              force: { type: 'boolean', description: 'close: allow closing the last tab of an attached browser (this closes the browser).' },
+              force: { type: 'boolean', description: 'close: allow closing the last attached tab (closes browser).' },
               activate: { type: 'boolean' },
               isolatedContext: {
                 type: 'string',
-                description: 'Optional isolated context name for open action (separate cookies/storage).',
+                description: 'Separate cookies/storage context name for open.',
               },
               width: { type: 'integer' },
               height: { type: 'integer' },
@@ -164,6 +162,10 @@ export const TOOL_DEFINITIONS = [
             },
           },
         },
+        returnSnapshot: { type: 'boolean', default: false },
+        snapshotMode: { type: 'string', enum: ['interactive', 'forms', 'article', 'all'] },
+        snapshotMaxChars: { type: 'integer', default: 2500 },
+        snapshotQuery: { type: 'string' },
       },
     },
   },
@@ -239,7 +241,10 @@ export const TOOL_DEFINITIONS = [
                 items: { type: 'string' },
                 description: 'Multiple option values/patterns for <select multiple>.',
               },
-              option: { oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }] },
+              option: {
+                oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+                description: 'Option text/value for <select> or role=combobox.',
+              },
               check: {
                 oneOf: [{ type: 'string' }, { type: 'boolean' }, { type: 'array', items: { type: 'string' } }],
                 description: 'true/false sets a checkbox/radio; label(s) check matching options.',
@@ -639,12 +644,17 @@ ${res.text}`;
       }
     }
   }
+  const degraded = manager.degradedReason || '';
+  if (degraded && res && typeof res.text === 'string' && !res.text.includes('"degraded":')) {
+    res.text = res.text.startsWith('{')
+      ? `{"degraded":${JSON.stringify(degraded)}${res.text[1] === '}' ? '' : ','}${res.text.slice(1)}`
+      : `degraded: ${degraded}\n${res.text}`;
+  }
   const note = typeof manager.takeConnectionNote === 'function' ? manager.takeConnectionNote() : '';
   if (note && res && typeof res.text === 'string') {
     res.text = res.text.startsWith('{')
       ? `{"connectionNote":${JSON.stringify(note)}${res.text[1] === '}' ? '' : ','}${res.text.slice(1)}`
-      : `connectionNote: ${note}
-${res.text}`;
+      : `connectionNote: ${note}\n${res.text}`;
   }
   return res;
 }
@@ -654,6 +664,24 @@ async function dispatchToolCallInner(manager, name, rawArgs = {}) {
   switch (name) {
     case 'tabs_batch': {
       const res = await manager.tabsBatch(args.operations || [], { includeTabs: args.includeTabs });
+      if (args.returnSnapshot && res.activeTabId !== null && res.activeTabId !== undefined && manager.tabs?.has?.(res.activeTabId)) {
+        const page = manager.tabs.get(res.activeTabId);
+        if (page && !page.isClosed()) {
+          const snapFn = domEngine.snapshotAfterAction || inspectCompact;
+          const snap = await snapFn(
+            page,
+            {
+              mode: args.snapshotMode || 'interactive',
+              maxChars: args.snapshotMaxChars || 2500,
+              query: args.snapshotQuery,
+              afterNavOrSubmit: true,
+            },
+            manager.getSnapshotState(page)
+          );
+          res.snapshot = snap.snapshot !== undefined ? snap.snapshot : wrapPage(snap.text);
+          if (snap.pageText) res.pageText = snap.pageText;
+        }
+      }
       return { text: JSON.stringify(res) };
     }
     case 'inspect_compact': {

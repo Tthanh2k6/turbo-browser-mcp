@@ -122,6 +122,7 @@ export class BrowserManager {
     this.diagnostics = new WeakMap();
     this.tempDownloadFiles = new Set();
     this.connectionNote = '';
+    this.degradedReason = '';
     this.bridgePort = options.bridgePort;
     this.cdpAutoTimeoutMs = options.cdpAutoTimeoutMs;
     this.bridgeRetryMs = options.bridgeRetryMs;
@@ -306,12 +307,18 @@ export class BrowserManager {
 
     if (bridgeLost && this.connectionType !== 'cdp') {
       this.connectionNote = `Chrome remote debugging is no longer available (bridge upstream closed); using ${this.headless ? 'a headless' : 'a separate'} browser. Logged-in sites will not be available.`;
+      this.degradedReason = 'headless-fallback';
     } else if (this.connectionNote && this.connectionType !== 'cdp') {
       this.connectionNote = `${this.connectionType} fallback (${this.connectionNote})`;
+      this.degradedReason = 'headless-fallback';
     } else if (this._lostCdp && this.connectionType !== 'cdp') {
       this.connectionNote = `The attached Chrome is gone (closed or disconnected); using ${this.headless ? 'a headless' : 'a separate'} ${this.connectionType} browser. Logged-in sites will not be available.`;
+      this.degradedReason = 'headless-fallback';
     }
-    if (this.connectionType === 'cdp') this._lostCdp = false;
+    if (this.connectionType === 'cdp') {
+      this._lostCdp = false;
+      this.degradedReason = '';
+    }
 
     const currentBrowser = this.browser;
     const currentContext = this.context;

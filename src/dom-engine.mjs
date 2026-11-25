@@ -753,7 +753,7 @@ function conciseActionError(err) {
  * Resolve a compact ref (f0:e3 / e3), CSS/Playwright selector (piercing open Shadow DOM),
  * or text match across frames.
  */
-export async function resolveTarget(page, { ref, selector, text, frameIdx, allowHidden: paramAllowHidden } = {}, options = {}) {
+export async function resolveTarget(page, { ref, selector, text, label, action, frameIdx, allowHidden: paramAllowHidden } = {}, options = {}) {
   const allowHidden = Boolean(options.allowHidden ?? paramAllowHidden);
   const frames = getAllFrames(page);
   if (frames.length === 0) {
@@ -873,6 +873,37 @@ export async function resolveTarget(page, { ref, selector, text, frameIdx, allow
       if (fallback) return fallback;
     }
     throw new Error(`Text "${text}" matched 0 elements across ${scopedFrames.length} frame(s).`);
+  }
+
+  const labelStr = action !== 'select' && typeof label === 'string' ? label.trim() : '';
+  if (labelStr) {
+    let fallback = null;
+    for (const f of scopedFrames) {
+      const allLoc = f.frame.getByLabel(labelStr);
+      const picked = await pickBestLocator(allLoc, allowHidden);
+      if (picked) {
+        const res = { frame: f.frame, frameIdx: f.frameIdx, locator: picked.locator };
+        if (picked.visible) return res;
+        if (!fallback) fallback = res;
+      }
+    }
+    if (fallback) return fallback;
+    const q = labelStr.replace(/["\\\n]/g, (c) => (c === '\n' ? ' ' : '\\' + c));
+    for (const attrSel of [`[placeholder="${q}" i]`, `[placeholder*="${q}" i]`, `[aria-label="${q}" i]`, `[aria-label*="${q}" i]`, `[title="${q}" i]`]) {
+      for (const f of scopedFrames) {
+        let picked = null;
+        try {
+          picked = await pickBestLocator(f.frame.locator(attrSel), allowHidden);
+        } catch {}
+        if (picked) {
+          const res = { frame: f.frame, frameIdx: f.frameIdx, locator: picked.locator };
+          if (picked.visible) return res;
+          if (!fallback) fallback = res;
+        }
+      }
+      if (fallback) return fallback;
+    }
+    throw new Error(`Label "${labelStr}" matched 0 elements across ${scopedFrames.length} frame(s).`);
   }
 
   throw new Error('Target requires ref, selector, or text.');
@@ -2214,11 +2245,11 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
 
           const selectorByMode = {
             interactive:
-              'a[href], button, input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="link"], [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], [role="switch"], [role="tab"], [role="menuitem"], [role="option"], summary',
+              'a[href], button, input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="link"], [role="textbox"], [role="combobox"], [aria-haspopup="listbox"], [role="radio"], [role="checkbox"], [role="switch"], [role="tab"], [role="menuitem"], [role="option"], summary',
             forms:
-              'input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], [role="switch"], button, [role="button"], [role="option"]',
+              'input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="combobox"], [aria-haspopup="listbox"], [role="radio"], [role="checkbox"], [role="switch"], button, [role="button"], [role="option"]',
             article: 'h1, h2, h3, h4, p, li, a[href], button',
-            all: 'h1, h2, h3, a[href], button, input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="textbox"], [role="combobox"], [role="radio"], [role="checkbox"], [role="switch"], p',
+            all: 'h1, h2, h3, a[href], button, input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="textbox"], [role="combobox"], [aria-haspopup="listbox"], [role="radio"], [role="checkbox"], [role="switch"], p',
           };
 
           const sel = (selectorByMode[modeArg] || selectorByMode.interactive) + (queryArg ? ', [role="row"]' : '');
@@ -2363,9 +2394,10 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
             }
 
             const role = el.getAttribute('role');
+            const hasListboxPopup = (el.getAttribute('aria-haspopup') || '').toLowerCase() === 'listbox';
             const type = el.getAttribute('type') || '';
             const isComboInput =
-              tag === 'input' && (role === 'combobox' || Boolean(el.getAttribute('aria-autocomplete')));
+              tag === 'input' && (role === 'combobox' || hasListboxPopup || Boolean(el.getAttribute('aria-autocomplete')));
             const kind = isComboInput
               ? 'input:combobox'
               : tag === 'input'
@@ -2374,7 +2406,9 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
                 ? `${tag}:editable`
                 : role
                   ? `${tag}:${role}`
-                  : tag;
+                  : hasListboxPopup
+                    ? `${tag}:combobox`
+                    : tag;
 
             const rowText = role === 'row' ? (clean(el.getAttribute('aria-label')) || composedText(el)) : '';
             let lbl = rowText ? rowText.slice(0, 220) : labelFor(el);
@@ -2394,10 +2428,22 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
               if (type === 'checkbox' || type === 'radio') {
                 extra += el.checked ? ' [checked]' : '';
               } else if (type === 'file') {
+                if (el.files && el.files.length > 0) {
+                  const names = Array.from(el.files, (f) => f?.name || '').filter(Boolean);
+                  if (names.length > 0) {
+                    const fileSummary = names.length === 1 ? names[0] : `${names.length} files: ${names.join(', ')}`;
+                    extra += ` val="${clean(fileSummary).slice(0, 60)}"`;
+                  }
+                }
                 const style = getComputedStyle(el);
                 if (style.display === 'none' || Number(style.opacity) === 0) extra += ' [hidden-file]';
               } else if (el.value) {
                 extra += ` val="${clean(el.value).slice(0, 40)}"`;
+              }
+            } else if (role === 'combobox' || hasListboxPopup) {
+              const comboTxt = composedText(el) || clean(el.innerText || el.textContent);
+              if (comboTxt && comboTxt.toLowerCase() !== (lbl || '').toLowerCase()) {
+                extra += ` val="${comboTxt.slice(0, 40)}"`;
               }
             } else if (role === 'checkbox' || role === 'radio' || role === 'switch') {
               if (el.getAttribute('aria-checked') === 'true') extra += ' [checked]';
@@ -5723,16 +5769,69 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
   };
 
   if (spec.returnSnapshot) {
-    const snap = await inspectCompact(
+    const snap = await snapshotAfterAction(
       page,
-      { mode: spec.snapshotMode || 'forms', maxChars: spec.snapshotMaxChars || 2500, query: spec.snapshotQuery },
+      {
+        mode: spec.snapshotMode || 'forms',
+        maxChars: spec.snapshotMaxChars || 2500,
+        query: spec.snapshotQuery,
+        afterNavOrSubmit: spec.stopBeforeSubmit === false,
+      },
       previousLinesSet
     );
-    output.snapshot = wrapPage(snap.text);
+    output.snapshot = snap.snapshot;
+    if (snap.pageText) output.pageText = snap.pageText;
     output.elapsedMs = Date.now() - t0;
   }
 
   return output;
+}
+
+/**
+ * Run inspectCompact after an action or tabs_batch; when in interactive mode (or 0 elements found)
+ * and the page has 0 interactive elements (or < 2 buttons after navigation/submit), automatically
+ * extract up to 800 chars of compact main/body text so receipt pages need no extra extract turn.
+ */
+export async function snapshotAfterAction(page, options = {}, previousLinesSet = null) {
+  const mode = options.mode || 'interactive';
+  const maxChars = options.maxChars || 2500;
+  const query = options.query;
+  const snap = await inspectCompact(page, { mode, maxChars, query }, previousLinesSet);
+  const afterNavOrSubmit = options.afterNavOrSubmit !== false;
+  let pageText = '';
+  if ((mode === 'interactive' || snap.totalInteractive === 0) && !query) {
+    let buttonCount = 0;
+    for (const line of (snap.text || '').split('\n')) {
+      const m = /^\*?\[f\d+:e\d+\] <([^>]+)> /.exec(line);
+      if (m && /^(?:button(?::button)?|input:(?:submit|button|image)|[^>\s]+:button)$/i.test(m[1])) {
+        buttonCount++;
+      }
+    }
+    if (snap.totalInteractive === 0 || (mode === 'interactive' && afterNavOrSubmit && buttonCount < 2)) {
+      const rawText = await page
+        .evaluate(() => {
+          const root = document.querySelector('main, article, [role="main"]') || document.body;
+          if (!root) return '';
+          return (root.innerText || root.textContent || '')
+            .split('\n')
+            .map((l) => l.replace(/\s+/g, ' ').trim())
+            .filter(Boolean)
+            .join('\n')
+            .trim()
+            .slice(0, 800);
+        })
+        .catch(() => '');
+      if (rawText) {
+        pageText = wrapPage(rawText);
+        snap.text = `${snap.text.replace(/\s+$/, '')}\nPage text:\n${rawText}`;
+      }
+    }
+  }
+  return {
+    ...snap,
+    snapshot: wrapPage(snap.text),
+    ...(pageText ? { pageText } : {}),
+  };
 }
 
 /**
@@ -6081,6 +6180,60 @@ async function executeSingleAction(page, rawParams = {}) {
   return res;
 }
 
+function waitTextNewScan([ns, k, init, fresh]) {
+  // fresh: the document was just loaded by a navigation in this batch, so an empty baseline is the right one
+  // (this also covers a baseline write that was lost to a process swap).
+  if (fresh && !window[k]) {
+    window[k] = new WeakMap();
+    window[k + 't'] = '';
+  }
+  const seen = init ? (window[k] = new WeakMap()) : window[k];
+  if (!seen) return '';
+  if (init) window[k + 't'] = document.title;
+  // The page title counts too: text such as "Example Domain" can live only in <title>.
+  const title = (document.title || '').toLowerCase();
+  if (!init && title && document.title !== window[k + 't']) {
+    const th = ns.find((x) => title.includes(x));
+    if (th) return th;
+  }
+  const EDITABLE_SEL =
+    'input, textarea, [contenteditable="true"], [contenteditable=""], [contenteditable="plaintext-only"]';
+  const BLOCK_DESC_SEL =
+    'div, p, li, ul, ol, table, tr, section, article, main, form, header, footer, nav, aside, blockquote, pre, h1, h2, h3, h4, h5, h6';
+  for (const el of document.querySelectorAll('body *')) {
+    if (el.isContentEditable || el.closest?.(EDITABLE_SEL)) continue;
+    let own = '';
+    for (const n of el.childNodes) if (n.nodeType === 3) own += n.nodeValue + ' ';
+    own = own.replace(/\s+/g, ' ').trim().toLowerCase();
+    const inlineFull = !el.querySelector(BLOCK_DESC_SEL)
+      ? (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase()
+      : '';
+    const hit = ns.find((x) => own.includes(x) || (inlineFull && inlineFull.includes(x)));
+    if (!hit) continue;
+    const r = el.getBoundingClientRect();
+    if (!(r.width > 0 && r.height > 0) || getComputedStyle(el).visibility === 'hidden') continue;
+    const sig = inlineFull || own;
+    if (init) seen.set(el, sig);
+    else if (!seen.has(el) || seen.get(el) !== sig) return hit;
+  }
+  return '';
+}
+
+async function armWaitTextNew(page, textNew) {
+  const needles = String(textNew).split('|').map((x) => x.trim().toLowerCase()).filter(Boolean);
+  const key = '__tbmTN' + Math.random().toString(36).slice(2);
+  const frames = getAllFrames(page);
+  await Promise.all(frames.map((f) => f.frame.evaluate(waitTextNewScan, [needles, key, true, false]).catch(() => '')));
+  return key;
+}
+
+async function disarmWaitTextNew(page, key) {
+  if (!key) return;
+  for (const f of getAllFrames(page)) {
+    f.frame.evaluate((k) => { delete window[k]; delete window[k + 't']; }, key).catch(() => {});
+  }
+}
+
 async function executeSingleActionInner(page, params = {}, silentState = { count: 0 }) {
   const action = params.action;
   if (!action) throw new Error('act_fast requires action.');
@@ -6095,7 +6248,7 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
   }
 
   if (action === 'scroll') {
-    if (params.ref || params.selector || params.text) {
+    if (params.ref || params.selector || params.text || (typeof params.label === 'string' && params.label.trim())) {
       const target = await resolveTarget(page, params);
       if (target.note) silentState.note = target.note;
       await target.locator.scrollIntoViewIfNeeded({ timeout });
@@ -6141,51 +6294,26 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
       // Only text that appears after this step starts: elements already showing it are remembered and ignored.
       const needleOrig = String(params.textNew).split('|').map((x) => x.trim()).filter(Boolean);
       const needles = needleOrig.map((x) => x.toLowerCase());
-      const key = '__tbmTN' + Math.random().toString(36).slice(2);
-      const scan = ([ns, k, init, fresh]) => {
-        // fresh: the document was just loaded by a navigation in this batch, so an empty baseline is the right one
-        // (this also covers a baseline write that was lost to a process swap).
-        if (fresh && !window[k]) { window[k] = new WeakSet(); window[k + 't'] = ''; }
-        const seen = init ? (window[k] = new WeakSet()) : window[k];
-        if (!seen) return '';
-        if (init) window[k + 't'] = document.title;
-        // The page title counts too: text such as "Example Domain" can live only in <title>.
-        const title = (document.title || '').toLowerCase();
-        if (title && document.title !== window[k + 't']) {
-          const th = ns.find((x) => title.includes(x));
-          if (th) return th;
-        }
-        for (const el of document.querySelectorAll('body *')) {
-          let own = '';
-          for (const n of el.childNodes) if (n.nodeType === 3) own += n.nodeValue + ' ';
-          own = own.toLowerCase();
-          const hit = ns.find((x) => own.includes(x));
-          if (!hit) continue;
-          const r = el.getBoundingClientRect();
-          if (!(r.width > 0 && r.height > 0) || getComputedStyle(el).visibility === 'hidden') continue;
-          if (init) seen.add(el);
-          else if (!seen.has(el)) return hit;
-        }
-        return '';
-      };
+      const preKey = typeof params._textNewKey === 'string' ? params._textNewKey : '';
+      const key = preKey || ('__tbmTN' + Math.random().toString(36).slice(2));
       const frames = getAllFrames(page);
       if (params._freshDocument) {
         // Right after navigate/reload/back/forward in the same batch: everything on the new document is new.
-        await Promise.all(frames.map((f) => f.frame.evaluate((k) => { window[k] = new WeakSet(); window[k + 't'] = ''; }, key).catch(() => '')));
-      } else {
-        await Promise.all(frames.map((f) => f.frame.evaluate(scan, [needles, key, true, false]).catch(() => '')));
+        await Promise.all(frames.map((f) => f.frame.evaluate((k) => { window[k] = new WeakMap(); window[k + 't'] = ''; }, key).catch(() => '')));
+      } else if (!preKey) {
+        await Promise.all(frames.map((f) => f.frame.evaluate(waitTextNewScan, [needles, key, true, false]).catch(() => '')));
       }
       const deadline = Date.now() + timeout;
       try {
         while (Date.now() <= deadline) {
           for (const f of getAllFrames(page)) {
-            const hit = await f.frame.evaluate(scan, [needles, key, false, Boolean(params._freshDocument)]).catch(() => '');
+            const hit = await f.frame.evaluate(waitTextNewScan, [needles, key, false, Boolean(params._freshDocument || preKey)]).catch(() => '');
             if (hit) return { ok: true, action, waitedFor: params.textNew, ...(needles.length > 1 ? { matched: needleOrig[needles.indexOf(hit)] } : {}) };
           }
           await page.waitForTimeout(80);
         }
       } finally {
-        for (const f of getAllFrames(page)) f.frame.evaluate((k) => { delete window[k]; delete window[k + 't']; }, key).catch(() => {});
+        await disarmWaitTextNew(page, key);
       }
       throw new Error(`Timed out after ${timeout}ms waiting for new "${params.textNew}".`);
     }
@@ -6214,13 +6342,13 @@ async function executeSingleActionInner(page, params = {}, silentState = { count
       }
       throw new Error(`Timed out after ${timeout}ms waiting for "${params.textGone}" to disappear.`);
     }
-    if (params.ref) {
+    if (params.ref || (!params.selector && !params.text && typeof params.label === 'string' && params.label.trim())) {
       const target = await resolveTarget(page, params, {
         allowHidden: ['hidden', 'detached', 'attached'].includes(params.state),
       });
       if (target.note) silentState.note = target.note;
       await target.locator.waitFor({ state: params.state || 'visible', timeout });
-      return { ok: true, action, waitedFor: params.ref };
+      return { ok: true, action, waitedFor: params.ref || params.label };
     }
     if (params.selector || params.text) {
       const desiredState = params.state || 'visible';
@@ -6798,7 +6926,7 @@ ${el.value || ''}`.toLowerCase();
       keyParts.some(isSpacePart) ||
       rawKey === ' ';
     const hasCtrlOrMeta = keyParts.some((p) => /^(control|ctrl|meta|command|cmd|controlormeta)$/i.test(p.trim()));
-    if (params.ref || params.selector || params.text) {
+    if (params.ref || params.selector || params.text || (typeof params.label === 'string' && params.label.trim())) {
       target = await resolveTarget(page, params);
       if (target.note) silentState.note = target.note;
       let isSafeTargetPress = false;
@@ -7017,7 +7145,12 @@ ${el.value || ''}`.toLowerCase();
     return { ok: true, action, key: params.key };
   }
 
-  const hasTarget = Boolean(params.ref || params.selector || params.text);
+  const hasTarget = Boolean(
+    params.ref ||
+    params.selector ||
+    params.text ||
+    (action !== 'select' && typeof params.label === 'string' && params.label.trim())
+  );
   const hasCoords =
     params.x !== undefined &&
     params.x !== null &&
@@ -7795,12 +7928,23 @@ export async function actFast(page, params = {}, previousLinesSet = null) {
     await finishCommit(page, params, key, ledgerPath, res, tnKey);
   }
   if (params.returnSnapshot && !res.blocked) {
-    const snap = await inspectCompact(
+    const snap = await snapshotAfterAction(
       page,
-      { mode: params.snapshotMode || 'interactive', maxChars: params.snapshotMaxChars || 2500, query: params.snapshotQuery },
+      {
+        mode: params.snapshotMode || 'interactive',
+        maxChars: params.snapshotMaxChars || 2500,
+        query: params.snapshotQuery,
+        afterNavOrSubmit: Boolean(
+          allowSubmit ||
+          res.outcome ||
+          res.url ||
+          ['reload', 'back', 'forward'].includes(params.action)
+        ),
+      },
       previousLinesSet
     );
-    res.snapshot = wrapPage(snap.text);
+    res.snapshot = snap.snapshot;
+    if (snap.pageText) res.pageText = snap.pageText;
   }
   res.elapsedMs = Date.now() - t0;
   return res;
@@ -7859,6 +8003,11 @@ const BATCH_ACTIONS = new Set([
   'scroll', 'wait', 'upload', 'reload', 'back', 'forward',
 ]);
 
+const MUTATING_BATCH_ACTIONS = new Set([
+  'click', 'dblclick', 'press', 'fill', 'type', 'clear', 'smart_fill_form', 'fill_form',
+  'navigate', 'reload', 'back', 'forward', 'select', 'check', 'uncheck', 'upload', 'drop', 'drag',
+]);
+
 async function batchActionsCore(page, stepList, options, previousLinesSet, guardState) {
   const t0 = Date.now();
   const continueOnError = Boolean(options.continueOnError);
@@ -7866,106 +8015,136 @@ async function batchActionsCore(page, stepList, options, previousLinesSet, guard
   let lastNavBad = '';
   const results = [];
   let prevWasNav = false;
+  let pendingTextNewKey = '';
 
-  for (let i = 0; i < stepList.length; i++) {
-    const step = stepList[i];
-    const afterNav = prevWasNav;
-    prevWasNav = ['navigate', 'reload', 'back', 'forward'].includes(step?.action);
-    try {
-      if (!step || typeof step !== 'object') {
-        throw new Error('Invalid batch step: expected an action object.');
+  try {
+    for (let i = 0; i < stepList.length; i++) {
+      const step = stepList[i];
+      const afterNav = prevWasNav;
+      const isNavStep = ['navigate', 'reload', 'back', 'forward'].includes(step?.action);
+      prevWasNav = isNavStep;
+      const nextStep = stepList[i + 1];
+      if (pendingTextNewKey && !(step?.action === 'wait' && step?.textNew)) {
+        await disarmWaitTextNew(page, pendingTextNewKey);
+        pendingTextNewKey = '';
       }
-      let stepResult;
-      if (step.action === 'smart_fill_form' || step.action === 'fill_form') {
-        const effectiveStopBeforeSubmit =
-          options.allowSubmit === false
-            ? true
-            : step.stopBeforeSubmit !== undefined
-              ? Boolean(step.stopBeforeSubmit)
-              : !defaultAllowSubmit;
-        stepResult = await smartFillForm(
-          page,
-          { ...step, stopBeforeSubmit: effectiveStopBeforeSubmit },
-          previousLinesSet
-        );
-      } else if (step.action === 'navigate') {
-        if (!step.url) throw new Error('navigate requires url.');
-        const url = new URL(String(step.url), page.url());
-        if (!['http:', 'https:'].includes(url.protocol)) {
-          throw new Error('navigate requires an HTTP(S) URL.');
+      if (
+        !isNavStep &&
+        MUTATING_BATCH_ACTIONS.has(step?.action) &&
+        nextStep &&
+        nextStep.action === 'wait' &&
+        nextStep.textNew
+      ) {
+        pendingTextNewKey = await armWaitTextNew(page, nextStep.textNew);
+      }
+      try {
+        if (!step || typeof step !== 'object') {
+          throw new Error('Invalid batch step: expected an action object.');
         }
-        if ((step.method !== undefined && String(step.method).toUpperCase() !== 'GET') ||
-            step.body !== undefined || step.postData !== undefined) {
-          throw new Error('navigate supports GET only, without a request body.');
+        let stepResult;
+        if (step.action === 'smart_fill_form' || step.action === 'fill_form') {
+          const effectiveStopBeforeSubmit =
+            options.allowSubmit === false
+              ? true
+              : step.stopBeforeSubmit !== undefined
+                ? Boolean(step.stopBeforeSubmit)
+                : !defaultAllowSubmit;
+          stepResult = await smartFillForm(
+            page,
+            { ...step, stopBeforeSubmit: effectiveStopBeforeSubmit },
+            previousLinesSet
+          );
+        } else if (step.action === 'navigate') {
+          if (!step.url) throw new Error('navigate requires url.');
+          const rawUrl = String(step.url).trim();
+          const isBlank = rawUrl.toLowerCase() === 'about:blank';
+          const url = isBlank ? new URL('about:blank') : new URL(rawUrl, page.url());
+          if (!isBlank && !['http:', 'https:'].includes(url.protocol)) {
+            throw new Error('navigate requires an HTTP(S) URL.');
+          }
+          if ((step.method !== undefined && String(step.method).toUpperCase() !== 'GET') ||
+              step.body !== undefined || step.postData !== undefined) {
+            throw new Error('navigate supports GET only, without a request body.');
+          }
+          if (!isBlank) {
+            const denied = urlDenial(url.href);
+            if (denied) throw new Error(denied);
+          }
+          let navResp, navRetried;
+          try {
+            ({ resp: navResp, retried: navRetried } = await gotoRetry(page, url.href, {
+              waitUntil: 'domcontentloaded', timeout: Number(step.timeoutMs) || DEFAULT_TIMEOUT_MS,
+            }));
+          } catch (navErr) {
+            // A redirect to a disallowed host: the record stays on the page so the tool result reports it once.
+            const stopped = peekBlocked(page);
+            if (stopped) throw new Error(denyMessage(matchUrl(stopped.url, getPolicy())));
+            throw navErr;
+          }
+          const navTitle = await page.title().catch(() => '');
+          stepResult = { ok: true, action: 'navigate', url: page.url(), ...(navRetried ? { retried: navRetried } : {}), ...(await navHealth(page, navResp, url.href, navTitle)) };
+          lastNavBad = stepResult.blocked ? `page blocked (${stepResult.blocked})` : stepResult.status >= 400 ? `page status ${stepResult.status}` : '';
+        } else if (step.action === 'extract') {
+          stepResult = await extractCleanText(page, step);
+          if (boundariesEnabled() && typeof stepResult.text === 'string') stepResult.text = wrapPage(stepResult.text);
+        } else if (step.action === 'collect') {
+          stepResult = await collectItems(page, step);
+          if (boundariesEnabled() && Array.isArray(stepResult.items)) {
+            stepResult.items = stepResult.items.map((it) => (typeof it === 'string' ? wrapPage(it) : it && typeof it.text === 'string' ? { ...it, text: wrapPage(it.text) } : it));
+          }
+          if (lastNavBad) stepResult.note = lastNavBad + (stepResult.note ? `; ${stepResult.note}` : '');
+        } else {
+          if (step.action && !BATCH_ACTIONS.has(step.action)) throw new Error(`unknown batch action: ${step.action}`);
+          lastNavBad = '';
+          const stepAllowSubmit =
+            options.allowSubmit === false ? false : resolveAllowSubmit(step.allowSubmit ?? defaultAllowSubmit);
+          const preWaitKey = step.action === 'wait' && step.textNew ? pendingTextNewKey : '';
+          if (preWaitKey) pendingTextNewKey = '';
+          stepResult = await executeSingleAction(page, {
+            ...step,
+            ...(afterNav && step.action === 'wait' && step.textNew ? { _freshDocument: true } : {}),
+            ...(preWaitKey ? { _textNewKey: preWaitKey } : {}),
+            returnSnapshot: options.returnSnapshot || step.returnSnapshot,
+            observeAftermath: step.observeAftermath ?? options.observeAftermath,
+            _registerPopup: options._registerPopup,
+            allowSubmit: stepAllowSubmit,
+          });
         }
-        const denied = urlDenial(url.href);
-        if (denied) throw new Error(denied);
-        let navResp, navRetried;
-        try {
-          ({ resp: navResp, retried: navRetried } = await gotoRetry(page, url.href, {
-            waitUntil: 'domcontentloaded', timeout: Number(step.timeoutMs) || DEFAULT_TIMEOUT_MS,
-          }));
-        } catch (navErr) {
-          // A redirect to a disallowed host: the record stays on the page so the tool result reports it once.
-          const stopped = peekBlocked(page);
-          if (stopped) throw new Error(denyMessage(matchUrl(stopped.url, getPolicy())));
-          throw navErr;
+        tagBlockedBy(stepResult);
+        const g = guardState?.guard;
+        if (g) await g.settleStep();
+        if (g && g.blocked.length > guardState.seen) {
+          applyNetworkBlock(stepResult, g.blocked.slice(guardState.seen));
+          guardState.seen = g.blocked.length;
         }
-        const navTitle = await page.title().catch(() => '');
-        stepResult = { ok: true, action: 'navigate', url: page.url(), ...(navRetried ? { retried: navRetried } : {}), ...(await navHealth(page, navResp, url.href, navTitle)) };
-        lastNavBad = stepResult.blocked ? `page blocked (${stepResult.blocked})` : stepResult.status >= 400 ? `page status ${stepResult.status}` : '';
-      } else if (step.action === 'extract') {
-        stepResult = await extractCleanText(page, step);
-        if (boundariesEnabled() && typeof stepResult.text === 'string') stepResult.text = wrapPage(stepResult.text);
-      } else if (step.action === 'collect') {
-        stepResult = await collectItems(page, step);
-        if (boundariesEnabled() && Array.isArray(stepResult.items)) {
-          stepResult.items = stepResult.items.map((it) => (typeof it === 'string' ? wrapPage(it) : it && typeof it.text === 'string' ? { ...it, text: wrapPage(it.text) } : it));
+        results.push({ step: i, ...stepResult });
+        if (stepResult.blocked && !continueOnError) {
+          return {
+            completed: results.length,
+            total: stepList.length,
+            blocked: true,
+            elapsedMs: Date.now() - t0,
+            results,
+          };
         }
-        if (lastNavBad) stepResult.note = lastNavBad + (stepResult.note ? `; ${stepResult.note}` : '');
-      } else {
-        if (step.action && !BATCH_ACTIONS.has(step.action)) throw new Error(`unknown batch action: ${step.action}`);
-        lastNavBad = '';
-        const stepAllowSubmit =
-          options.allowSubmit === false ? false : resolveAllowSubmit(step.allowSubmit ?? defaultAllowSubmit);
-        stepResult = await executeSingleAction(page, {
-          ...step,
-          ...(afterNav && step.action === 'wait' && step.textNew ? { _freshDocument: true } : {}),
-          returnSnapshot: options.returnSnapshot || step.returnSnapshot,
-          observeAftermath: step.observeAftermath ?? options.observeAftermath,
-          _registerPopup: options._registerPopup,
-          allowSubmit: stepAllowSubmit,
-        });
+      } catch (err) {
+        results.push({ step: i, ok: false, action: step?.action, error: cleanErrorMessage(err.message) });
+        if (!continueOnError) {
+          return {
+            completed: i,
+            total: stepList.length,
+            blocked: false,
+            error: cleanErrorMessage(err.message),
+            elapsedMs: Date.now() - t0,
+            results,
+          };
+        }
       }
-      tagBlockedBy(stepResult);
-      const g = guardState?.guard;
-      if (g) await g.settleStep();
-      if (g && g.blocked.length > guardState.seen) {
-        applyNetworkBlock(stepResult, g.blocked.slice(guardState.seen));
-        guardState.seen = g.blocked.length;
-      }
-      results.push({ step: i, ...stepResult });
-      if (stepResult.blocked && !continueOnError) {
-        return {
-          completed: results.length,
-          total: stepList.length,
-          blocked: true,
-          elapsedMs: Date.now() - t0,
-          results,
-        };
-      }
-    } catch (err) {
-      results.push({ step: i, ok: false, action: step?.action, error: cleanErrorMessage(err.message) });
-      if (!continueOnError) {
-        return {
-          completed: i,
-          total: stepList.length,
-          blocked: false,
-          error: cleanErrorMessage(err.message),
-          elapsedMs: Date.now() - t0,
-          results,
-        };
-      }
+    }
+  } finally {
+    if (pendingTextNewKey) {
+      await disarmWaitTextNew(page, pendingTextNewKey);
+      pendingTextNewKey = '';
     }
   }
 
@@ -7977,12 +8156,18 @@ async function batchActionsCore(page, stepList, options, previousLinesSet, guard
   };
 
   if (options.returnSnapshot) {
-    const snap = await inspectCompact(
+    const snap = await snapshotAfterAction(
       page,
-      { mode: options.snapshotMode || 'interactive', maxChars: options.snapshotMaxChars || 2500, query: options.snapshotQuery },
+      {
+        mode: options.snapshotMode || 'interactive',
+        maxChars: options.snapshotMaxChars || 2500,
+        query: options.snapshotQuery,
+        afterNavOrSubmit: true,
+      },
       previousLinesSet
     );
-    out.snapshot = wrapPage(snap.text);
+    out.snapshot = snap.snapshot;
+    if (snap.pageText) out.pageText = snap.pageText;
   }
 
   out.elapsedMs = Date.now() - t0;

@@ -7,11 +7,12 @@ description: Use when driving a browser through the turbo-browser MCP tools (tab
 
 Aim for few calls and small results. Each call below replaces several one-action calls.
 
-## 1. Look once, then only changes
+## 1. Open with a snapshot, then only changes
 
-Call `inspect_compact` once. Later calls pass `onlyChanged` so the result lists only new or changed elements (marked `*`). Narrow big pages with `query` or `selector`. Use refs from the latest snapshot only.
+Pass `returnSnapshot` to `tabs_batch` on Turn 1 so opening or navigating returns the initial snapshot in the same call. Later `inspect_compact` calls pass `onlyChanged` so the result lists only new or changed elements (marked `*`). Narrow big pages with `query` or `selector`. Use refs from the latest snapshot only.
 
 ```
+tabs_batch {"operations":[{"action":"open","url":"https://example.com"}],"returnSnapshot":true}
 inspect_compact {"mode":"forms"}
 inspect_compact {"onlyChanged":true}
 inspect_compact {"mode":"article","selector":"main","maxChars":3000}
@@ -78,6 +79,7 @@ tabs_batch {"operations":[{"action":"open_many","urls":["https://example.com/a",
 
 ## Habits
 
-- Prefer `text` or `ref` targets over coordinates.
+- Prefer `text`, `label` or `ref` targets over coordinates.
 - One `batch_actions` call beats five `act_fast` calls.
 - Treat an error as data: read it, fix the target, retry once.
+- When a task asks for a final JSON line, output raw JSON on the last line with no prefix like "Final answer:" or code fences.
