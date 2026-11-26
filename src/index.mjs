@@ -33,7 +33,16 @@ import { takeLate } from './aftermath.mjs';
 import { getPolicy, takeBlocked } from './allow-hosts.mjs';
 import { waitForHuman } from './guards.mjs';
 import { boundariesEnabled, boundaryInstruction, wrapPage } from './boundaries.mjs';
-import { getSecrets, redactText, resolveSecretArgs } from './secrets.mjs';
+import {
+  DEFAULT_REDACT_URL_PARAMS,
+  getRedactUrlParams,
+  getSecrets,
+  redactText,
+  redactUrlParams,
+  resolveSecretArgs,
+} from './secrets.mjs';
+
+export { DEFAULT_REDACT_URL_PARAMS, getRedactUrlParams, redactUrlParams };
 
 // Read from package.json so --version, --doctor and serverInfo never drift from the published version.
 const PACKAGE_VERSION = JSON.parse(
@@ -54,7 +63,7 @@ const SERVER_INFO = {
 const COMMIT_PROPS = {
   expect: {
     type: 'object',
-    description: 'Submit evidence to wait for; sets submitVerified.',
+    description: 'Wait for submit evidence; sets submitVerified.',
     properties: {
       urlMatches: { type: 'string' },
       textMatches: { type: 'string' },
@@ -63,7 +72,7 @@ const COMMIT_PROPS = {
       timeoutMs: { type: 'integer' },
     },
   },
-  submissionKey: { type: 'string', description: 'Idempotency key; repeat submits refused.' },
+  submissionKey: { type: 'string', description: 'Idempotency key; blocks repeat submit.' },
   allowDuplicate: { type: 'boolean' },
 };
 
@@ -89,7 +98,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'tabs_batch',
     description:
-      'Batch tab ops: list, open, open_many, navigate, activate, resize, emulate, reload, back, forward, close. Pass returnSnapshot=true on open/navigate.',
+      'Tab ops: list, open, open_many, navigate, activate, resize, emulate, reload, back, forward, close. Pass returnSnapshot=true on open/navigate.',
     annotations: { readOnlyHint: false },
     inputSchema: {
       type: 'object',
@@ -135,7 +144,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'inspect_compact',
     description:
-      'Compact DOM snapshot (refs, forms, article) across frames and Shadow DOM, capped at maxChars. Use onlyChanged=true after first call.',
+      'Compact DOM snapshot (refs, forms, article) across frames/Shadow DOM, capped at maxChars. Use onlyChanged=true after first call.',
     annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
@@ -155,7 +164,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'smart_fill_form',
     description:
-      'Fill multiple inputs, editors, selects, role=combobox, checkboxes, Shadow DOM/iframe fields and file uploads at once. Stops before Submit by default.',
+      'Fill inputs, editors, selects, role=combobox, checkboxes, Shadow DOM/iframe fields and file uploads at once. Stops before Submit.',
     annotations: { readOnlyHint: false },
     inputSchema: {
       type: 'object',
@@ -175,7 +184,7 @@ export const TOOL_DEFINITIONS = [
               values: { type: 'array', items: { type: 'string' } },
               option: {
                 oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
-                description: 'Option text/value for <select> or role=combobox.',
+                description: 'Text/value for <select> or role=combobox.',
               },
               check: { oneOf: [{ type: 'string' }, { type: 'boolean' }, { type: 'array', items: { type: 'string' } }] },
               file: { type: 'string' },
@@ -197,7 +206,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'act_fast',
     description:
-      'One action on ref, selector, text, label or x/y. Supports returnSnapshot; blocks submit/publish/send unless allowSubmit=true.',
+      'One action on ref, selector, text, label or x/y. Supports returnSnapshot; blocks Submit unless allowSubmit=true.',
     annotations: { readOnlyHint: false, destructiveHint: true },
     inputSchema: {
       type: 'object',
@@ -234,7 +243,7 @@ export const TOOL_DEFINITIONS = [
         dy: { type: 'number' },
         ms: { type: 'integer' },
         textGone: { type: 'string' },
-        textNew: { type: 'string', description: 'Wait for new text ("A|B") after step starts.' },
+        textNew: { type: 'string', description: 'Wait for new text ("A|B").' },
         url: { type: 'string' },
         loadState: { type: 'string', enum: ['load', 'domcontentloaded', 'networkidle'] },
         state: { type: 'string', enum: ['visible', 'hidden', 'attached', 'detached'] },
@@ -251,7 +260,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'batch_actions',
     description:
-      'Run act_fast, smart_fill_form, navigate, extract or collect steps in order. Stops on Submit guard unless allowSubmit=true.',
+      'Run act_fast, smart_fill_form, navigate, extract or collect steps in order. Blocks Submit unless allowSubmit=true.',
     annotations: { readOnlyHint: false, destructiveHint: true },
     inputSchema: {
       type: 'object',
@@ -278,7 +287,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'extract_clean_text',
     description:
-      'Extract clean text, markdown, or table_json from main content and iframes, capped at maxChars.',
+      'Extract clean text, markdown or table_json across frames, capped at maxChars.',
     annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
@@ -295,7 +304,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'evaluate_js',
     description:
-      'Evaluate JS in frame or on target (ref/selector/text passes (el, arg)); returns JSON.',
+      'Evaluate JS in frame or on target (passes (el, arg)); returns JSON.',
     annotations: { readOnlyHint: false, destructiveHint: true },
     inputSchema: {
       type: 'object',
@@ -315,7 +324,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'page_diagnostics',
     description:
-      'Read buffered console logs, network requests (or reqId details), downloads and dialogs.',
+      'Read console logs, network requests (or reqId details), downloads and dialogs.',
     annotations: { readOnlyHint: false },
     inputSchema: {
       type: 'object',
@@ -337,7 +346,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'capture_page',
     description:
-      'Screenshot (png/jpeg) or PDF of page or target element to savePath or inline image.',
+      'Screenshot (png/jpeg/webp, optional maxWidth) or PDF of page/element to savePath or inline.',
     annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
@@ -349,8 +358,10 @@ export const TOOL_DEFINITIONS = [
         text: { type: 'string' },
         frameIdx: { type: 'integer' },
         fullPage: { type: 'boolean' },
-        type: { type: 'string', enum: ['png', 'jpeg'] },
+        format: { type: 'string', enum: ['png', 'jpeg', 'webp'] },
+        type: { type: 'string', enum: ['png', 'jpeg', 'webp'] },
         quality: { type: 'integer' },
+        maxWidth: { type: 'integer' },
         scale: { type: 'string', enum: ['css', 'device'] },
         savePath: { type: 'string' },
         returnImage: { type: 'boolean' },
@@ -360,7 +371,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'network_session',
     description:
-      'Manage cookies, local/sessionStorage, storageState files, and resource/URL blocking presets.',
+      'Manage cookies, storage, storageState files and resource/URL blocking presets.',
     annotations: { readOnlyHint: false },
     inputSchema: {
       type: 'object',
@@ -384,7 +395,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'wait_for_human',
     description:
-      'Wait for human step (login, bot check, 2FA) in visible browser until condition holds.',
+      'Wait for human step (login, 2FA, bot check) until condition holds.',
     annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
@@ -408,8 +419,7 @@ export const TOOL_DEFINITIONS = [
  */
 export async function dispatchToolCall(manager, name, rawArgs = {}) {
   const secrets = getSecrets();
-  if (!secrets) return dispatchToolCallBase(manager, name, rawArgs);
-  const args = resolveSecretArgs(rawArgs, secrets);
+  const args = secrets ? resolveSecretArgs(rawArgs, secrets) : rawArgs;
   try {
     const res = await dispatchToolCallBase(manager, name, args);
     if (res && typeof res.text === 'string') res.text = redactText(res.text, secrets);
@@ -935,6 +945,7 @@ const VALUE_FLAG_ENV = {
   '--allow-hosts': 'TURBO_BROWSER_ALLOW_HOSTS',
   '--allow-origins': 'TURBO_BROWSER_ALLOW_ORIGINS',
   '--secrets': 'TURBO_BROWSER_SECRETS_FILE',
+  '--redact-url-params': 'TURBO_BROWSER_REDACT_URL_PARAMS',
 };
 
 const HELP_TEXT = `turbo-browser-mcp v${SERVER_INFO.version} — Fast, token-efficient Playwright MCP server
@@ -965,6 +976,8 @@ Options:
   --allow-origins <o,o>      Only allow these exact origins, e.g. http://localhost:3000 (TURBO_BROWSER_ALLOW_ORIGINS)
   --allow-strict             With an allowlist, also block sub-resource requests to other hosts
   --secrets <file>           dotenv file of secrets; use $secret:NAME as a fill/type value, values are redacted from results (TURBO_BROWSER_SECRETS_FILE)
+  --redact-url-params [a,b]  Redact sensitive URL query params (default: access_token,id_token,refresh_token,code,api_key,apikey,token,secret; pass off to disable)
+  --no-focus                 Keep Chrome in the background and enable Emulation.setFocusEmulationEnabled on background tabs (TURBO_BROWSER_NO_FOCUS=1)
   --content-boundaries       Wrap page text in <<page:nonce>> markers (TURBO_BROWSER_CONTENT_BOUNDARIES=1)
   --print-skill              Print the bundled SKILL.md for this version and exit
 
@@ -1019,6 +1032,20 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
       out.envOverrides.TURBO_BROWSER_ALLOW_STRICT = '1';
     } else if (flag === '--content-boundaries') {
       out.envOverrides.TURBO_BROWSER_CONTENT_BOUNDARIES = '1';
+    } else if (flag === '--no-focus') {
+      out.envOverrides.TURBO_BROWSER_NO_FOCUS = 'true';
+    } else if (flag === '--no-focus-emulation') {
+      out.envOverrides.TURBO_BROWSER_FOCUS_EMULATION = 'false';
+    } else if (flag === '--no-redact-url-params') {
+      out.envOverrides.TURBO_BROWSER_REDACT_URL_PARAMS = 'false';
+    } else if (flag === '--redact-url-params') {
+      if (inlineVal !== null) {
+        out.envOverrides.TURBO_BROWSER_REDACT_URL_PARAMS = String(inlineVal || 'true');
+      } else if (argv[i + 1] !== undefined && !String(argv[i + 1]).startsWith('-')) {
+        out.envOverrides.TURBO_BROWSER_REDACT_URL_PARAMS = String(argv[++i]);
+      } else {
+        out.envOverrides.TURBO_BROWSER_REDACT_URL_PARAMS = 'true';
+      }
     } else if (flag === '--print-skill') {
       out.printSkill = true;
     } else if (flag === '--allow-submit') {

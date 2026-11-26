@@ -5,7 +5,7 @@ import { urlDenial, peekBlocked, denyMessage, matchUrl, getPolicy } from './allo
 import { isBackgroundRequest, observeClickAftermath, parkLate, watchActivity } from './aftermath.mjs';
 import { armToasts, takeToast } from './toast.mjs';
 import { wrapPage, boundariesEnabled } from './boundaries.mjs';
-import { redactText } from './secrets.mjs';
+import { redactText, redactUrlParams } from './secrets.mjs';
 import path from 'node:path';
 import {
   appendLedger,
@@ -2530,6 +2530,8 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
 
     const frameItems = [];
     for (const item of chunk.items) {
+      item.line = redactUrlParams(item.line);
+      item.sig = redactUrlParams(item.sig);
       const refLower = item.ref.toLowerCase();
       const bareLower = refLower.split(':')[1];
       if (frameStamp) {
@@ -2557,7 +2559,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
     }
 
     if (!frameInfo.isMain && frameItems.length > 0) {
-      entries.push(`--- iframe f${frameInfo.frameIdx} (${frameInfo.url.slice(0, 80)}) ---`);
+      entries.push(`--- iframe f${frameInfo.frameIdx} (${redactUrlParams(frameInfo.url).slice(0, 80)}) ---`);
     }
     for (const line of frameItems) {
       entries.push(line);
@@ -2588,7 +2590,8 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
       ? 'No earlier full snapshot (a query or selector snapshot is not kept as baseline): listing everything\n'
       : '';
   const popupNote = (await popupOpenIn(allFrames[0].frame)) ? `Note: ${POPUP_NOTE}\n` : '';
-  const header = `URL: ${page.url()}\nTitle: ${title}\nMode: ${mode} | Frames: ${frames.length} | Elements: ${totalMatched}${filterNote}\n${urlChangedNote}${popupNote}`;
+  const safePageUrl = redactUrlParams(page.url());
+  const header = `URL: ${safePageUrl}\nTitle: ${title}\nMode: ${mode} | Frames: ${frames.length} | Elements: ${totalMatched}${filterNote}\n${urlChangedNote}${popupNote}`;
   let body = '';
   let shownCount = 0;
   let truncated = false;
@@ -2656,7 +2659,7 @@ export async function inspectCompact(page, options = {}, previousLinesSet = null
   return {
     text,
     fullChars: savedPath && fullText.length > text.length ? fullText.length : undefined,
-    url: page.url(),
+    url: safePageUrl,
     title,
     mode,
     framesScanned: frames.length,
@@ -9767,8 +9770,57 @@ export async function evaluateJs(page, { expression, frameIdx = 0, arg, ref, sel
   return out;
 }
 
+const pageFocusSessions = new WeakMap();
+
 /**
- * Capture full-page/element screenshots (png/jpeg) or PDF export safely to cwd-resolved paths.
+ * Enable Emulation.setFocusEmulationEnabled on a page's persistent CDP session so background
+ * or --no-focus tabs continue rendering and receiving input without stealing window focus.
+ */
+export async function ensureFocusEmulation(page, enabled = true) {
+  if (!page || typeof page.context !== 'function') return false;
+  if (
+    arguments.length < 2 &&
+    /^(0|false|no|off)$/i.test(String(process.env.TURBO_BROWSER_FOCUS_EMULATION || ''))
+  ) {
+    return false;
+  }
+  const want = Boolean(enabled);
+  let entry = pageFocusSessions.get(page);
+  if (entry && entry.enabled === want) return true;
+  let timer;
+  try {
+    return await Promise.race([
+      (async () => {
+        const ctx = page.context();
+        if (!ctx || typeof ctx.newCDPSession !== 'function') return false;
+        const session = entry?.session || (await ctx.newCDPSession(page));
+        if (!entry) {
+          entry = { session, enabled: false };
+          pageFocusSessions.set(page, entry);
+          page.once?.('close', () => {
+            pageFocusSessions.delete(page);
+            session.detach().catch(() => {});
+          });
+        }
+        await session.send('Emulation.setFocusEmulationEnabled', { enabled: want });
+        if (want) await session.send('Page.setWebLifecycleState', { state: 'active' }).catch(() => {});
+        entry.enabled = want;
+        return true;
+      })(),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(false), 1000);
+      }),
+    ]);
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Capture full-page/element screenshots (png/jpeg/webp, with optional server-side maxWidth downscaling)
+ * or PDF export safely to cwd-resolved paths.
  */
 export async function capturePage(page, params = {}) {
   const mode = params.mode === 'pdf' ? 'pdf' : 'screenshot';
@@ -9820,13 +9872,21 @@ export async function capturePage(page, params = {}) {
     };
   }
 
-  const type = params.type === 'jpeg' ? 'jpeg' : 'png';
+  const rawFormat = params.format ?? params.type ?? process.env.TURBO_BROWSER_SCREENSHOT_FORMAT ?? 'png';
+  const fmtNorm = String(rawFormat).trim().toLowerCase();
+  const type = fmtNorm === 'jpeg' || fmtNorm === 'jpg' ? 'jpeg' : fmtNorm === 'webp' ? 'webp' : 'png';
+  const quality = type !== 'png' ? Math.min(100, Math.max(1, Number(params.quality) || 80)) : undefined;
+  const maxWidth = Math.max(0, Number(params.maxWidth ?? process.env.TURBO_BROWSER_SCREENSHOT_MAX_WIDTH) || 0);
   const shotOpts = {
-    type,
-    quality: type === 'jpeg' ? (Number(params.quality) || 80) : undefined,
+    type: type === 'jpeg' ? 'jpeg' : 'png',
+    quality: type === 'jpeg' ? quality : undefined,
     scale: params.scale === 'device' ? 'device' : 'css',
     timeout,
   };
+
+  if (typeof page.context === 'function') {
+    await ensureFocusEmulation(page).catch(() => {});
+  }
 
   // Playwright waits indefinitely for FontFaceSet.ready within its screenshot timeout.
   // Give web fonts a short chance, then capture through CDP without changing global env
@@ -9843,22 +9903,33 @@ export async function capturePage(page, params = {}) {
   }, Math.min(500, timeout)).catch(() => false)))).some(Boolean);
   const target = params.ref || params.selector || params.text ? await resolveTarget(page, params) : null;
   let imgBuf;
-  if (fontsPending) {
+  let outWidth;
+  let outHeight;
+  const useCdpCapture = (fontsPending || type === 'webp' || maxWidth > 0) && typeof page.context === 'function';
+  if (useCdpCapture) {
     if (target) await target.locator.scrollIntoViewIfNeeded({ timeout });
     const box = target ? await target.locator.boundingBox({ timeout }) : null;
     if (target && (!box || !box.width || !box.height)) throw new Error('Screenshot target is not visible.');
     const client = await page.context().newCDPSession(page);
     try {
+      await client.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
       const { cssLayoutViewport: viewport, cssContentSize: content } = await client.send('Page.getLayoutMetrics');
-      const dpr = await page.evaluate(() => window.devicePixelRatio);
+      const dpr = (await page.evaluate(() => window.devicePixelRatio).catch(() => 1)) || 1;
       const clip = box
         ? { x: box.x + viewport.pageX, y: box.y + viewport.pageY, width: box.width, height: box.height }
         : params.fullPage ? { x: 0, y: 0, width: content.width, height: content.height }
           : { x: viewport.pageX, y: viewport.pageY, width: viewport.clientWidth, height: viewport.clientHeight };
+      const baseScale = shotOpts.scale === 'device' ? 1 : 1 / dpr;
+      const naturalPixelWidth = clip.width * dpr * baseScale;
+      const naturalPixelHeight = clip.height * dpr * baseScale;
+      const downscale = maxWidth > 0 && naturalPixelWidth > maxWidth ? maxWidth / naturalPixelWidth : 1;
+      const clipScale = baseScale * downscale;
+      outWidth = Math.max(1, Math.round(naturalPixelWidth * downscale));
+      outHeight = Math.max(1, Math.round(naturalPixelHeight * downscale));
       const { data } = await client.send('Page.captureScreenshot', {
         format: type,
-        ...(type === 'jpeg' ? { quality: shotOpts.quality } : {}),
-        clip: { ...clip, scale: shotOpts.scale === 'device' ? 1 : 1 / dpr },
+        ...(type !== 'png' ? { quality } : {}),
+        clip: { ...clip, scale: clipScale },
         captureBeyondViewport: true,
       });
       imgBuf = Buffer.from(data, 'base64');
@@ -9876,7 +9947,9 @@ export async function capturePage(page, params = {}) {
     mode: 'screenshot',
     ...(fontsPending ? { fontsPending: true } : {}),
     type,
-    mimeType: type === 'jpeg' ? 'image/jpeg' : 'image/png',
+    format: type,
+    mimeType: `image/${type}`,
+    ...(outWidth ? { width: outWidth, height: outHeight } : {}),
     savePath: resolvedPath,
     bytes: imgBuf.length,
     base64: shouldReturnImage ? imgBuf.toString('base64') : undefined,

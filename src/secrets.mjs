@@ -75,14 +75,56 @@ export function getSecrets() {
   return cache;
 }
 
-/** Replace real secret values in text with their placeholders. */
-export function redactText(text, secrets = getSecrets()) {
-  if (!secrets || typeof text !== 'string' || !text) return text;
-  let out = text;
-  for (const { needle, placeholder } of secrets.redactors) {
-    if (out.includes(needle)) out = out.split(needle).join(placeholder);
+export const DEFAULT_REDACT_URL_PARAMS = [
+  'access_token',
+  'id_token',
+  'refresh_token',
+  'code',
+  'api_key',
+  'apikey',
+  'token',
+  'secret',
+];
+
+export function getRedactUrlParams(custom) {
+  const raw = custom !== undefined ? custom : process.env.TURBO_BROWSER_REDACT_URL_PARAMS;
+  if (raw === false) return [];
+  if (Array.isArray(raw)) return raw.map((s) => String(s).trim()).filter(Boolean);
+  if (raw === undefined || raw === null || raw === true) return DEFAULT_REDACT_URL_PARAMS;
+  const trimmed = String(raw).trim();
+  if (!trimmed || /^(1|true|yes|on|default)$/i.test(trimmed)) return DEFAULT_REDACT_URL_PARAMS;
+  if (/^(0|false|no|off|none)$/i.test(trimmed)) return [];
+  if (trimmed.startsWith('=')) {
+    return trimmed.slice(1).split(',').map((s) => s.trim()).filter(Boolean);
   }
-  return out;
+  const extra = trimmed.split(',').map((s) => s.trim()).filter(Boolean);
+  return [...new Set([...DEFAULT_REDACT_URL_PARAMS, ...extra])];
+}
+
+/** Mask sensitive query/fragment parameters in URLs or text containing URLs with <redacted>. */
+export function redactUrlParams(text, paramList = getRedactUrlParams()) {
+  if (typeof text !== 'string' || !text || !paramList || paramList.length === 0) return text;
+  const escaped = paramList
+    .map((p) => String(p).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .filter(Boolean);
+  if (escaped.length === 0) return text;
+  const re = new RegExp(`([?&#])(${escaped.join('|')})=(?:<redacted>|([^&#\\s"'\\\\>)\\]]*))`, 'gi');
+  return text.replace(re, (full, sep, key, val) => {
+    if (val === undefined || val === '') return full;
+    return `${sep}${key}=<redacted>`;
+  });
+}
+
+/** Replace real secret values in text with their placeholders and mask sensitive URL query params. */
+export function redactText(text, secrets = getSecrets()) {
+  if (typeof text !== 'string' || !text) return text;
+  let out = text;
+  if (secrets) {
+    for (const { needle, placeholder } of secrets.redactors) {
+      if (out.includes(needle)) out = out.split(needle).join(placeholder);
+    }
+  }
+  return redactUrlParams(out);
 }
 
 /**

@@ -5,7 +5,7 @@ import { checkBridgeHealth, DEFAULT_BRIDGE_PORT, ensureCdpBridgeDaemon, probeBri
 import { cdpRawCall } from './cdp-raw.mjs';
 import { resolveSafePath } from './dom-engine.mjs';
 import { gotoRetry, navHealth } from './navinfo.mjs';
-import { redactText } from './secrets.mjs';
+import { redactText, redactUrlParams } from './secrets.mjs';
 import { getPolicy, installGuard, takeBlocked, peekBlocked, urlDenial, denyMessage, matchUrl } from './allow-hosts.mjs';
 
 const firstLine = (err) => String((err && err.message) || err).split(/\r?\n/)[0];
@@ -103,6 +103,14 @@ export class BrowserManager {
       options.defaultTimeoutMs ?? (Number(process.env.TURBO_BROWSER_TIMEOUT_MS) || 15000);
     this.isolateHosts = String(options.isolateHosts ?? process.env.TURBO_BROWSER_ISOLATE_HOSTS ?? '')
       .split(',').map((s) => s.trim().toLowerCase().replace(/\.$/, '')).filter(Boolean);
+    this.noFocus = Boolean(
+      options.noFocus ??
+      /^(1|true|yes)$/i.test(String(process.env.TURBO_BROWSER_NO_FOCUS || process.env.CDP_SHARE_NO_FOCUS || ''))
+    );
+    this.focusEmulation =
+      options.focusEmulation !== undefined
+        ? Boolean(options.focusEmulation)
+        : !/^(0|false|no|off)$/i.test(String(process.env.TURBO_BROWSER_FOCUS_EMULATION || ''));
     this.nextAutoContextId = 1;
 
     this.browser = null;
@@ -759,6 +767,7 @@ export class BrowserManager {
   }
 
   async _keepRendering(page) {
+    if (!this.focusEmulation) return false;
     const diag = this._ensureDiagState(page);
     let timer;
     try {
@@ -766,11 +775,15 @@ export class BrowserManager {
         (async () => {
           if (!diag.cdpSession) diag.cdpSession = await page.context().newCDPSession(page);
           await diag.cdpSession.send('Emulation.setFocusEmulationEnabled', { enabled: true });
-          await diag.cdpSession.send('Page.setWebLifecycleState', { state: 'active' });
+          diag.focusEmulated = true;
+          await diag.cdpSession.send('Page.setWebLifecycleState', { state: 'active' }).catch(() => {});
         })(),
         new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), 1000); }),
       ]);
-    } catch { /* Some targets do not support emulation; the liveness check still applies. */ }
+      return Boolean(diag.focusEmulated);
+    } catch { /* Some targets do not support emulation; the liveness check still applies. */
+      return false;
+    }
     finally { clearTimeout(timer); }
   }
 
@@ -939,7 +952,7 @@ export class BrowserManager {
           pushRing(
             diag.downloads,
             {
-              url: download.url(),
+              url: redactUrlParams(download.url()),
               suggestedFilename: safeName,
               savePath,
               ts: new Date().toISOString(),
@@ -950,7 +963,7 @@ export class BrowserManager {
           pushRing(
             diag.downloads,
             {
-              url: download.url(),
+              url: redactUrlParams(download.url()),
               suggestedFilename: safeName,
               error: String(err?.message || err),
               ts: new Date().toISOString(),
@@ -1156,7 +1169,7 @@ export class BrowserManager {
       if (url === '' && this._staleFallback?.page === page) { url = this._staleFallback.url; title = this._staleFallback.title; }
       const entry = {
         tabId,
-        url,
+        url: redactUrlParams(url),
         title,
         active: tabId === this.activeTabId,
         isolatedContext: this.tabContextName.get(tabId) || 'default',
@@ -1297,7 +1310,7 @@ export class BrowserManager {
                 return {
                   tabId,
                   isolatedContext: ctxName,
-                  url: page.url(),
+                  url: redactUrlParams(page.url()),
                   title,
                   ok: true,
                   ...(await navHealth(page, resp, targetUrl, title, { waitUntil: navOpts.waitUntil })),
@@ -1350,6 +1363,7 @@ export class BrowserManager {
         const { name: ctxName, ctx } = await this._getOrCreateContext(this._contextForUrl(op.url, op.isolatedContext));
         const page = await ctx.newPage();
         const tabId = this._registerPage(page, op.activate !== false, ctxName);
+        await this._keepRendering(page);
         if (op.activate === false) {
           this.activeTabId =
             prevActiveTabId !== null && this.tabs.has(prevActiveTabId)
@@ -1406,7 +1420,7 @@ export class BrowserManager {
           action: 'open',
           tabId,
           isolatedContext: ctxName,
-          url: page.url(),
+          url: redactUrlParams(page.url()),
           title: openTitle,
           ...(op.url ? await navHealth(page, openResp, op.url, openTitle, { waitUntil: op.waitUntil }) : {}),
         });
@@ -1421,7 +1435,7 @@ export class BrowserManager {
         if (!op.url) throw new Error('navigate action requires url.');
         const navDenied = urlDenial(op.url);
         if (navDenied) {
-          results.push({ action: 'navigate', ok: false, url: op.url, error: navDenied });
+          results.push({ action: 'navigate', ok: false, url: redactUrlParams(op.url), error: navDenied });
           continue;
         }
         const { tabId, page } = await this.getPage(op.tabId);
@@ -1447,7 +1461,7 @@ export class BrowserManager {
             tabId,
             ok: false,
             ...(err && err.name === 'TimeoutError' && !stopped ? { timedOut: true } : {}),
-            url: stopped ? stopped.url : page.url(),
+            url: redactUrlParams(stopped ? stopped.url : page.url()),
             title: await page.title().catch(() => ''),
             error: stopped ? denyMessage(matchUrl(stopped.url, getPolicy())) : firstLine(err),
             ...(stopped ? { blocked: 'host-not-allowed' } : {}),
@@ -1456,13 +1470,14 @@ export class BrowserManager {
         }
         if (op.activate === true) {
           this.activeTabId = tabId;
-          await page.bringToFront().catch(() => {});
+          if (!this.noFocus) await page.bringToFront().catch(() => {});
+          await this._keepRendering(page);
         }
         const navTitle = await page.title().catch(() => '');
         results.push({
           action: 'navigate',
           tabId,
-          url: page.url(),
+          url: redactUrlParams(page.url()),
           title: navTitle,
           ...(navRetried ? { retried: navRetried } : {}),
           ...(await navHealth(page, navResp, op.url, navTitle, { waitUntil: op.waitUntil })),
@@ -1473,8 +1488,9 @@ export class BrowserManager {
       if (action === 'activate') {
         const { tabId, page } = await this.getPage(op.tabId);
         this.activeTabId = tabId;
-        await page.bringToFront().catch(() => {});
-        results.push({ action: 'activate', tabId, url: page.url() });
+        if (!this.noFocus) await page.bringToFront().catch(() => {});
+        await this._keepRendering(page);
+        results.push({ action: 'activate', tabId, url: redactUrlParams(page.url()) });
         continue;
       }
 
@@ -1621,7 +1637,7 @@ export class BrowserManager {
       const fullDetail = {
         reqId: entry.reqId,
         method: entry.method,
-        url: entry.url,
+        url: redactUrlParams(entry.url),
         resourceType: entry.resourceType,
         status: entry.status,
         statusText: entry.statusText,
@@ -1688,13 +1704,13 @@ export class BrowserManager {
               ERROR_CONSOLE_LEVELS.has(c.level) &&
               !(blockedByPreset > 0 && /ERR_BLOCKED_BY_CLIENT/.test(c.text))
           ),
-          (c) => `${c.level} ${c.text}`
+          (c) => `${c.level}\u0000${c.text}`
         );
 
     const compactReq = (r) => ({
       reqId: r.reqId,
       method: r.method,
-      url: r.url,
+      url: redactUrlParams(r.url),
       resourceType: r.resourceType,
       status: r.status,
       ok: r.ok,
@@ -1725,13 +1741,13 @@ export class BrowserManager {
 
     const snapshot = {
       tabId: id,
-      url: page.url(),
+      url: redactUrlParams(page.url()),
       dialogPolicy: diag.dialogPolicy,
       console: consoleFiltered,
       requests: filteredReqs,
       networkErrors,
       dialogs: [...diag.dialogs],
-      downloads: [...diag.downloads],
+      downloads: diag.downloads.map((d) => ({ ...d, url: redactUrlParams(d.url) })),
       totalBufferedRequests: diag.requests.length,
     };
     if (blockedByPreset > 0) snapshot.blockedByPreset = blockedByPreset;

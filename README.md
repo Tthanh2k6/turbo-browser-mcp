@@ -4,24 +4,31 @@
 [![npm](https://img.shields.io/npm/v/turbo-browser-mcp)](https://www.npmjs.com/package/turbo-browser-mcp)
 ![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
+[![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_MCP-0098FF)](vscode:mcp/install?%7B%22name%22%3A%22turbo-browser%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22turbo-browser-mcp%22%5D%7D)
+[![Install in Cursor](https://img.shields.io/badge/Cursor-Install_MCP-000000)](cursor://anysphere.cursor-deeplink/mcp/install?name=turbo-browser&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsInR1cmJvLWJyb3dzZXItbWNwIl19)
 
-An MCP server for browser automation, built on Playwright. It has 11 tools, and each one does more per call than the usual one-action-per-call design:
+Playwright MCP server for browser automation with 11 tools (2,440 schema tokens, or 6 core tools at 1,731 tokens). One call fills a whole form, runs an action list, or returns only the DOM nodes that changed since the last snapshot, and final Submit clicks are blocked by default.
 
-- `smart_fill_form` fills a whole form in one call, including React inputs, selects, comboboxes, rich-text editors and file uploads read from disk.
-- `inspect_compact` can return only the elements that changed since the last snapshot.
-- `batch_actions` runs a list of clicks, key presses, form steps and page reads as one call.
+```text
+Step-by-step MCP : [snapshot] -> [fill 1] -> [snapshot] ... x10 -> [click Submit]  (11 turns | 72,614 cum. tokens | submits live)
+turbo-browser-mcp: [inspect_compact] -> [smart_fill_form (10 fields + PDF)] ||     ( 2 turns |    811 tokens      | stops at Submit)
+                   next turns        -> [inspect_compact(onlyChanged: true)]       ( 1 turn  |     56 tokens      | -98.4% vs ARIA)
+                   Chrome 144+       -> [cdp-share --no-focus]                     ( 1 Allow | focus emulation on | 0 stolen focus)
+```
 
-Fewer calls means fewer model turns and less page text replayed in the conversation. The numbers, and their limits, are under [Benchmarks](#benchmarks).
-
-Buttons that look like a final commit (Submit, Send, Publish, Pay, Confirm, and their Korean, Japanese, Chinese and Vietnamese equivalents) are blocked by default, so an agent can prefill a form and leave the last click to a person. Pass `allowSubmit: true` per call or start with `--allow-submit` to turn this off.
+| Capability | Typical browser MCP | `turbo-browser-mcp` v0.7.5 |
+| :--- | :--- | :--- |
+| Tool schema per turn | 24 to 66 tools (3,917 to 6,737 tokens) | 11 tools (2,440 tokens) or `--tools core` (6 tools, 1,731 tokens) |
+| DOM snapshots | Full ARIA tree on every step (3,568 tokens) | `inspect_compact` + `onlyChanged: true` delta (56 tokens, -98.4%) |
+| 10-field form + combobox + file | 11 turns, 72,614 cumulative tokens, 44,728-token Base64 upload | 1 `smart_fill_form` call (811 tokens, 85-token disk path) |
+| Commit and secret safety | Clicks Submit/Pay directly; leaks OAuth query params | 4-layer Submit guard (`allowSubmit=false`), `$secret:NAME`, auto URL param redaction |
+| Chrome 144+ and background tabs | Re-prompts Allow per client; background tabs freeze or capture white | 1 Allow via `--bridge` / `cdp-share`; `Emulation.setFocusEmulationEnabled` + WebP/JPEG `maxWidth` |
 
 The server does not hide that the browser is automated: no stealth patches, no fingerprint changes, no CAPTCHA solving. For sites with a bot check it can hand the tab to a person and continue afterwards ([`wait_for_human`](#handing-a-step-to-a-person-wait_for_human---open-profile)).
 
 ## Install
 
-Needs Node 20 or newer and a Chromium-based browser (Chrome, Edge, Brave, or Playwright's Chromium).
-
-Claude Code:
+Needs Node 20 or newer and a Chromium-based browser (Chrome, Edge, Brave, or Playwright's Chromium). Click **Install MCP** in VS Code or Cursor above, or run one command in Claude Code:
 
 ```bash
 claude mcp add turbo-browser -- npx -y turbo-browser-mcp
@@ -73,7 +80,7 @@ node src/index.mjs --doctor
 | `extract_clean_text` | Page text or compact Markdown | `format` (`text`, `markdown`), `selector`, `includeFrames`, `maxChars`, `savePath` |
 | `evaluate_js` | JS expression, or a function called with `(el, arg)` | `expression`, `arg`, `frameIdx`, `ref`/`selector`/`text`, `savePath` |
 | `page_diagnostics` | Console, network, downloads and dialogs | `level` (`errors`, `all`), `statusFilter` (`errors`, `all`), `includeStatic`, `urlFilter`, `reqId`, `part`, `dialogPolicy`, `clear`, `savePath` |
-| `capture_page` | PNG/JPEG screenshot or PDF | `mode` (`screenshot`, `pdf`), `type`, `quality`, `fullPage`, `scale` (`css`, `device`), `ref`/`selector`/`text`, `returnImage`, `savePath` |
+| `capture_page` | PNG/JPEG/WebP screenshot or PDF | `mode` (`screenshot`, `pdf`), `format`/`type` (`png`, `jpeg`, `webp`), `quality`, `maxWidth`, `fullPage`, `scale` (`css`, `device`), `ref`/`selector`/`text`, `returnImage`, `savePath` |
 | `network_session` | Resource blocking, cookies and storage | `preset` (`turbo`, `no-images`, `no-media`, `clean`), `blockResources`, `blockUrls`, `cookieAction`, `storageAction`, `loadStorageStatePath`, `saveStorageStatePath` |
 | `wait_for_human` | Hand a step to a person, resume in the same session | `message`, `urlMatches`, `selector`, `textMatches`, `textGone`, `timeoutMs`, `pollMs` |
 
@@ -318,6 +325,8 @@ This reports an action that has already happened. It cannot prevent a commit or 
 | `--allow-strict` | `TURBO_BROWSER_ALLOW_STRICT` | `false` | With an allowlist, also block sub-resource requests to other hosts |
 | - | `TURBO_BROWSER_ISOLATE_HOSTS` | `""` | Comma-separated hosts (and subdomains) that open in fresh isolated browser contexts |
 | `--secrets <file>` | `TURBO_BROWSER_SECRETS_FILE` | unset | dotenv file of secrets for `$secret:NAME` placeholders (see [Secrets](#secrets)) |
+| `--redact-url-params [a,b]` | `TURBO_BROWSER_REDACT_URL_PARAMS` | `access_token,id_token,refresh_token,code,api_key,apikey,token,secret` | Mask sensitive URL query/hash params as `<redacted>` in snapshots and results (`off` to disable) |
+| `--no-focus` | `TURBO_BROWSER_NO_FOCUS` | `false` | Keep Chrome in the background and enable `Emulation.setFocusEmulationEnabled` on background tabs |
 | `--content-boundaries` | `TURBO_BROWSER_CONTENT_BOUNDARIES` | `false` | Wrap page-sourced text in `<<page:nonce>>` markers (see [Content boundaries](#content-boundaries)) |
 | `--print-skill` | - | - | Print the bundled `SKILL.md` for this version |
 | `--doctor` | - | - | Print Node, Playwright, Chromium and CDP diagnostics as JSON |
