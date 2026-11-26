@@ -33,6 +33,10 @@ const LOCAL_UI_RE =
 
 const APPLY_LABEL_RE = /^apply(\s+now)?(?![\p{L}\p{N}_])/iu;
 
+// Non-submitting buttons that merely open an inline reply/edit form (e.g. dev.to Reply/Edit buttons that load a form via XHR POST).
+const EDITOR_OPEN_LABEL_RE =
+  /^(reply(\s+to\b.*)?|edit(\s+(comment|post|reply|article|message|profile|bio))?|write\s+a\s+reply|add\s+a?\s*comment|leave\s+a?\s*comment|trả\s*lời|chỉnh\s*sửa|sửa)(?![\p{L}\p{N}_])/iu;
+
 // smart_fill_form submitButtons: never list these, even when type=submit.
 const SUBMIT_CAND_NEG_RE =
   /^(clear|reset|remove|delete|cancel|close|discard|xóa|xoá|hủy|huỷ|đóng|bỏ\s+qua)(?![\p{L}\p{N}_])/iu;
@@ -3875,7 +3879,8 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
           const isCustomCombobox = (el) =>
             Boolean(
               el &&
-              (el.getAttribute('role') || '').toLowerCase() === 'combobox' &&
+              ((el.getAttribute('role') || '').toLowerCase() === 'combobox' ||
+                (el.getAttribute('aria-haspopup') || '').toLowerCase() === 'listbox') &&
               !['SELECT'].includes(el.tagName) &&
               !el.isContentEditable
             );
@@ -4876,7 +4881,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
 
             const hasSelToken = (el, idx) => getSelOrder(el, idx) >= 0;
 
-            const combos = queryAllDeep(document, '[role="combobox"]').filter((el) => {
+            const combos = queryAllDeep(document, '[role="combobox"], [aria-haspopup="listbox"]').filter((el) => {
               if (el.tagName === 'SELECT') return false;
               if (!fieldSpec.all && !fieldSpec._again && el.getAttribute('data-tbm-combo-claimed') === '1') return false;
               if (
@@ -4897,7 +4902,17 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
               }
               const st = getComputedStyle(el);
               const r = el.getBoundingClientRect();
-              return st.display !== 'none' && st.visibility !== 'hidden' && Number(st.opacity) !== 0 && r.width > 0 && r.height > 0;
+              if (st.display === 'none' || st.visibility === 'hidden') return false;
+              // react-select dummy/search inputs can have opacity 0 or 1px width inside a visible control wrapper.
+              if (el.tagName === 'INPUT' && (Number(st.opacity) === 0 || r.width === 0 || r.height === 0)) {
+                const ctrl = el.closest('[class*="control" i], [class*="select" i], [class*="combobox" i]');
+                if (ctrl) {
+                  const cr = ctrl.getBoundingClientRect();
+                  const cst = getComputedStyle(ctrl);
+                  return cst.display !== 'none' && cst.visibility !== 'hidden' && cr.width > 0 && cr.height > 0;
+                }
+              }
+              return Number(st.opacity) !== 0 && r.width > 0 && r.height > 0;
             });
 
             const keys = Array.isArray(fieldSpec.keys) ? fieldSpec.keys : fieldSpec.keys ? [fieldSpec.keys] : [];
@@ -4980,19 +4995,58 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                   return composedText(refNode, true) || refNode?.innerText || '';
                 })
                 .join(' ');
+              const ownLabels = el.labels && el.labels.length > 0
+                ? [...el.labels].map((l) => composedText(l) || l.innerText).join(' ')
+                : '';
+              const nearComboLabel = (() => {
+                const COMBO_FIELD_SEL =
+                  'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="image"]):not([type="reset"]), textarea, select, [role="combobox"], [aria-haspopup="listbox"]';
+                let cur = el;
+                let prevChild = el;
+                for (let up = 0; up < 4 && cur.parentElement; up++) {
+                  cur = cur.parentElement;
+                  let fields = 0;
+                  try {
+                    const all = [...cur.querySelectorAll(COMBO_FIELD_SEL)];
+                    const hasComboRole = all.some((n) => (n.getAttribute('role') || '').toLowerCase() === 'combobox');
+                    // Count a combobox wrapper, its inner input, and its companion listbox toggle button as one control.
+                    fields = all.filter(
+                      (n) =>
+                        !(hasComboRole && n.tagName === 'BUTTON' && (n.getAttribute('aria-haspopup') || '').toLowerCase() === 'listbox' && (n.getAttribute('role') || '').toLowerCase() !== 'combobox') &&
+                        !all.some((other) => other !== n && other.contains(n))
+                    ).length;
+                  } catch {}
+                  if (fields > 1) break;
+                  for (const c of cur.querySelectorAll('label, [class*="label" i]')) {
+                    if (c.contains(el)) continue;
+                    const forId = c.getAttribute?.('for');
+                    if (forId && forId !== el.id && document.getElementById(forId) && !cur.contains(document.getElementById(forId))) continue;
+                    const t = clean(c.innerText || c.textContent).replace(/\s*[*\uFF0A]+$/, '');
+                    if (t && t.length <= 80 && /[\p{L}\p{N}]/u.test(t)) return t;
+                  }
+                  const sib = prevChild.previousElementSibling;
+                  if (sib && !sib.matches(COMBO_FIELD_SEL) && !sib.querySelector(COMBO_FIELD_SEL)) {
+                    const t = clean(sib.innerText || sib.textContent).replace(/\s*[*\uFF0A]+$/, '');
+                    if (t && t.length <= 60 && /[\p{L}\p{N}]/u.test(t)) return t;
+                  }
+                  prevChild = cur;
+                }
+                return '';
+              })();
               const prev = el.previousElementSibling;
               const prevTxt =
                 prev && !prev.matches('button, input, select, textarea, a, [role="button"], [role="combobox"]')
                   ? (composedText(prev) || prev.innerText)
                   : '';
-              const blk = closestComposed(el, '[class*="field"], [class*="Field"], .form-group, [role="listitem"]');
+              const blk = closestComposed(el, '[class*="field"], [class*="Field"], .form-group, [role="listitem"], [class*="select" i], [class*="combobox" i], [class*="autocomplete" i]');
               let blkTxt = '';
               let blkLblTxt = '';
               if (blk) {
-                const siblings = queryAllDeep(
+                const rawSibs = queryAllDeep(
                   blk,
-                  'input:not([type="radio"]):not([type="checkbox"]):not([type="hidden"]):not([type="file"]), textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="combobox"]'
+                  'input:not([type="radio"]):not([type="checkbox"]):not([type="hidden"]):not([type="file"]), textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="combobox"], [aria-haspopup="listbox"]'
                 );
+                const siblings = rawSibs.filter((n) => !rawSibs.some((other) => other !== n && other.contains(n)));
                 if (siblings.length <= 1) {
                   blkTxt = composedText(blk, false, el) || composedText(blk) || blk.innerText;
                   const innerLbl = blk.querySelector('label');
@@ -5009,6 +5063,8 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                 el.getAttribute('name'),
                 el.getAttribute('id'),
                 lblBy,
+                ownLabels,
+                nearComboLabel,
                 wrapLblClean,
                 hostAttr,
                 prevTxt,
@@ -5176,7 +5232,7 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
         const optionScopes = frameInfo.isMain ? [frameInfo.frame] : [frameInfo.frame, page.mainFrame()];
         const stopBeforeSubmit = spec.stopBeforeSubmit !== false;
 
-        const clickWidgetSafely = async (loc) => {
+        const clickWidgetSafely = async (loc, isComboTrigger = false) => {
           await withFrameSubmitGuard(frameInfo.frame, async () => {
             if (stopBeforeSubmit) {
               await loc
@@ -5192,11 +5248,68 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                 })
                 .catch(() => {});
             }
-            await loc.click({ timeout: 2500 });
+            try {
+              await loc.click({ timeout: isComboTrigger ? 1200 : 2500 });
+            } catch (err) {
+              if (!isComboTrigger) throw err;
+              // In react-select / Headless UI / MUI, the inner <input role="combobox"> may be covered by a placeholder
+              // or value container, or have a companion toggle button: click the control wrapper / toggle button and focus.
+              await loc.evaluate((el) => {
+                const ctrl =
+                  el.closest?.('[class*="control" i], [role="combobox"], [class*="select" i], [class*="combobox" i], [class*="autocomplete" i]') ||
+                  el.parentElement ||
+                  el;
+                const toggleBtn =
+                  ctrl !== el && ctrl.querySelector?.('button[aria-haspopup="listbox"], button[aria-label*="open" i], [class*="indicator" i]');
+                const target = toggleBtn || ctrl;
+                for (const evt of ['mousedown', 'mouseup', 'click']) {
+                  target.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));
+                }
+                if (typeof el.focus === 'function') el.focus();
+              });
+            }
           });
         };
 
-        const tryPickEnabledOption = async () => {
+        const verifySelfInputCommit = async () => {
+          return comboLoc
+            .evaluate((el, wanted) => {
+              const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+              const w = clean(wanted);
+              if (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') return true;
+              if (el.getAttribute('aria-expanded') === 'false') return true;
+              const attrs = [el.getAttribute('data-value'), el.getAttribute('data-selected'), el.getAttribute('aria-valuetext')];
+              if (attrs.some((v) => clean(v) === w)) return true;
+              const doc = el.ownerDocument || document;
+              const listId = el.getAttribute('aria-controls') || el.getAttribute('aria-owns');
+              const listEl = listId ? doc.getElementById(listId) : null;
+              if (listId && (!listEl || listEl.hidden || getComputedStyle(listEl).display === 'none')) return true;
+              const scope = el.form || doc;
+              for (const h of scope.querySelectorAll('input[type="hidden"], input:not([role="combobox"])')) {
+                if (h !== el && clean(h.value) === w) return true;
+              }
+              for (const opt of doc.querySelectorAll('[role="option"], [cmdk-item], [data-radix-collection-item], [class*="option" i]')) {
+                if (
+                  (opt.getAttribute('aria-selected') === 'true' ||
+                    opt.getAttribute('data-state') === 'checked' ||
+                    opt.getAttribute('data-selected') === 'true' ||
+                    /\bselected\b/i.test(opt.className || '')) &&
+                  clean(opt.textContent).includes(w)
+                ) {
+                  return true;
+                }
+              }
+              const visibleOptions = [...doc.querySelectorAll('[role="option"], [cmdk-item], [data-radix-collection-item]')].filter((o) => {
+                const r = o.getBoundingClientRect();
+                const st = getComputedStyle(o);
+                return r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden';
+              });
+              return visibleOptions.length === 0;
+            }, comboWanted)
+            .catch(() => true);
+        };
+
+        const tryPickEnabledOption = async (requireCommitCheck = false) => {
           let sawDisabledMatch = false;
           let anyVisibleOption = false;
           for (const scope of optionScopes) {
@@ -5237,8 +5350,77 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
                   continue;
                 }
                 await clickWidgetSafely(nth);
+                if (requireCommitCheck && !(await verifySelfInputCommit())) {
+                  return { clicked: false, sawDisabledMatch, anyVisibleOption };
+                }
                 return { clicked: true, sawDisabledMatch, anyVisibleOption };
               }
+            }
+
+            // Fallback for custom portaled combobox items (cmdk, Radix collection items, react-select v3/v4, or ul[role=listbox] > li without role=option).
+            const customMatch = await scope
+              .evaluate((wanted) => {
+                const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+                const wLower = clean(wanted).toLowerCase();
+                if (!wLower) return { hit: false, anyVis: false, disabled: false };
+                for (const old of document.querySelectorAll('[data-tbm-portal-opt]')) {
+                  old.removeAttribute('data-tbm-portal-opt');
+                }
+                const CUSTOM_OPT_SEL =
+                  '[cmdk-item], [data-radix-collection-item], [class*="react-select__option"], [class*="-option"]:not(select), [role="listbox"] > li, [role="listbox"] > button, [role="listbox"] > div[tabindex], [role="menu"] [role="menuitem"], [role="menu"] [role="menuitemradio"]';
+                const nodes = [...document.querySelectorAll(CUSTOM_OPT_SEL)];
+                let anyVis = false;
+                let best = null;
+                let bestTier = 0;
+                let sawDis = false;
+                for (const node of nodes) {
+                  if (node.getAttribute('role') === 'combobox') continue;
+                  const r = node.getBoundingClientRect();
+                  const st = getComputedStyle(node);
+                  if (r.width <= 0 || r.height <= 0 || st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) continue;
+                  anyVis = true;
+                  const txt = clean(node.innerText || node.textContent);
+                  const val = clean(node.getAttribute('data-value') || '');
+                  const tLower = txt.toLowerCase();
+                  const vLower = val.toLowerCase();
+                  let tier = 0;
+                  if (tLower === wLower || vLower === wLower) tier = 3;
+                  else if (tLower.startsWith(wLower) || vLower.startsWith(wLower)) tier = 2;
+                  else if (tLower.includes(wLower) || vLower.includes(wLower)) tier = 1;
+                  if (tier === 0) continue;
+                  const dis = Boolean(
+                    node.disabled ||
+                    node.getAttribute('aria-disabled') === 'true' ||
+                    node.getAttribute('data-disabled') === 'true' ||
+                    node.hasAttribute('data-disabled') && node.getAttribute('data-disabled') !== 'false' ||
+                    node.closest('[aria-disabled="true"]')
+                  );
+                  if (dis) {
+                    sawDis = true;
+                    continue;
+                  }
+                  if (tier > bestTier) {
+                    bestTier = tier;
+                    best = node;
+                    if (tier === 3) break;
+                  }
+                }
+                if (best) {
+                  best.setAttribute('data-tbm-portal-opt', '1');
+                  return { hit: true, anyVis: true, disabled: false };
+                }
+                return { hit: false, anyVis, disabled: sawDis };
+              }, comboWanted)
+              .catch(() => ({ hit: false, anyVis: false, disabled: false }));
+            if (customMatch.anyVis) anyVisibleOption = true;
+            if (customMatch.disabled) sawDisabledMatch = true;
+            if (customMatch.hit) {
+              const optLoc = scope.locator('[data-tbm-portal-opt="1"]').first();
+              await clickWidgetSafely(optLoc);
+              if (requireCommitCheck && !(await verifySelfInputCommit())) {
+                return { clicked: false, sawDisabledMatch, anyVisibleOption };
+              }
+              return { clicked: true, sawDisabledMatch, anyVisibleOption };
             }
           }
           return { clicked: false, sawDisabledMatch, anyVisibleOption };
@@ -5257,12 +5439,13 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
           } else if (preCheck.sawDisabledMatch) {
             // Target option is still disabled in the already-open dropdown
           } else if (!preCheck.anyVisibleOption) {
-            await clickWidgetSafely(comboLoc);
+            await clickWidgetSafely(comboLoc, true);
           }
         } else {
-          await clickWidgetSafely(comboLoc);
+          await clickWidgetSafely(comboLoc, true);
         }
 
+        // Wait briefly for options to appear; if a search input is already ready in the portal or trigger, move to typing quickly.
         if (!clickedOption) {
           for (let attempt = 0; attempt < 18; attempt++) {
             const pollRes = await tryPickEnabledOption();
@@ -5275,45 +5458,183 @@ export async function smartFillForm(page, spec = {}, previousLinesSet = null) {
               await comboLoc.evaluate((el) => el.setAttribute('data-tbm-combo-open', '1')).catch(() => {});
               break;
             }
-            // The list is open but the option is not rendered (paged, windowed or filtered list):
-            // stop polling and go to the search box / keyboard steps below.
-            if (pollRes.anyVisibleOption && attempt >= 2) break;
+            if (attempt >= 2) {
+              if (pollRes.anyVisibleOption) break;
+              const hasSearchBoxReady = await comboLoc
+                .evaluate((el) => {
+                  const doc = el.ownerDocument || document;
+                  if (el.matches?.('input, textarea') && !el.readOnly && !el.disabled) return true;
+                  if (doc.activeElement && doc.activeElement !== el && doc.activeElement.matches?.('input, textarea')) return true;
+                  return Boolean(doc.querySelector('[cmdk-input], [role="dialog"] input, [data-radix-popper-content-wrapper] input, [role="listbox"] input'));
+                })
+                .catch(() => false);
+              if (hasSearchBoxReady) break;
+            }
             await page.waitForTimeout(35);
           }
         }
 
         if (!clickedOption) {
-          // Portaled lists with their own search box: the box is focused on open, or sits next to
-          // the listbox named by aria-controls. Type the wanted text there, then pick the option.
-          const searchHandle = await comboLoc.evaluateHandle((el) => {
-            const isText = (n) => Boolean(n && n !== el && n.matches?.(
-              'input:not([type]), input[type="text"], input[type="search"], textarea') && !n.readOnly && !n.disabled);
-            const doc = el.ownerDocument;
-            if (isText(doc.activeElement)) return doc.activeElement;
-            const id = el.getAttribute('aria-controls') || el.getAttribute('aria-owns');
-            let box = id ? doc.getElementById(id) : null;
-            for (let up = 0; box && up < 3; up++, box = box.parentElement) {
-              const input = [...box.querySelectorAll('input, textarea')].find(isText);
-              if (input) return input;
-            }
-            return null;
-          }).catch(() => null);
+          // Portaled searchable comboboxes (Radix/cmdk, MUI Autocomplete, Headless UI Combobox, react-select):
+          // locate the search input in the portal, aria-controls container, combobox wrapper, or trigger itself,
+          // type the filter query, and click the matching option in the portal.
+          const searchHandle = await comboLoc
+            .evaluateHandle((el) => {
+              const isEditableInput = (n) => {
+                if (!n || !n.matches?.('input:not([type]), input[type="text"], input[type="search"], input[role="combobox"], [cmdk-input], textarea')) {
+                  return false;
+                }
+                if (n.readOnly || n.disabled || n.getAttribute('aria-disabled') === 'true') return false;
+                const st = getComputedStyle(n);
+                if (st.display === 'none' || st.visibility === 'hidden') return false;
+                const r = n.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) {
+                  const ctrl = n.closest('[class*="control" i], [class*="select" i], [class*="combobox" i]');
+                  if (!ctrl) return false;
+                  const cr = ctrl.getBoundingClientRect();
+                  return cr.width > 0 && cr.height > 0;
+                }
+                return true;
+              };
+              const doc = el.ownerDocument || document;
+              // 1. Focused search input inside the newly opened portal
+              if (doc.activeElement && doc.activeElement !== el && isEditableInput(doc.activeElement)) {
+                return doc.activeElement;
+              }
+              // 2. Input linked via aria-controls / aria-owns on el or its wrapper
+              const ctrlSource = el.hasAttribute('aria-controls') || el.hasAttribute('aria-owns')
+                ? el
+                : el.closest?.('[aria-controls], [aria-owns]') || el.querySelector?.('[aria-controls], [aria-owns]');
+              const id = ctrlSource ? (ctrlSource.getAttribute('aria-controls') || ctrlSource.getAttribute('aria-owns')) : '';
+              let box = id ? doc.getElementById(id) : null;
+              for (let up = 0; box && box !== doc.body && box.tagName !== 'FORM' && up < 4; up++, box = box.parentElement) {
+                const input = [...box.querySelectorAll('input, textarea')].find((n) => n !== el && isEditableInput(n));
+                if (input) return input;
+              }
+              // 3. Input inside el itself or its immediate combobox control wrapper (react-select, Headless UI, MUI)
+              if (!el.matches?.('input, textarea')) {
+                const innerInput = [...el.querySelectorAll('input, textarea')].find(isEditableInput);
+                if (innerInput) return innerInput;
+                const ctrlWrap = el.closest?.('[role="combobox"], [class*="select" i], [class*="combobox" i], [class*="autocomplete" i]');
+                if (ctrlWrap) {
+                  const wrapInput = [...ctrlWrap.querySelectorAll('input, textarea')].find(isEditableInput);
+                  if (wrapInput) return wrapInput;
+                }
+              }
+              // 4. Input inside any visible open portal / popover / dialog / listbox container
+              const PORTAL_SEL =
+                '[data-radix-popper-content-wrapper], [cmdk-root], [role="dialog"], [data-headlessui-state*="open" i], [class*="portal" i], [class*="popover" i], [class*="popper" i], [class*="dropdown" i], [class*="menu" i]';
+              for (const portal of doc.querySelectorAll(PORTAL_SEL)) {
+                if (portal.contains(el)) continue;
+                const pr = portal.getBoundingClientRect();
+                const pst = getComputedStyle(portal);
+                if (pr.width <= 0 || pr.height <= 0 || pst.display === 'none' || pst.visibility === 'hidden') continue;
+                const hasListOrCmdk = Boolean(
+                  portal.querySelector('[role="listbox"], [role="option"], [cmdk-list], [cmdk-item], [cmdk-input], [data-radix-collection-item], [class*="option" i]')
+                );
+                if (!hasListOrCmdk) continue;
+                const portalInput = [...portal.querySelectorAll('input, textarea')].find(isEditableInput);
+                if (portalInput) return portalInput;
+              }
+              // 5. Any visible [cmdk-input] or search input adjacent to a visible [role="listbox"]
+              for (const lb of doc.querySelectorAll('[role="listbox"], [cmdk-list]')) {
+                const lr = lb.getBoundingClientRect();
+                const lst = getComputedStyle(lb);
+                if (lr.width <= 0 || lr.height <= 0 || lst.display === 'none' || lst.visibility === 'hidden') continue;
+                let anc = lb.parentElement;
+                for (let up = 0; anc && anc !== doc.body && anc.tagName !== 'FORM' && up < 3; up++, anc = anc.parentElement) {
+                  const adjInput = [...anc.querySelectorAll('input, textarea')].find((n) => n !== el && isEditableInput(n));
+                  if (adjInput) return adjInput;
+                }
+              }
+              // 6. Trigger el itself is a searchable <input role="combobox"> (MUI Autocomplete, Headless UI, react-select)
+              if (isEditableInput(el)) return el;
+              return null;
+            })
+            .catch(() => null);
           const searchEl = searchHandle?.asElement?.() || null;
           if (searchEl) {
-            await searchEl.fill(comboWanted).catch(() => {});
+            const isSelfInput = await comboLoc.evaluate((el, s) => el === s, searchEl).catch(() => false);
+            await searchEl.focus().catch(() => {});
+            await searchEl.fill(comboWanted).catch(async () => {
+              await searchEl.evaluate((inp, val) => {
+                const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+                if (setter) setter.call(inp, val);
+                else inp.value = val;
+                inp.dispatchEvent(new InputEvent('input', { bubbles: true, data: val, inputType: 'insertText' }));
+                inp.dispatchEvent(new Event('change', { bubbles: true }));
+              }, comboWanted).catch(() => {});
+            });
             for (let attempt = 0; attempt < 18 && !clickedOption; attempt++) {
-              const pollRes = await tryPickEnabledOption();
+              const pollRes = await tryPickEnabledOption(isSelfInput);
               if (pollRes.clicked) {
                 clickedOption = true;
                 await comboLoc.evaluate((el) => el.removeAttribute('data-tbm-combo-open')).catch(() => {});
-              } else if (pollRes.sawDisabledMatch) {
                 break;
+              }
+              if (pollRes.sawDisabledMatch) {
+                break;
+              }
+              // If .fill() did not trigger a keystroke-based filter after 3 polls, type with real key events once.
+              if (attempt === 3) {
+                await searchEl.focus().catch(() => {});
+                await searchEl.evaluate((inp) => {
+                  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+                  if (setter) setter.call(inp, '');
+                  else inp.value = '';
+                  inp.dispatchEvent(new Event('input', { bubbles: true }));
+                }).catch(() => {});
+                await page.keyboard.type(comboWanted).catch(() => {});
               } else {
                 await page.waitForTimeout(35);
               }
             }
           }
           await searchHandle?.dispose?.().catch(() => {});
+        }
+
+        if (!clickedOption) {
+          // Scrollable virtualized listbox (e.g. react-window / MUI virtualized 200+ options mounted on scroll).
+          const hasScrollableListbox = await page
+            .evaluate(() => {
+              for (const lb of document.querySelectorAll('[role="listbox"], [cmdk-list]')) {
+                const r = lb.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) continue;
+                const candidates = [lb, ...lb.querySelectorAll('*')];
+                for (const c of candidates) {
+                  if (c.scrollHeight > c.clientHeight + 16) return true;
+                }
+              }
+              return false;
+            })
+            .catch(() => false);
+          if (hasScrollableListbox) {
+            for (let step = 0; step < 45 && !clickedOption; step++) {
+              const moved = await page
+                .evaluate(() => {
+                  for (const lb of document.querySelectorAll('[role="listbox"], [cmdk-list]')) {
+                    const r = lb.getBoundingClientRect();
+                    if (r.width <= 0 || r.height <= 0) continue;
+                    const scroller = [lb, ...lb.querySelectorAll('*')].find((c) => c.scrollHeight > c.clientHeight + 16);
+                    if (!scroller) continue;
+                    const before = scroller.scrollTop;
+                    scroller.scrollTop = before + Math.max(140, Math.floor(scroller.clientHeight * 0.9));
+                    scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+                    return scroller.scrollTop !== before;
+                  }
+                  return false;
+                })
+                .catch(() => false);
+              await page.waitForTimeout(15);
+              const pollRes = await tryPickEnabledOption();
+              if (pollRes.clicked) {
+                clickedOption = true;
+                await comboLoc.evaluate((el) => el.removeAttribute('data-tbm-combo-open')).catch(() => {});
+                break;
+              }
+              if (!moved) break;
+            }
+          }
         }
 
         if (!clickedOption) {
@@ -5900,118 +6221,397 @@ function watchActionNavigation(page, timeout) {
 }
 
 /**
- * Scroll-and-collect for virtualized feeds: reads innerText of every element matching `selector`, scrolls (the
- * nearest scrollable ancestor of the first match, else the window), repeats, and returns the unique items.
- * One round trip; the loop runs inside the page. Dedupe is by a cheap text hash.
+ * Scroll-and-collect for virtualized feeds and multi-page lists/tables: reads matching elements (`selector`),
+ * optionally scrolls `scrolls` times per page, optionally clicks a pagination control (`nextText` / `nextSelector`,
+ * up to `maxPages` pages, stopping when Next disappears or is disabled), and returns deduplicated items.
  */
 export async function collectItems(page, step = {}) {
   const selector = String(step.selector || '');
   if (!selector) throw new Error('collect requires selector.');
-  const scrolls = Math.min(60, Math.max(0, Number.isFinite(Number(step.scrolls)) ? Number(step.scrolls) : 5));
+  const nextSelector = step.nextSelector ? String(step.nextSelector).trim() : '';
+  const nextText = step.nextText ? String(step.nextText).trim() : '';
+  const hasPagination = Boolean(nextSelector || nextText || Number(step.maxPages) > 1);
+  const maxPages = hasPagination ? Math.min(50, Math.max(1, Number(step.maxPages) || 10)) : 1;
+  const scrolls = Math.min(
+    60,
+    Math.max(0, Number.isFinite(Number(step.scrolls)) ? Number(step.scrolls) : hasPagination ? 0 : 5)
+  );
   const waitMs = Math.min(5000, Math.max(0, Number.isFinite(Number(step.waitMs)) ? Number(step.waitMs) : 400));
   const maxItems = Math.min(2000, Math.max(1, Number(step.maxItems) || 100));
   const maxChars = Math.max(200, Number(step.maxChars) || 8000);
-  const fields = Array.isArray(step.fields) ? step.fields.filter((f) => f === 'text' || f === 'href' || f === 'id') : [];
+  const rawFields = Array.isArray(step.fields) ? step.fields.map((f) => String(f || '').trim()).filter(Boolean) : [];
+  const tableJsonMode = step.format === 'table_json';
   const sub = String(step.itemSelector || step.textSelector || '');
   const t0 = Date.now();
-  const r = await page.evaluate(
-    async ({ sel, sub, scrolls: nScrolls, waitMs: wait, maxItems: cap, maxChars: charCap, fields: want }) => {
-      const hash = (s) => {
-        let h = 5381;
-        for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) | 0;
-        return `${s.length}:${h}`;
-      };
-      const seen = new Set(); // per call only: nothing survives between collect calls or navigations
-      const items = [];
-      let chars = 0;
-      let full = false;
-      let matched = 0;
-      const read = () => {
-        let added = 0;
-        const els = document.querySelectorAll(sel);
-        matched = Math.max(matched, els.length);
-        for (const el of els) {
-          if (full) break;
-          const tEl = sub ? el.querySelector(sub) : el;
-          if (!tEl) continue;
-          const text = (tEl.innerText || '').replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n').trim().slice(0, 1500);
-          if (!text) continue;
-          const key = hash(text.replace(/\s+/g, ' ').trim());
-          if (seen.has(key)) continue;
+
+  const seenKeys = new Set();
+  const allItems = [];
+  let totalChars = 0;
+  let totalScrolls = 0;
+  let full = false;
+  let maxMatchedOnAnyPage = 0;
+  let pagesVisited = 0;
+
+  for (let pageNum = 1; pageNum <= maxPages; pageNum++) {
+    const pageRes = await page.evaluate(
+      async ({
+        sel,
+        sub,
+        scrolls: nScrolls,
+        waitMs: wait,
+        maxItems: cap,
+        maxChars: charCap,
+        fields: want,
+        tableJson,
+        seenArr,
+        curCount,
+        curChars,
+      }) => {
+        const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+        const parseCellVal = (raw) => {
+          const s = clean(raw);
+          if (/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(s)) {
+            const n = Number(s);
+            if (Number.isFinite(n)) return n;
+          }
+          return s;
+        };
+        const tableHeadersFor = (tbl) => {
+          if (!tbl) return [];
+          const headRows = [...tbl.querySelectorAll('thead tr')];
+          const hdrTr = headRows.length > 0 ? headRows[headRows.length - 1] : tbl.querySelector('tr');
+          if (!hdrTr) return [];
+          const cells = [...hdrTr.children].filter((c) => c.tagName === 'TH' || c.tagName === 'TD');
+          if (headRows.length === 0 && !cells.some((c) => c.tagName === 'TH')) return [];
+          return cells.map((c, idx) => clean(c.innerText || c.textContent) || `col${idx + 1}`);
+        };
+        const isBuiltInFieldsOnly =
+          want.length > 0 && want.every((f) => f === 'text' || f === 'href' || f === 'id');
+        const hash = (s) => {
+          let h = 5381;
+          for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) | 0;
+          return `${s.length}:${h}`;
+        };
+        const seen = new Set(seenArr);
+        const pageItems = [];
+        const newKeys = [];
+        let count = curCount;
+        let chars = curChars;
+        let isFull = false;
+        let matched = 0;
+
+        const addCandidate = (item, keyStr) => {
+          if (isFull || !keyStr) return false;
+          const key = hash(keyStr);
+          if (seen.has(key)) return false;
+          const size = typeof item === 'string' ? item.length : JSON.stringify(item).length;
+          if (count >= cap || chars + size > charCap) {
+            isFull = true;
+            return false;
+          }
           seen.add(key);
-          let item = text;
-          if (want.length) {
-            item = {};
-            for (const f of want) {
-              if (f === 'text') item.text = text;
-              else if (f === 'id') {
-                const v = el.id || el.getAttribute('data-id');
-                if (v) item.id = v;
-              } else if (f === 'href') {
-                // textSelector on (or inside) a link: that link's URL, not the row's first anchor (an upvote link).
-                const own = sub ? tEl.closest('a[href]') : null;
-                const v = (own || (el.matches('a[href]') ? el : el.querySelector('a[href]')))?.href;
-                if (v) item.href = v;
+          newKeys.push(key);
+          pageItems.push(item);
+          count++;
+          chars += size;
+          return true;
+        };
+
+        const read = () => {
+          let added = 0;
+          const rawEls = [...document.querySelectorAll(sel)];
+          const els = [];
+          for (const el of rawEls) {
+            if (el.tagName === 'TABLE') {
+              const bodyRows = [...el.querySelectorAll('tbody tr')];
+              if (bodyRows.length > 0) els.push(...bodyRows);
+              else els.push(...[...el.querySelectorAll('tr')].filter((tr) => !tr.closest('thead, tfoot')));
+            } else {
+              els.push(el);
+            }
+          }
+          matched = Math.max(matched, els.length);
+          for (const el of els) {
+            if (isFull) break;
+            const isTableRow = el.tagName === 'TR';
+            if (isTableRow && (tableJson || (want.length > 0 && !isBuiltInFieldsOnly))) {
+              if (el.closest('thead, tfoot')) continue;
+              const directCells = [...el.children].filter((c) => c.tagName === 'TD' || c.tagName === 'TH');
+              if (directCells.length === 0 || directCells.every((c) => c.tagName === 'TH')) continue;
+              const tbl = el.closest('table');
+              const headers = tableHeadersFor(tbl);
+              const rowObj = {};
+              directCells.forEach((cell, idx) => {
+                const colName = headers[idx] || want[idx] || `col${idx + 1}`;
+                rowObj[colName] = parseCellVal(cell.innerText || cell.textContent);
+              });
+              let outObj = rowObj;
+              if (want.length > 0 && !tableJson) {
+                outObj = {};
+                for (const f of want) {
+                  const hitKey = Object.keys(rowObj).find((k) => k.toLowerCase() === f.toLowerCase());
+                  if (hitKey !== undefined) outObj[hitKey] = rowObj[hitKey];
+                }
+                if (Object.keys(outObj).length === 0) outObj = rowObj;
+              }
+              if (addCandidate(outObj, JSON.stringify(outObj))) added++;
+              continue;
+            }
+
+            const tEl = sub ? el.querySelector(sub) : el;
+            if (!tEl) continue;
+            const text = (tEl.innerText || '')
+              .replace(/[ \t]+/g, ' ')
+              .replace(/\n\s*\n+/g, '\n')
+              .trim()
+              .slice(0, 1500);
+            if (!text) continue;
+            const keyStr = text.replace(/\s+/g, ' ').trim();
+            let item = text;
+            if (want.length) {
+              item = {};
+              for (const f of want) {
+                if (f === 'text') item.text = text;
+                else if (f === 'id') {
+                  const v = el.id || el.getAttribute('data-id');
+                  if (v) item.id = v;
+                } else if (f === 'href') {
+                  const own = sub ? tEl.closest('a[href]') : null;
+                  const v = (own || (el.matches('a[href]') ? el : el.querySelector('a[href]')))?.href;
+                  if (v) item.href = v;
+                }
+              }
+              if (!Object.keys(item).length) item = text;
+            }
+            if (addCandidate(item, keyStr)) added++;
+          }
+          return added;
+        };
+
+        const scroller = () => {
+          const first = document.querySelector(sel);
+          for (let p = first?.parentElement; p && p !== document.body; p = p.parentElement) {
+            const st = getComputedStyle(p);
+            if (/(auto|scroll)/.test(st.overflowY) && p.scrollHeight > p.clientHeight + 4) return p;
+          }
+          return null;
+        };
+
+        let pageAdded = read();
+        if (!matched) {
+          for (let k = 0; k < 6 && !matched; k++) {
+            await new Promise((res) => setTimeout(res, 150));
+            pageAdded += read();
+          }
+        }
+        let done = 0;
+        let idle = 0;
+        for (let i = 0; i < nScrolls && !isFull; i++) {
+          const box = scroller();
+          const before = box ? box.scrollTop : window.scrollY;
+          const stepPx = Math.max(200, Math.floor((box ? box.clientHeight : window.innerHeight) * 0.9));
+          if (box) box.scrollTop = before + stepPx;
+          else window.scrollBy(0, stepPx);
+          done++;
+          await new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)));
+          await new Promise((res) => setTimeout(res, wait));
+          const moved = (box ? box.scrollTop : window.scrollY) !== before;
+          let added = read();
+          if (moved && added === 0) {
+            await new Promise((res) => setTimeout(res, Math.max(wait, 150)));
+            added = read();
+          }
+          pageAdded += added;
+          idle = added === 0 && !moved ? idle + 1 : added === 0 ? idle : 0;
+          if (idle >= 1) break;
+        }
+        return {
+          pageItems,
+          newKeys,
+          scrolls: done,
+          full: isFull,
+          matched,
+          pageAdded,
+          chars,
+        };
+      },
+      {
+        sel: selector,
+        sub,
+        scrolls,
+        waitMs,
+        maxItems,
+        maxChars,
+        fields: rawFields,
+        tableJson: tableJsonMode,
+        seenArr: [...seenKeys],
+        curCount: allItems.length,
+        curChars: totalChars,
+      }
+    );
+
+    pagesVisited = pageNum;
+    for (const k of pageRes.newKeys) seenKeys.add(k);
+    allItems.push(...pageRes.pageItems);
+    totalChars = pageRes.chars;
+    totalScrolls += pageRes.scrolls;
+    full = pageRes.full;
+    maxMatchedOnAnyPage = Math.max(maxMatchedOnAnyPage, pageRes.matched);
+
+    if (full || pageNum >= maxPages) break;
+
+    // Locate and validate the Next pagination button/link.
+    const hasNext = await page
+      .evaluate(
+        ({ nextSel, nextTxt, nextPageNum }) => {
+          const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+          for (const old of document.querySelectorAll('[data-tbm-collect-next]')) {
+            old.removeAttribute('data-tbm-collect-next');
+          }
+          const isVisible = (el) => {
+            if (!el || el.nodeType !== 1) return false;
+            const r = el.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0) return false;
+            const st = getComputedStyle(el);
+            return st.display !== 'none' && st.visibility !== 'hidden' && Number(st.opacity) !== 0;
+          };
+          const isDisabled = (el) => {
+            let cur = el;
+            for (let d = 0; cur && cur.nodeType === 1 && d < 4; d++, cur = cur.parentElement) {
+              if (
+                cur.disabled ||
+                Boolean(cur.matches?.(':disabled')) ||
+                cur.getAttribute('aria-disabled') === 'true' ||
+                cur.hasAttribute('disabled') ||
+                /\bdisabled\b/i.test(typeof cur.className === 'string' ? cur.className : '')
+              ) {
+                return true;
               }
             }
-            if (!Object.keys(item).length) item = text;
+            const tag = (el.tagName || '').toUpperCase();
+            if (tag === 'A') {
+              const href = (el.getAttribute('href') || '').trim();
+              if (!href && !el.hasAttribute('onclick') && el.getAttribute('role') !== 'button') {
+                // Anchor without href or click handler is often an inactive pagination item
+              }
+            }
+            return false;
+          };
+
+          if (nextSel) {
+            const matches = [...document.querySelectorAll(nextSel)].filter(isVisible);
+            const enabled = matches.find((el) => !isDisabled(el));
+            if (!enabled) return false;
+            enabled.setAttribute('data-tbm-collect-next', '1');
+            return true;
           }
-          const size = typeof item === 'string' ? item.length : JSON.stringify(item).length;
-          if (items.length >= cap || chars + size > charCap) {
-            full = true;
-            break;
+
+          const ACT_SEL =
+            'a[href], button, input[type="button"], input[type="submit"], [role="button"], [role="link"], [onclick]';
+          const candidates = [...document.querySelectorAll(ACT_SEL)].filter(isVisible);
+
+          if (nextTxt) {
+            const want = clean(nextTxt).toLowerCase();
+            const scored = [];
+            let sawAnyMatch = false;
+            for (const el of candidates) {
+              const labels = [
+                clean(el.innerText || el.textContent),
+                clean(el.getAttribute('aria-label')),
+                clean(el.getAttribute('title')),
+                clean(el.value),
+              ].filter(Boolean);
+              let tier = 0;
+              for (const l of labels) {
+                const ll = l.toLowerCase();
+                if (ll === want) {
+                  tier = 3;
+                  break;
+                }
+                if (ll.startsWith(want) || ll.endsWith(want)) tier = Math.max(tier, 2);
+                else if (ll.includes(want)) tier = Math.max(tier, 1);
+              }
+              if (tier > 0) {
+                sawAnyMatch = true;
+                if (!isDisabled(el)) scored.push({ el, tier });
+              }
+            }
+            if (scored.length > 0) {
+              scored.sort((a, b) => b.tier - a.tier);
+              scored[0].el.setAttribute('data-tbm-collect-next', '1');
+              return true;
+            }
+            // If a matching Next control exists on the page but is disabled, stop immediately.
+            if (sawAnyMatch) return false;
           }
-          items.push(item);
-          chars += size;
-          added++;
-        }
-        return added;
-      };
-      const scroller = () => {
-        const first = document.querySelector(sel);
-        for (let p = first?.parentElement; p && p !== document.body; p = p.parentElement) {
-          const st = getComputedStyle(p);
-          if (/(auto|scroll)/.test(st.overflowY) && p.scrollHeight > p.clientHeight + 4) return p;
-        }
-        return null;
-      };
-      read();
-      if (!matched) {
-        // Rows rendered a beat after domcontentloaded: poll briefly before declaring the page empty.
-        for (let k = 0; k < 6 && !matched; k++) {
-          await new Promise((res) => setTimeout(res, 150));
-          read();
-        }
-      }
-      let done = 0;
-      let idle = 0;
-      for (let i = 0; i < nScrolls && !full; i++) {
-        const box = scroller();
-        const before = box ? box.scrollTop : window.scrollY;
-        const step = Math.max(200, Math.floor((box ? box.clientHeight : window.innerHeight) * 0.9));
-        if (box) box.scrollTop = before + step;
-        else window.scrollBy(0, step);
-        done++;
-        // Wait for two frames (scroll handlers render on the next frame), then waitMs.
-        await new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)));
-        await new Promise((res) => setTimeout(res, wait));
-        const moved = (box ? box.scrollTop : window.scrollY) !== before;
-        let added = read();
-        // Slow renderers (busy page, slow device) may not have swapped items in yet: give them one more wait
-        // before scrolling again, otherwise the next scroll skips the items that were about to appear.
-        if (moved && added === 0) {
-          await new Promise((res) => setTimeout(res, Math.max(wait, 150)));
-          added = read();
-        }
-        idle = added === 0 && !moved ? idle + 1 : added === 0 ? idle : 0;
-        if (idle >= 1) break;
-      }
-      return { items, scrolls: done, truncated: full, matched };
-    },
-    { sel: selector, sub, scrolls, waitMs, maxItems, maxChars, fields }
-  );
-  const res = { ok: true, action: 'collect', count: r.items.length, scrolls: r.scrolls, truncated: r.truncated, items: r.items, elapsedMs: Date.now() - t0 };
-  if (!r.items.length) res.note = r.matched ? `${r.matched} elements matched but none had text` : 'selector matched 0 elements';
+
+          // Fallback for numbered pagination links ("Page 2", "2", or ?page=2) when nextText is generic ("Next"/"Page") or maxPages > 1.
+          if (!nextTxt || /^(next(\s+page)?|page|[>›»])$/i.test(clean(nextTxt))) {
+            const wantPageLbl = `page ${nextPageNum}`;
+            const wantNumStr = String(nextPageNum);
+            const pageRe = new RegExp(`[?&]page=${nextPageNum}(?:[&#]|$)`, 'i');
+            for (const el of candidates) {
+              if (isDisabled(el)) continue;
+              const txt = clean(el.innerText || el.textContent).toLowerCase();
+              const aria = clean(el.getAttribute('aria-label')).toLowerCase();
+              const href = el.getAttribute('href') || '';
+              if (
+                txt === wantPageLbl ||
+                aria === wantPageLbl ||
+                ((txt === wantNumStr || pageRe.test(href)) &&
+                  Boolean(el.closest('nav, [role="navigation"], [class*="pag" i], ul, ol') || pageRe.test(href)))
+              ) {
+                el.setAttribute('data-tbm-collect-next', '1');
+                return true;
+              }
+            }
+          }
+
+          return false;
+        },
+        { nextSel: nextSelector, nextTxt: nextText, nextPageNum: pageNum + 1 }
+      )
+      .catch(() => false);
+
+    if (!hasNext) break;
+
+    const urlBefore = page.url();
+    const firstKeyBefore = pageRes.newKeys[0] || '';
+    const navWatch = watchActionNavigation(page, DEFAULT_TIMEOUT_MS);
+    const actWatch = watchActivity(page);
+    try {
+      const nextLoc = page.locator('[data-tbm-collect-next="1"]').first();
+      await nextLoc.click({ timeout: 2500 });
+      await navWatch.finish();
+      await actWatch.settle({ minMs: Math.min(waitMs, 60), capMs: Math.max(waitMs, 800) });
+    } catch {
+      break;
+    } finally {
+      navWatch.remove();
+      actWatch.remove();
+    }
+
+    // If neither URL changed nor any new items appeared on the previous page, guard against infinite loops on no-op buttons.
+    if (pageNum > 1 && pageRes.pageAdded === 0 && page.url() === urlBefore && !firstKeyBefore) {
+      break;
+    }
+  }
+
+  const res = {
+    ok: true,
+    action: 'collect',
+    count: allItems.length,
+    scrolls: totalScrolls,
+    ...(hasPagination ? { pages: pagesVisited } : {}),
+    truncated: full,
+    items: allItems,
+    elapsedMs: Date.now() - t0,
+  };
+  if (!allItems.length) {
+    res.note = maxMatchedOnAnyPage
+      ? `${maxMatchedOnAnyPage} elements matched but none had text`
+      : 'selector matched 0 elements';
+  }
   return res;
 }
 
@@ -6062,7 +6662,7 @@ async function executeSingleAction(page, rawParams = {}) {
   const params = { ...rawParams, allowSubmit };
   if (params.ref) await assertCurrentDocumentRef(page, params.ref);
   if (params.targetRef) await assertCurrentDocumentRef(page, params.targetRef);
-  const silentState = { count: 0, wantKind: false, clickKind: '' };
+  const silentState = { count: 0, wantKind: false, clickKind: '', editorOpen: false };
   const enabled = params.observeAftermath ?? (process.env.TURBO_BROWSER_OBSERVE_AFTERMATH === 'true');
   const observer = enabled && ['click', 'dblclick'].includes(params.action) ? observeClickAftermath(page, () => silentState.clickKind) : null;
   const navigation = params.returnSnapshot && ['click', 'dblclick', 'press'].includes(params.action)
@@ -6104,6 +6704,7 @@ async function executeSingleAction(page, rawParams = {}) {
     try { const u = new URL(request.url()); host = u.host; reqPath = u.pathname; } catch { return; }
     if (isBackgroundRequest(request, { pageUrl: page.url(), readNavigation: getNavigation })) return;
     // An allowed submit was the point of the click: the agent knows it submitted, no late warning.
+    if (silentState.editorOpen) return;
     if (returned && params.allowSubmit === true) return;
     if (returned) parkLate(page, `possibleSubmit: ${request.method()} ${host}${reqPath.slice(0, 60)}`);
     else mutating.push({ method: request.method(), host });
@@ -6150,12 +6751,16 @@ async function executeSingleAction(page, rawParams = {}) {
     returned = true;
     if (clickAction) {
       const ok = completed && res && typeof res === 'object' && !res.blocked;
+      if (silentState.editorOpen && res?.aftermath && !res.aftermath.navigated) {
+        res.aftermath.unexpectedSubmit = false;
+        delete res.aftermath.warning;
+      }
       const seen = observer ? (res?.aftermath?.mutatingRequests || []).map((r) => ({ method: r.method, host: (() => { try { return new URL(r.url).host; } catch { return ''; } })() })) : mutating;
-      if (ok && seen.length && params.allowSubmit !== true) {
+      if (ok && seen.length && params.allowSubmit !== true && !silentState.editorOpen) {
         res.possibleSubmit = true;
         res.request = `${seen[0].method} ${seen[0].host}`;
       }
-      if (observer || !ok || params.allowSubmit === true) { watchOpen = false; page.off('request', onMutating); }
+      if (observer || !ok || params.allowSubmit === true || silentState.editorOpen) { watchOpen = false; page.off('request', onMutating); }
       else {
         const off = () => { watchOpen = false; page.off('request', onMutating); };
         const t = setTimeout(off, 800);
@@ -7304,6 +7909,13 @@ ${el.value || ''}`.toLowerCase();
         };
       }
       isSafeLocatorClick = Boolean(meta.isSafeSubmit);
+      const cleanMetaLbl = String(meta.label || '').replace(/^[^\p{L}\p{N}]+/u, '').trim();
+      if (
+        (cleanMetaLbl && EDITOR_OPEN_LABEL_RE.test(cleanMetaLbl)) ||
+        (typeof params.text === 'string' && EDITOR_OPEN_LABEL_RE.test(params.text.trim()))
+      ) {
+        silentState.editorOpen = true;
+      }
       await locator.scrollIntoViewIfNeeded({ timeout }).catch(() => {});
       const box = await locator.boundingBox().catch(() => null);
       if (box && box.width > 0 && box.height > 0) {
@@ -7936,7 +8548,7 @@ export async function actFast(page, params = {}, previousLinesSet = null) {
         query: params.snapshotQuery,
         afterNavOrSubmit: Boolean(
           allowSubmit ||
-          res.outcome ||
+          res.outcome === 'navigated' ||
           res.url ||
           ['reload', 'back', 'forward'].includes(params.action)
         ),
@@ -8229,9 +8841,172 @@ export async function extractCleanText(page, options = {}) {
   const maxChars = Math.max(1, Number(options.maxChars) || 6000);
   const includeFrames = options.includeFrames !== false;
   let selector = options.selector || null;
-  const format = options.format === 'markdown' ? 'markdown' : 'text';
+  const format =
+    options.format === 'markdown'
+      ? 'markdown'
+      : options.format === 'table_json'
+        ? 'table_json'
+        : 'text';
 
   const frames = includeFrames ? getAllFrames(page) : getAllFrames(page).slice(0, 1);
+
+  if (format === 'table_json') {
+    const allRows = [];
+    for (const frameInfo of frames) {
+      const frameRows = await frameInfo.frame
+        .evaluate((sel) => {
+          const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+          const parseCellVal = (raw) => {
+            const s = clean(raw);
+            if (/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(s)) {
+              const n = Number(s);
+              if (Number.isFinite(n)) return n;
+            }
+            return s;
+          };
+          const getSR = (node) => node?.shadowRoot || window.__tbmGetShadowRoot?.(node) || null;
+          const findDeepAll = (rootNode, query) => {
+            const seen = new Set();
+            const out = [];
+            const stack = [rootNode];
+            while (stack.length > 0) {
+              const cur = stack.shift();
+              if (!cur) continue;
+              const sr = getSR(cur);
+              if (sr) stack.push(sr);
+              if (!cur.querySelectorAll) continue;
+              let matches = [];
+              try {
+                matches = cur.querySelectorAll(query);
+              } catch {
+                return out;
+              }
+              for (const m of matches) {
+                if (!seen.has(m)) {
+                  seen.add(m);
+                  out.push(m);
+                }
+              }
+              for (const el of cur.querySelectorAll('*')) {
+                const elSr = getSR(el);
+                if (elSr) stack.push(elSr);
+              }
+            }
+            return out;
+          };
+          const isHidden = (el) => {
+            let cur = el;
+            while (cur && cur.nodeType === 1) {
+              if (cur.hasAttribute('hidden') || cur.getAttribute('aria-hidden') === 'true') return true;
+              try {
+                const st = getComputedStyle(cur);
+                if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) return true;
+              } catch {}
+              const rn = cur.getRootNode?.();
+              cur = cur.parentElement || (rn instanceof ShadowRoot ? rn.host : null);
+            }
+            return false;
+          };
+          const extractTableRows = (tbl, onlyRows = null) => {
+            const headRows = [...tbl.querySelectorAll('thead tr')].filter((tr) => !isHidden(tr));
+            let hdrTr = headRows.length > 0 ? headRows[headRows.length - 1] : null;
+            if (!hdrTr) {
+              const firstTr = [...tbl.querySelectorAll('tr')].find((tr) => !isHidden(tr));
+              if (firstTr && [...firstTr.children].some((c) => c.tagName === 'TH')) hdrTr = firstTr;
+            }
+            const headers = hdrTr
+              ? [...hdrTr.children]
+                  .filter((c) => (c.tagName === 'TH' || c.tagName === 'TD') && !isHidden(c))
+                  .map((c, idx) => clean(c.innerText || c.textContent) || `col${idx + 1}`)
+              : [];
+            const candidateTrs =
+              onlyRows ||
+              ([...tbl.querySelectorAll('tbody tr')].length > 0
+                ? [...tbl.querySelectorAll('tbody tr')]
+                : [...tbl.querySelectorAll('tr')].filter((tr) => !tr.closest('thead, tfoot')));
+            const out = [];
+            for (const tr of candidateTrs) {
+              if (tr === hdrTr || isHidden(tr)) continue;
+              const cells = [...tr.children].filter((c) => (c.tagName === 'TD' || c.tagName === 'TH') && !isHidden(c));
+              if (cells.length === 0) continue;
+              if (cells.every((c) => c.tagName === 'TH')) continue;
+              const rowObj = {};
+              let hasContent = false;
+              cells.forEach((cell, idx) => {
+                const key = headers[idx] || `col${idx + 1}`;
+                const val = parseCellVal(cell.innerText || cell.textContent);
+                if (val !== '') hasContent = true;
+                rowObj[key] = val;
+              });
+              if (hasContent) out.push(rowObj);
+            }
+            return out;
+          };
+
+          const rows = [];
+          if (sel) {
+            const matched = findDeepAll(document, sel).filter((el) => !isHidden(el));
+            const directTrs = matched.filter((el) => el.tagName === 'TR');
+            if (directTrs.length > 0) {
+              const byTable = new Map();
+              for (const tr of directTrs) {
+                const tbl = tr.closest('table') || document.body;
+                if (!byTable.has(tbl)) byTable.set(tbl, []);
+                byTable.get(tbl).push(tr);
+              }
+              for (const [tbl, trList] of byTable.entries()) {
+                rows.push(...extractTableRows(tbl, trList));
+              }
+              return rows;
+            }
+            for (const m of matched) {
+              if (m.tagName === 'TABLE') {
+                rows.push(...extractTableRows(m));
+              } else if (m.tagName === 'TBODY') {
+                const tbl = m.closest('table') || m;
+                rows.push(...extractTableRows(tbl, [...m.querySelectorAll('tr')]));
+              } else {
+                for (const tbl of findDeepAll(m, 'table').filter((t) => !isHidden(t))) {
+                  rows.push(...extractTableRows(tbl));
+                }
+              }
+            }
+            return rows;
+          }
+          const root =
+            findDeepAll(document, 'main, article, [role="main"]').find((el) => !isHidden(el) && el.querySelector('table')) ||
+            document.body;
+          if (!root) return rows;
+          for (const tbl of findDeepAll(root, 'table').filter((t) => !isHidden(t))) {
+            rows.push(...extractTableRows(tbl));
+          }
+          return rows;
+        }, selector)
+        .catch(() => []);
+      if (Array.isArray(frameRows) && frameRows.length > 0) {
+        allRows.push(...frameRows);
+      }
+    }
+    const title = await page.title().catch(() => '');
+    const full = JSON.stringify(allRows);
+    const MARK = '\n... [truncated]';
+    const truncated = full.length > maxChars;
+    const text = truncated ? `${full.slice(0, Math.max(0, maxChars - MARK.length))}${MARK}` : full;
+    const savedPath = writeSaveFile(options.savePath, full);
+    return {
+      text,
+      rows: allRows,
+      rowCount: allRows.length,
+      fullChars: savedPath && truncated ? full.length : undefined,
+      url: page.url(),
+      title,
+      format,
+      truncated,
+      charCount: text.length,
+      savePath: savedPath,
+      ...(allRows.length === 0 ? { note: 'no visible table rows found' } : {}),
+    };
+  }
   let sections = [];
 
   const runAll = async () => {

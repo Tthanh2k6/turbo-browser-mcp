@@ -123,6 +123,9 @@ export class BrowserManager {
     this.tempDownloadFiles = new Set();
     this.connectionNote = '';
     this.degradedReason = '';
+    this.cdpPendingApproval = false;
+    this.cdpPendingHintMs = options.cdpPendingHintMs;
+    this.onCdpPendingApproval = options.onCdpPendingApproval;
     this.bridgePort = options.bridgePort;
     this.cdpAutoTimeoutMs = options.cdpAutoTimeoutMs;
     this.bridgeRetryMs = options.bridgeRetryMs;
@@ -219,9 +222,27 @@ export class BrowserManager {
       // Chrome 144+ shows an Allow prompt on the first connect: give a person time to click it.
       const human = this.mode === 'auto' && Boolean(activeCdpEndpoint) && /^wss?:/.test(activeCdpEndpoint) &&
         hasDevToolsActivePort(this.userDataDir, this.cdpUrl);
+      const isWsCdp = /^wss?:\/\//i.test(targetEndpoint) || human;
       const waitMs = cdpConnectWaitMs({ optionMs: this.cdpAutoTimeoutMs, human });
       if (human) process.stderr.write(`waiting for 'Allow' in Chrome (up to ${Math.round(waitMs / 1000)} s)
 `);
+      const hintDelay = Number.isFinite(Number(this.cdpPendingHintMs))
+        ? Math.max(50, Number(this.cdpPendingHintMs))
+        : Math.min(800, Math.max(200, Math.floor(waitMs / 3)));
+      const pendingTimer = isWsCdp
+        ? setTimeout(() => {
+            this.cdpPendingApproval = true;
+            try {
+              this.onCdpPendingApproval?.({ endpoint: targetEndpoint, waitMs });
+            } catch {}
+            if (human) {
+              process.stderr.write(
+                `[turbo-browser-mcp] cdpPendingApproval: click "Allow" on Chrome's remote debugging prompt\n`
+              );
+            }
+          }, hintDelay)
+        : null;
+      pendingTimer?.unref?.();
       lap('prep');
       let bridgeTimedOut = false;
       let usedBridge = false;
@@ -262,15 +283,20 @@ export class BrowserManager {
             throw new Error(`The CDP bridge on port ${bridgePort} is running but attaching through it failed (step: connect to the bridge, tried ${Math.round(waitMs / 1000)} s then ${Math.round(retryMs / 1000)} s: ${String(retryErr?.message || retryErr).split(String.fromCharCode(10))[0].slice(0, 120)}). Not opening a separate signed-out browser. Try again, or set TURBO_BROWSER_MODE=launch to use a fresh browser on purpose.`);
           }
         }
+        clearTimeout(pendingTimer);
+        this.cdpPendingApproval = false;
         lap('connect');
         this.connectionNote = '';
         this._cdpEndpoint = targetEndpoint;
         this.context = this.browser.contexts()[0] ?? (await this.browser.newContext());
         this.connectionType = 'cdp';
       } catch (err) {
+        clearTimeout(pendingTimer);
         if (/^The CDP bridge on port/.test(String(err?.message))) throw err;
+        const m = String(err?.message || err);
+        const isApprovalTimeout = isWsCdp && (/timeout/i.test(m) || bridgeTimedOut);
+        this.cdpPendingApproval = Boolean(isApprovalTimeout && (human || hasDevToolsActivePort(this.userDataDir, this.cdpUrl) || this.cdpPendingHintMs !== undefined));
         if (this.mode === 'auto') {
-          const m = String(err?.message || err);
           this._note(/timeout/i.test(m)
             ? `cdp: no response within ${Math.round(waitMs / 1000)}s (Chrome may be waiting for 'Allow remote debugging')`
             : `cdp: ${m.slice(0, 120).split(String.fromCharCode(10))[0]}`);

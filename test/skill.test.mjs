@@ -23,7 +23,7 @@ const known = new Set(tools.keys());
 const STEP_ACTIONS = new Set([...tools.get('act_fast').inputSchema.properties.action.enum, 'smart_fill_form', 'navigate', 'extract', 'collect']);
 const STEP_KEYS = new Set([
   ...Object.keys(tools.get('act_fast').inputSchema.properties),
-  'url', 'format', 'scrolls', 'waitMs', 'maxItems', 'fields', 'textSelector', 'itemSelector',
+  'url', 'format', 'scrolls', 'waitMs', 'maxItems', 'fields', 'textSelector', 'itemSelector', 'nextText', 'nextSelector', 'maxPages',
 ]);
 for (const x of [...STEP_ACTIONS, ...STEP_KEYS, 'submitVerified', 'true', 'false']) known.add(x);
 

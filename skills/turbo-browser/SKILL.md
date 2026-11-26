@@ -18,7 +18,7 @@ inspect_compact {"onlyChanged":true}
 inspect_compact {"mode":"article","selector":"main","maxChars":3000}
 ```
 
-For plain reading use `extract_clean_text` (`format` markdown or text).
+For plain reading use `extract_clean_text` (`format` markdown, text or `table_json`).
 
 ## 2. Fill a whole form in one call
 
@@ -36,7 +36,7 @@ smart_fill_form {"fields":[{"selector":"#email","value":"a@b.co"},{"ref":"f0:e7"
 batch_actions {"steps":[{"action":"click","text":"Next"},{"action":"wait","textNew":"Step 2"},{"action":"fill","selector":"#phone","value":"0900000000"}],"returnSnapshot":true,"snapshotQuery":"phone|Continue"}
 ```
 
-Read feeds with `collect`, which scrolls, reads and de-duplicates:
+Read feeds or paged lists with `collect` (`scrolls` or `nextText`/`nextSelector` + `maxPages`), which reads and de-duplicates:
 
 ```
 batch_actions {"steps":[{"action":"navigate","url":"https://example.com/list"},{"action":"collect","selector":".row","scrolls":8,"maxItems":100}]}

@@ -303,6 +303,56 @@ export async function resolveActiveCdpEndpoint(
 }
 
 /**
+ * Probe whether a ws:// CDP endpoint (Chrome 136+/144+ DevToolsActivePort) is open on TCP
+ * but hanging before WebSocket upgrade response because Chrome is waiting for the user
+ * to click "Allow" on the "Allow remote debugging?" dialog.
+ */
+export function probeCdpPendingApproval(endpoint, timeoutMs = 450) {
+  if (!endpoint || (!endpoint.startsWith('ws://') && !endpoint.startsWith('wss://'))) {
+    return Promise.resolve(false);
+  }
+  return new Promise((resolve) => {
+    let parsed;
+    try {
+      parsed = new URL(endpoint);
+    } catch {
+      resolve(false);
+      return;
+    }
+    const host = parsed.hostname || '127.0.0.1';
+    const port = Number(parsed.port) || 9222;
+    const socket = new net.Socket();
+    let connected = false;
+    let settled = false;
+    const finish = (pending) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(pending);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => {
+      connected = true;
+      const reqLines = [
+        `GET ${parsed.pathname || '/'}${parsed.search || ''} HTTP/1.1`,
+        `Host: ${parsed.host}`,
+        'Upgrade: websocket',
+        'Connection: Upgrade',
+        'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+        'Sec-WebSocket-Version: 13',
+        '\r\n',
+      ].join('\r\n');
+      socket.write(reqLines);
+    });
+    socket.once('data', () => finish(false));
+    socket.once('timeout', () => finish(connected));
+    socket.once('error', () => finish(false));
+    socket.once('close', () => finish(false));
+    socket.connect(port, host);
+  });
+}
+
+/**
  * Inspect local Node, Playwright, Chromium binary, and CDP reachability for `--doctor`.
  */
 export async function diagnoseEnvironment(
@@ -323,6 +373,10 @@ export async function diagnoseEnvironment(
 
   const resolvedEndpoint = await resolveActiveCdpEndpoint(cdpUrl);
   const cdpReachable = Boolean(resolvedEndpoint);
+  const cdpPendingApproval =
+    resolvedEndpoint && /^wss?:\/\//i.test(resolvedEndpoint)
+      ? await probeCdpPendingApproval(resolvedEndpoint, 450)
+      : false;
 
   return {
     nodeVersion: process.version,
@@ -333,5 +387,6 @@ export async function diagnoseEnvironment(
     executablePath,
     cdpUrl: resolvedEndpoint || cdpUrl,
     cdpReachable,
+    ...(cdpPendingApproval ? { cdpPendingApproval: true } : {}),
   };
 }
