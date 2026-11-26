@@ -403,8 +403,9 @@ describe('v0.7.4 deliverables: schema budget, portaled comboboxes, collect pagin
       assert.ok(counts.coreFull < 1850, `Expected core full schema < 1850 tokens, got ${counts.coreFull}`);
     } else {
       // Fallback character budget check if Python/tiktoken is unavailable in minimal environment
-      assert.ok(compactStr.length < 9500, `Expected compact schema < 9500 chars, got ${compactStr.length}`);
-      assert.ok(coreCompactStr.length < 6800, `Expected core schema < 6800 chars, got ${coreCompactStr.length}`);
+      // JSON schemas average ~4.11 chars/token under o200k_base (2,440 tok ≈ 10,038 chars)
+      assert.ok(compactStr.length < 10500, `Expected compact schema < 10500 chars, got ${compactStr.length}`);
+      assert.ok(coreCompactStr.length < 7600, `Expected core schema < 7600 chars, got ${coreCompactStr.length}`);
     }
   });
 
