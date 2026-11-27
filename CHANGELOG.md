@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.7.5 (2026-11-26)
+
+Tabs and focus
+- Background tabs (`activate: false`) and `--no-focus` (`TURBO_BROWSER_NO_FOCUS`) automatically enable `Emulation.setFocusEmulationEnabled({ enabled: true })` so background pages report `document.hasFocus() === true` and keep rendering.
+
+Redaction
+- `--redact-url-params` (`TURBO_BROWSER_REDACT_URL_PARAMS`) masks sensitive URL query and hash parameters (`access_token`, `id_token`, `refresh_token`, `code`, `api_key`, `apikey`, `token`, `secret` by default, or a custom comma-separated list) as `<redacted>` across `inspect_compact`, `tabs_batch`, and `page_diagnostics`. Pass `--no-redact-url-params` or `off` to disable.
+
+Screenshots and registry
+- `capture_page` adds server-side `maxWidth` downscaling and `format: "webp" | "jpeg" | "png"` with `quality`.
+- Added `mcpName` (`io.github.Tthanh2k6/turbo-browser-mcp`) in `package.json` and updated `server.json` for the Official MCP Registry.
+
+## 0.7.4 (2026-11-26)
+
+Schema and comboboxes
+- Trimmed the 11-tool schema to 2,440 tokens and the 6-tool `--tools core` schema to 1,731 tokens (`tiktoken` `o200k_base`) while keeping critical parameter cues.
+- `smart_fill_form` fills portaled and virtualized comboboxes (Radix UI / `cmdk`, MUI Autocomplete, Headless UI Combobox, `react-select`, and scrollable `role="listbox"` menus) in one call.
+
+Extraction and pagination
+- `batch_actions` `collect` supports multi-page pagination via `nextText` or `nextSelector` with `maxPages`, stopping when the next control is missing or disabled.
+- `extract_clean_text` and `batch_actions` `collect` support `format: "table_json"` to parse HTML tables into JSON arrays of row objects.
+
+Actions and connection
+- `act_fast` suppresses false `possibleSubmit` warnings on reply and edit buttons that only open an inline editor form, while keeping `possibleSubmit: true` on comment submission POSTs.
+- `--mode auto` probes hanging `DevToolsActivePort` WebSocket handshakes and sets `cdpPendingApproval: true` when Chrome 136+ is waiting on the "Allow remote debugging" prompt.
+- Added `.gitattributes` enforcing `* text=auto eol=lf`.
+
+## 0.7.3 (2026-11-25)
+
+Snapshots
+- `inspect_compact` displays the selected value (`val="..."`) on non-input ARIA comboboxes and `aria-haspopup="listbox"` triggers when it differs from the label, and shows attached filenames on `<input type="file">`.
+- `tabs_batch` supports `returnSnapshot: true` (with `snapshotMode`, `snapshotMaxChars`, and `snapshotQuery`).
+- When `returnSnapshot: true` lands on a receipt or confirmation page with zero interactive elements (or fewer than two buttons after an allowed submit), the response includes `pageText` automatically.
+
+Actions and waiting
+- `act_fast` and `batch_actions` resolve targets by `label` when `ref`, `selector`, and `text` are omitted.
+- `batch_actions` `wait` with `textNew` compares against the pre-step baseline so synchronous DOM updates do not time out.
+- `expect.textNew` and `wait` with `textNew` ignore text already typed inside `<input>`, `<textarea>`, and `[contenteditable]` editors.
+- `batch_actions` `navigate` allows `about:blank`.
+
+Connection
+- When `--mode auto` falls back from CDP to a local browser, `"degraded": "headless-fallback"` persists across turns after the one-time `connectionNote` is consumed.
+
 ## 0.7.2 (2026-11-20)
 
 Refs
